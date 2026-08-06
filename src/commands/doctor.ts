@@ -3480,7 +3480,21 @@ export async function checkSyncFreshness(
     }>(
       // v0.41.32.0: newest_content_at feeds the REMOTE (non-localOnly) lag so
       // doctorReportRemote never shells out to git on a DB-supplied local_path.
-      `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL`,
+      //
+      // The `federated` predicate matches core/sources-ops.ts isFederated(),
+      // which is a strict `=== true` — a source is federated only when it says
+      // so explicitly. Without this filter the check reported retired,
+      // deliberately-unfederated sources as "brain search is stale!", which is
+      // false: an isolated source is unreachable from cross-source search, so
+      // its sync age cannot make search stale. That produced a permanent hard
+      // FAIL (adaptig-docs retired 2026-08-01, lens retired) which in turn
+      // masked genuine staleness on live sources. Note the empty-set branch
+      // below already claimed "No federated sources to sync" — the intent was
+      // always federated-only; the WHERE clause simply never implemented it.
+      `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at
+         FROM sources
+        WHERE local_path IS NOT NULL
+          AND (config->>'federated')::boolean IS TRUE`,
     );
 
     if (sources.length === 0) {
@@ -3854,7 +3868,14 @@ export async function checkCycleFreshness(
   opts?: { nowMs?: number },
 ): Promise<Check> {
   try {
-    const sources = await engine.listAllSources({ localPathOnly: true });
+    // Same federation predicate as checkSyncFreshness and core/sources-ops.ts
+    // isFederated() — a strict `=== true`. A retired, deliberately-unfederated
+    // source is unreachable from cross-source search, so its cycle age cannot
+    // make search stale; reporting it as a hard FAIL only masks real staleness
+    // on live sources. The empty-set branch below already said "No federated
+    // sources to cycle", so federated-only was always the intent here too.
+    const allSources = await engine.listAllSources({ localPathOnly: true });
+    const sources = allSources.filter((s) => s.config?.federated === true);
     if (sources.length === 0) {
       return {
         name: 'cycle_freshness',
