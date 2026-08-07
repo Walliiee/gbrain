@@ -183,4 +183,14 @@ describe('rowToSearchResult', () => {
     expect(typeof r.score).toBe('number');
     expect(r.score).toBe(0.95);
   });
+
+  test('preserves the title-search result when effective_date is invalid', () => {
+    const r = rowToSearchResult({
+      slug: 'test', page_id: 1, title: 'Test', type: 'concept',
+      chunk_text: 'text', chunk_source: 'compiled_truth',
+      chunk_id: 1, chunk_index: 0, score: 1, stale: false,
+      effective_date: new Date('not-a-date'),
+    });
+    expect(r.effective_date).toBeNull();
+  });
 });

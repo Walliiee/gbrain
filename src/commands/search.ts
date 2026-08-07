@@ -76,6 +76,31 @@ const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   relational_retrieval_depth: 'Max hops for relational traversal (1..3, 2 default)',
 };
 
+/**
+ * Config key for each knob whose key spelling differs from `search.<knob>`.
+ * Without this, `gbrain search modes` attributes a reranker override to
+ * `search.reranker_enabled` — a key that does not exist — so an operator
+ * following the dashboard unsets nothing. Knobs absent from this map use the
+ * `search.<knob>` default.
+ */
+const KNOB_CONFIG_KEYS: Partial<Record<keyof ModeBundle, string>> = {
+  cache_enabled: 'search.cache.enabled',
+  cache_similarity_threshold: 'search.cache.similarity_threshold',
+  cache_ttl_seconds: 'search.cache.ttl_seconds',
+  reranker_enabled: 'search.reranker.enabled',
+  reranker_model: 'search.reranker.model',
+  reranker_top_n_in: 'search.reranker.top_n_in',
+  reranker_top_n_out: 'search.reranker.top_n_out',
+  reranker_timeout_ms: 'search.reranker.timeout_ms',
+  cross_modal_both_text_weight: 'search.cross_modal.both_mode_text_weight',
+  cross_modal_both_image_weight: 'search.cross_modal.both_mode_image_weight',
+  image_query_text_refinement_weight: 'search.image_query.text_refinement_weight',
+  image_query_image_refinement_weight: 'search.image_query.image_refinement_weight',
+  cross_modal_llm_intent: 'search.cross_modal.llm_intent',
+  relationalRetrieval: 'search.relational_retrieval',
+  relational_retrieval_depth: 'search.relational_retrieval_depth',
+};
+
 interface SearchModesReport {
   schema_version: 2;
   active_mode: SearchMode;
@@ -92,19 +117,15 @@ async function buildModesReport(engine: BrainEngine): Promise<SearchModesReport>
   const input = await loadSearchModeConfig(engine);
   const resolved = resolveSearchMode(input);
 
-  const knobs: Array<keyof ModeBundle> = [
-    'cache_enabled',
-    'cache_similarity_threshold',
-    'cache_ttl_seconds',
-    'intentWeighting',
-    'tokenBudget',
-    'expansion',
-    'searchLimit',
-    // v0.35.6.0 — floor-ratio surfaced in `gbrain search modes` dashboard
-    // so config drift is legible. Default undefined renders as 'undefined'
-    // in the bundle column, 'mode' source when unset by config/per-call.
-    'floor_ratio',
-  ];
+  // EVERY knob is reported — the list is derived from KNOB_DESCRIPTIONS, not
+  // hand-maintained. A hand-maintained list silently stopped at `floor_ratio`
+  // and hid 19 knobs, including all five reranker knobs: an operator running
+  // `gbrain search modes` could not see that the reranker was configured on,
+  // which is how 5,469 consecutive rerank failures stayed invisible for seven
+  // weeks. Adding a knob to ModeBundle now forces a KNOB_DESCRIPTIONS entry
+  // (the Record type is exhaustive), and that entry is what gets displayed —
+  // so a knob can never again exist without being legible here.
+  const knobs = Object.keys(KNOB_DESCRIPTIONS) as Array<keyof ModeBundle>;
 
   const attributions = {} as SearchModesReport['resolved'];
   for (const k of knobs) {
@@ -112,7 +133,12 @@ async function buildModesReport(engine: BrainEngine): Promise<SearchModesReport>
     attributions[k] = {
       value: a.value,
       source: a.source,
-      source_detail: a.source_detail,
+      // Point at the real config key. attributeKnob assumes `search.<knob>`,
+      // which is wrong for every dotted key (reranker, cache, cross-modal).
+      source_detail:
+        a.source === 'override'
+          ? `config: ${KNOB_CONFIG_KEYS[k] ?? `search.${k}`}`
+          : a.source_detail,
       description: KNOB_DESCRIPTIONS[k],
     };
   }

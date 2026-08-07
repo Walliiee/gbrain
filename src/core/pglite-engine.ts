@@ -2237,6 +2237,15 @@ export class PGLiteEngine implements BrainEngine {
   private async _upsertChunksOnce(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string }): Promise<void> {
     const sourceId = opts?.sourceId ?? 'default';
 
+    // 2026-07-29 arctic migration (parity with postgres-engine.ts): stamp the
+    // gateway-RESOLVED embedding model, not the compiled default, when the
+    // chunk carries no explicit model.
+    let effectiveModel: string = DEFAULT_EMBEDDING_MODEL;
+    try {
+      const gw = require('./ai/gateway.ts') as typeof import('./ai/gateway.ts');
+      effectiveModel = gw.getEmbeddingModel() || DEFAULT_EMBEDDING_MODEL;
+    } catch { /* gateway unconfigured (unit tests) — compiled default */ }
+
     // Source-scope the page-id lookup so duplicate slugs in different sources
     // do not return multiple rows or target the wrong page.
     const pageResult = await this.db.query(
@@ -2307,7 +2316,7 @@ export class PGLiteEngine implements BrainEngine {
       if (embeddingImageStr) params.push(embeddingImageStr);
       params.push(
         pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
-        chunk.model || DEFAULT_EMBEDDING_MODEL, chunk.token_count || null,
+        chunk.model || effectiveModel, chunk.token_count || null,
         chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
         chunk.start_line ?? null, chunk.end_line ?? null,
         parentPath, chunk.doc_comment || null, chunk.symbol_name_qualified || null,

@@ -2388,6 +2388,17 @@ export class PostgresEngine implements BrainEngine {
     const sql = this.sql;
     const sourceId = opts?.sourceId ?? 'default';
 
+    // 2026-07-29 arctic migration: when a chunk carries no explicit model,
+    // stamp the gateway-RESOLVED embedding model (env/config aware), not the
+    // compiled DEFAULT_EMBEDDING_MODEL. A lying stamp + matching dims means
+    // mixed-model vectors silently poison ranking. Lazy require mirrors
+    // embedding-column.ts (avoids loading every provider SDK at engine load).
+    let effectiveModel: string = DEFAULT_EMBEDDING_MODEL;
+    try {
+      const gw = require('./ai/gateway.ts') as typeof import('./ai/gateway.ts');
+      effectiveModel = gw.getEmbeddingModel() || DEFAULT_EMBEDDING_MODEL;
+    } catch { /* gateway unconfigured (unit tests) — compiled default */ }
+
     // Source-scope the page-id lookup. Without this filter, multi-source
     // brains where the slug exists in 2+ sources return >1 row and the
     // chunk replacement targets the wrong page (or fans out across pages).
@@ -2447,7 +2458,7 @@ export class PostgresEngine implements BrainEngine {
       if (embeddingImageStr) params.push(embeddingImageStr);
       params.push(
         pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
-        chunk.model || DEFAULT_EMBEDDING_MODEL, chunk.token_count || null,
+        chunk.model || effectiveModel, chunk.token_count || null,
         chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
         chunk.start_line ?? null, chunk.end_line ?? null,
         parentPath, chunk.doc_comment || null, chunk.symbol_name_qualified || null,

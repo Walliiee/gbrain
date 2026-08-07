@@ -366,7 +366,11 @@ export function rowToSearchResult(row: Record<string, unknown>): SearchResult {
     if (raw === null) {
       result.effective_date = null;
     } else if (raw instanceof Date) {
-      result.effective_date = raw.toISOString().slice(0, 10);
+      // A malformed database value can arrive as an invalid Date. Do not let
+      // that one row disable the entire title-search arm.
+      result.effective_date = Number.isNaN(raw.getTime())
+        ? null
+        : raw.toISOString().slice(0, 10);
     } else if (typeof raw === 'string' && raw) {
       // Postgres TIMESTAMPTZ already serializes as "YYYY-MM-DD ..." — slice
       // the date portion. PGLite returns the same shape via its parser.

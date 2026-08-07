@@ -1508,8 +1508,26 @@ export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> 
 export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
   try {
     const { readRecentRerankFailures } = await import('../core/rerank-audit.ts');
-    const cfg = await engine.getConfig('search.reranker.enabled');
-    const rerankerEnabled = cfg === 'true' || cfg === '1';
+    const { loadSearchModeConfig, resolveSearchMode } = await import('../core/search/mode.ts');
+
+    // Resolve through the SAME chain hybridSearch uses (per-call → config key
+    // → mode bundle), not a bare getConfig. Reading only the config key made
+    // the doctor report a state the search path never had: `search.reranker.
+    // enabled=true` in the DB while the resolved mode bundle left it off, so
+    // "enabled" was asserted for a reranker that never received a request.
+    // The raw key alone is not the effective state: the mode bundle can turn
+    // the reranker ON with no config key set at all (tokenmax does). Reading
+    // only `search.reranker.enabled` therefore reported "Reranker disabled —
+    // no failures expected" for a brain that was actively reranking, which is
+    // the reassuring-but-false half of this check. Resolve through the same
+    // chain hybridSearch uses (per-call → config key → mode bundle).
+    let rerankerEnabled: boolean;
+    try {
+      rerankerEnabled = resolveSearchMode(await loadSearchModeConfig(engine)).reranker_enabled;
+    } catch {
+      const cfg = await engine.getConfig('search.reranker.enabled');
+      rerankerEnabled = cfg === 'true' || cfg === '1';
+    }
 
     const failures = readRecentRerankFailures(7);
     if (failures.length === 0) {
@@ -1548,6 +1566,45 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
         name: 'reranker_health',
         status: 'warn',
         message: `${transientFails.length} transient reranker failure(s) in last 7 days. Search fails open to RRF order; check ZE status if persistent.`,
+      };
+    }
+
+    // Unclassified failures. Every branch above tests a SPECIFIC reason, so a
+    // failure whose reason matches none of them used to fall straight through
+    // to the `ok` return below — which is how 5,221 `unknown` failures (a
+    // missing API key, fail-open, for seven weeks) were reported as healthy
+    // while the message printed the four-digit count. A check that cannot see
+    // a failure class must not vouch for it.
+    const KNOWN_REASONS = new Set([
+      'auth',
+      'payload_too_large',
+      'network',
+      'timeout',
+      'rate_limit',
+    ]);
+    const unclassified = failures.filter((f) => !KNOWN_REASONS.has(f.reason));
+    if (unclassified.length > 0) {
+      const models = [...new Set(unclassified.map((f) => f.model))].join(', ');
+      const sample = unclassified[unclassified.length - 1]?.error_summary ?? '(no detail)';
+      return {
+        name: 'reranker_health',
+        status: 'warn',
+        message:
+          `${unclassified.length} unclassified reranker failure(s) in last 7 days (model: ${models}). ` +
+          `Every rerank call is failing open to RRF order, so search still returns results — but the reranker is doing nothing. ` +
+          `Latest: ${sample}. Fix: check the provider credential and run \`gbrain models doctor\`; ` +
+          `to stop paying the call cost entirely, \`gbrain config set search.reranker.enabled false\`.`,
+      };
+    }
+
+    // Volume backstop. Independent of classification: sustained failure at
+    // this rate means the reranker is effectively absent from the pipeline,
+    // whatever the reason bucket says.
+    if (failures.length >= 50) {
+      return {
+        name: 'reranker_health',
+        status: 'warn',
+        message: `${failures.length} reranker failure(s) in last 7 days. The reranker is effectively not running (every call fails open to RRF order).`,
       };
     }
 

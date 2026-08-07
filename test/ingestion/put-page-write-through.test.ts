@@ -100,7 +100,7 @@ describe('put_page write-through — happy path', () => {
     expect(onDisk).toContain('WT body');
   });
 
-  test('stamps provenance frontmatter (ingested_via=put_page for local CLI)', async () => {
+  test('does not leak local server metadata into source Markdown', async () => {
     const ctx = makeCtx({ remote: false });
     const result = (await putPage.handler(ctx, {
       slug: 'inbox/provenance',
@@ -108,11 +108,10 @@ describe('put_page write-through — happy path', () => {
     })) as { write_through?: { written: boolean; path?: string } };
     expect(result.write_through?.written).toBe(true);
     const onDisk = fs.readFileSync(result.write_through!.path!, 'utf8');
-    expect(onDisk).toMatch(/ingested_via:\s*put_page/);
-    expect(onDisk).toMatch(/ingested_at:/);
+    expect(onDisk).not.toMatch(/^(ingested_via|ingested_at|source_kind):/m);
   });
 
-  test('MCP/remote callers get ingested_via=mcp:put_page', async () => {
+  test('keeps MCP provenance in the database, not source Markdown', async () => {
     const ctx = makeCtx({ remote: true });
     const result = (await putPage.handler(ctx, {
       slug: 'inbox/mcp-prov',
@@ -120,9 +119,11 @@ describe('put_page write-through — happy path', () => {
     })) as { write_through?: { written: boolean; path?: string } };
     expect(result.write_through?.written).toBe(true);
     const onDisk = fs.readFileSync(result.write_through!.path!, 'utf8');
-    // YAML quotes strings containing `:` so the literal frontmatter line
-    // is `ingested_via: 'mcp:put_page'`. Match the value substring.
-    expect(onDisk).toMatch(/ingested_via:\s*['"]?mcp:put_page['"]?/);
+    expect(onDisk).not.toMatch(/^(ingested_via|ingested_at|source_kind):/m);
+    const page = await engine.getPage('inbox/mcp-prov');
+    expect(page?.ingested_via).toBe('mcp:put_page');
+    expect(page?.source_kind).toBe('mcp:put_page');
+    expect(page?.ingested_at).toBeInstanceOf(Date);
   });
 });
 

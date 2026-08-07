@@ -16,6 +16,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   configureGateway,
+  embed,
   embedQuery,
   isAvailable,
   resetGateway,
@@ -71,6 +72,36 @@ describe('embedQuery — bare (no opts)', () => {
     expect(v.length).toBe(1536);
     expect(calls.length).toBe(1);
     expect(calls[0].modelString).toBe('text-embedding-3-large');
+  });
+
+  test('Qwen3 embedding query path adds instruction prefix', async () => {
+    configureGateway({
+      embedding_model: 'ollama:qwen3-embedding:0.6b',
+      embedding_dimensions: 1024,
+      env: {},
+    });
+    installCaptureTransport(() => new Array(1024).fill(0).map((_, i) => i * 0.001));
+
+    const v = await embedQuery('Adaptig agent harness bottleneck');
+    expect(v.length).toBe(1024);
+    expect(calls.length).toBe(1);
+    expect(calls[0].modelString).toBe('qwen3-embedding:0.6b');
+    expect(calls[0].values[0]).toStartWith('Instruct: Given a question, retrieve relevant passages');
+    expect(calls[0].values[0]).toContain('\nQuery: Adaptig agent harness bottleneck');
+  });
+
+  test('Qwen3 document embedding path stays unprompted', async () => {
+    configureGateway({
+      embedding_model: 'ollama:qwen3-embedding:0.6b',
+      embedding_dimensions: 1024,
+      env: {},
+    });
+    installCaptureTransport(() => new Array(1024).fill(0).map((_, i) => i * 0.001));
+
+    const [v] = await embed(['# Adaptig Agent OS Roadmap']);
+    expect(v.length).toBe(1024);
+    expect(calls.length).toBe(1);
+    expect(calls[0].values[0]).toBe('# Adaptig Agent OS Roadmap');
   });
 });
 
