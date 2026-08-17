@@ -51,6 +51,14 @@ export const DEFAULT_SOURCE_BOOSTS: Record<string, number> = {
   // `dream_generated: true` in their frontmatter; demote here keeps them
   // findable but ranked below all curated user content.
   'extracts/': 0.3,
+  // Cold-storage — this workspace's DONE/SUPERSEDED shelf: "consult only when a
+  // question explicitly digs into history." Demoted HARDER than archive/ (0.5)
+  // and extracts/ (0.3): cold pages stay findable (links resolve, get_page works,
+  // and the reranker can still PROMOTE a strong match into the candidate window)
+  // but never outrank live content in normal recall. Two slug prefixes cover all
+  // of it — top-level cold-storage/ and the nested memory/cold-storage/.
+  'cold-storage/': 0.2,
+  'memory/cold-storage/': 0.2,
 };
 
 /**
