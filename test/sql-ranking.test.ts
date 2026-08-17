@@ -310,8 +310,16 @@ describe('buildVisibilityClause (v0.26.5)', () => {
 
   test('uses the supplied aliases verbatim', () => {
     expect(buildVisibilityClause('pp', 'src')).toBe(
-      "AND pp.deleted_at IS NULL AND NOT src.archived AND NOT (COALESCE(pp.frontmatter, '{}'::jsonb) ? 'quarantine')",
+      "AND pp.deleted_at IS NULL AND NOT src.archived AND NOT (COALESCE(pp.frontmatter, '{}'::jsonb) ? 'quarantine')" +
+        " AND NOT (lower(trim(COALESCE(pp.frontmatter ->> 'status', ''))) IN ('superseded', 'deprecated', 'retired', 'obsolete', 'archived'))",
     );
+  });
+
+  // LOCAL PATCH: author-set lifecycle retirement is a search-only filter.
+  test('drift guard: lifecycle fragment comes from lifecycle.ts single source of truth', async () => {
+    const { lifecycleFilterFragment } = await import('../src/core/lifecycle.ts');
+    expect(buildVisibilityClause('p', 's')).toContain(lifecycleFilterFragment('p'));
+    expect(buildVisibilityClause('xx', 's')).toContain(lifecycleFilterFragment('xx'));
   });
 
   test('drift guard: quarantine fragment comes from quarantine.ts single source of truth', async () => {
