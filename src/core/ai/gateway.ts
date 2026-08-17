@@ -97,6 +97,31 @@ function withDefaultTimeout(caller: AbortSignal | undefined, timeoutMs: number):
   return caller ? AbortSignal.any([caller, timeout]) : timeout;
 }
 
+const QWEN_QUERY_INSTRUCTION =
+  "Given a question, retrieve relevant passages from Mike's GBrain knowledge base. " +
+  'Prefer exact project, decision, task, people, and system-setup context that answers the question.';
+
+function isQwen3EmbeddingModel(modelId: string): boolean {
+  return /^qwen3-embedding(?::|$|-)/i.test(modelId) || /^qwen3[_-]embedding/i.test(modelId);
+}
+
+function formatQwenInstructionQuery(text: string): string {
+  return `Instruct: ${QWEN_QUERY_INSTRUCTION}\nQuery: ${text}`;
+}
+
+// Snowflake arctic-embed family (arctic-embed2 / arctic-embed-l-v2 / m-v1.5 ...)
+// is asymmetric: QUERIES must be prefixed with "query: "; documents are
+// embedded unprefixed. Ollama's OpenAI-compat /v1/embeddings endpoint does
+// no prefixing itself, so the gateway applies it at the text level (same
+// seam as the Qwen3 instruct prefix above). 2026-07-29 arctic migration.
+function isArcticEmbedModel(modelId: string): boolean {
+  return /snowflake-arctic-embed/i.test(modelId);
+}
+
+function formatArcticQuery(text: string): string {
+  return `query: ${text}`;
+}
+
 const MAX_CHARS = 8000;
 // v0.46.3 SPLIT-DEFAULT: DEFAULT_EMBEDDING_MODEL / DEFAULT_EMBEDDING_DIMENSIONS
 // are now the LEGACY CONFIGLESS RUNTIME FALLBACK only (brains with no
@@ -1688,7 +1713,17 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   const resolveTarget = opts?.embeddingModel ?? getEmbeddingModel();
   const tracker = __budgetStore.getStore() ?? null;
   const { model, recipe, modelId } = await resolveEmbeddingProvider(resolveTarget);
-  const truncated = texts.map(t => (t ?? '').slice(0, MAX_CHARS));
+  // Asymmetric embedding models need a QUERY-side text prefix that the
+  // provider endpoint does not add itself (Ollama's OpenAI-compat
+  // /v1/embeddings in particular). Documents stay unprefixed.
+  const qwenQueryInstruction = opts?.inputType === 'query' && isQwen3EmbeddingModel(modelId);
+  const arcticQueryPrefix = opts?.inputType === 'query' && isArcticEmbedModel(modelId);
+  const preparedTexts = qwenQueryInstruction
+    ? texts.map(t => formatQwenInstructionQuery(t ?? ''))
+    : arcticQueryPrefix
+      ? texts.map(t => formatArcticQuery(t ?? ''))
+      : texts;
+  const truncated = preparedTexts.map(t => (t ?? '').slice(0, MAX_CHARS));
 
   // Reserve up front for the worst-case batch token count. Embeddings have
   // no output rate, so maxOutputTokens=0. record() at the end uses the
