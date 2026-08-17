@@ -571,13 +571,29 @@ export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> 
  *   6) Budget/pricing failures: warn at >=1 with the rerank pricing surface
  *      and --max-cost escape hatch.
  *
- * Engine-agnostic (file-based + one config-key read).
+ * Engine-agnostic (file-based + search-mode resolution, which reads config).
  */
 export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
   try {
     const { readRecentRerankFailures } = await import('../../../core/rerank-audit.ts');
-    const cfg = await engine.getConfig('search.reranker.enabled');
-    const rerankerEnabled = cfg === 'true' || cfg === '1';
+
+    // Resolve through the SAME chain hybridSearch uses (mode bundle +
+    // search.reranker.* config overrides), not a bare getConfig — the same
+    // fix graph-embedding.ts already carries. The raw key alone is not the
+    // effective state: a mode bundle can turn the reranker ON with no config
+    // key set at all (tokenmax does), so reading only `search.reranker.enabled`
+    // reported "Reranker disabled — no failures expected" for a brain that was
+    // actively reranking. It also lies the other way: key=true while the
+    // resolved bundle leaves the reranker off. Fall back to the raw key only
+    // when mode resolution throws.
+    let rerankerEnabled: boolean;
+    try {
+      const { loadSearchModeConfig, resolveSearchMode } = await import('../../../core/search/mode.ts');
+      rerankerEnabled = resolveSearchMode(await loadSearchModeConfig(engine)).reranker_enabled;
+    } catch {
+      const cfg = await engine.getConfig('search.reranker.enabled');
+      rerankerEnabled = cfg === 'true' || cfg === '1';
+    }
 
     const failures = readRecentRerankFailures(7);
     if (failures.length === 0) {
