@@ -241,6 +241,57 @@ export interface Check {
    * Source of truth: `src/core/doctor-categories.ts`.
    */
   category?: CheckCategory;
+  /**
+   * "This check did not actually run." Optional + additive.
+   *
+   * LOCAL PATCH (not upstream at v0.46.19.0). A check that bails early —
+   * dependency absent, feature opt-in and off, column not provisioned — has
+   * historically returned `status: 'ok'`, because the status union has no
+   * third state. That is a false green: the summary line says "All checks
+   * passed" while N checks never looked at anything. Set this to `true` at
+   * any early-return site so the summary stops vouching for it.
+   * `computeDoctorReport` also infers it from the message for the sites that
+   * predate the field (see NOT_CHECKED_PATTERNS).
+   *
+   * Deliberately does NOT affect `health_score` — a skipped check has always
+   * scored 0 penalty and still does, so the back-compat invariant on
+   * `health_score` holds byte-for-byte.
+   */
+  not_checked?: boolean;
+}
+
+/**
+ * Anchored message shapes that mean "did not run", for the early-return sites
+ * that predate the `not_checked` field.
+ *
+ * These are deliberately tight. A loose /skip/i matches `--skip-failed` inside
+ * a recommended cron command (`sync_consolidation`) and a loose /not yet/i
+ * matches an informational aside from a check that DID run
+ * (`brainstorm_health`). Mislabelling a real check as "not checked" is the
+ * same class of lie as the one this is fixing, pointed the other way — so
+ * every pattern anchors to the start or end of the message.
+ *
+ * Prefer setting `not_checked: true` explicitly in new checks.
+ */
+const NOT_CHECKED_PATTERNS: RegExp[] = [
+  /^skipped\b/i, // "Skipped (nightly probe is opt-in; …)"
+  /^disabled \(opt-in\)/i, // "disabled (opt-in). Enable with: …"
+  /\bskipping\b[^.]*\bcheck\b/i, // "… — skipping fan-out/concurrency check"
+  /\bcheck (?:was )?skipped\b/i, // "… width check skipped."
+  /\bskipped[.;]?$/i, // "… ; skipped"
+  /[—-]\s*skip\.?$/i, // "… is not ZeroEntropy — skip."
+  /\(skipping\)\.?$/i, // "OAuth not configured (skipping)"
+  /\bN\/A\.?$/, // "… coverage check N/A"
+];
+
+/**
+ * True when a check reports `ok` without having actually inspected anything.
+ * Only `ok` qualifies: a `warn`/`fail` already tells the operator to look.
+ */
+export function isNotChecked(c: Check): boolean {
+  if (c.status !== 'ok') return false;
+  if (c.not_checked === true) return true;
+  return NOT_CHECKED_PATTERNS.some((p) => p.test(c.message));
 }
 
 /**
@@ -294,6 +345,14 @@ export interface DoctorReport {
    * the ranking. Additive + optional; schema_version stays at 2.
    */
   top_issues?: RankedIssue[];
+  /**
+   * LOCAL PATCH (not upstream at v0.46.19.0) — names of checks that reported
+   * `ok` without running (see `Check.not_checked`). Optional + additive;
+   * `schema_version` stays 2. Present so a CI gate or monitor can assert
+   * coverage instead of trusting a green tally that includes checks which
+   * never looked at anything.
+   */
+  not_checked?: string[];
 }
 
 function _penaltyScore(checks: Check[]): number {
@@ -334,6 +393,10 @@ export function computeDoctorReport(checks: Check[]): DoctorReport {
   const meta = tagged.filter((c) => c.category === 'meta');
 
   const status: DoctorReport['status'] = hasFail ? 'unhealthy' : hasWarn ? 'warnings' : 'healthy';
+  // LOCAL PATCH: post-pass separating the checks that reported ok without
+  // running. Scores are computed above and deliberately untouched — this only
+  // stops the summary from counting a skip as evidence of health.
+  const notChecked = tagged.filter(isNotChecked).map((c) => c.name);
   return {
     schema_version: 2,
     status,
@@ -347,6 +410,7 @@ export function computeDoctorReport(checks: Check[]): DoctorReport {
     },
     checks: tagged,
     top_issues: rankIssues(tagged),
+    not_checked: notChecked,
   };
 }
 
@@ -3891,7 +3955,13 @@ function outputResults(checks: Check[], json: boolean): boolean {
     console.log('');
   }
 
+  // LOCAL PATCH (not upstream at v0.46.19.0): checks that returned ok without
+  // running are printed apart from the OK list, so a green tally can never be
+  // read as "everything was inspected".
+  const notChecked = new Set(report.not_checked ?? []);
+
   for (const c of report.checks) {
+    if (notChecked.has(c.name)) continue; // listed under NOT CHECKED below
     const icon = c.status === 'ok' ? 'OK' : c.status === 'warn' ? 'WARN' : 'FAIL';
     console.log(`  [${icon}] ${c.name}: ${c.message}`);
     if (c.issues) {
@@ -3899,6 +3969,14 @@ function outputResults(checks: Check[], json: boolean): boolean {
         console.log(`    → ${issue.type.toUpperCase()}: ${issue.skill}`);
         console.log(`      ACTION: ${issue.action}`);
       }
+    }
+  }
+
+  if (notChecked.size > 0) {
+    console.log('');
+    console.log(`NOT CHECKED (${notChecked.size}) — reported ok without running:`);
+    for (const c of report.checks) {
+      if (notChecked.has(c.name)) console.log(`  [ -- ] ${c.name}: ${c.message}`);
     }
   }
 
@@ -3920,10 +3998,20 @@ function outputResults(checks: Check[], json: boolean): boolean {
   if (brainScoreLine) console.log(brainScoreLine);
   console.log('');
 
+  // LOCAL PATCH: the tally must never claim coverage it doesn't have. `ran` is
+  // the count of checks that actually inspected something. Only qualify the
+  // headline when there is something to qualify — a brain with full coverage
+  // prints the exact same line it always has.
+  const ran = report.checks.length - notChecked.size;
+  const coverage =
+    notChecked.size > 0 ? ` ${ran}/${report.checks.length} checks ran, ${notChecked.size} not checked.` : '';
+
   if (hasFail) {
-    console.log(`Overall health score: ${score}/100. Failed checks found.`);
+    console.log(`Overall health score: ${score}/100. Failed checks found.${coverage}`);
   } else if (hasWarn) {
-    console.log(`Overall health score: ${score}/100. All checks OK (some warnings).`);
+    console.log(`Overall health score: ${score}/100. All checks OK (some warnings).${coverage}`);
+  } else if (notChecked.size > 0) {
+    console.log(`Overall health score: ${score}/100.${coverage}`);
   } else {
     console.log(`Overall health score: ${score}/100. All checks passed.`);
   }
