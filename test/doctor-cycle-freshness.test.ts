@@ -29,10 +29,17 @@ beforeEach(async () => {
 const NOW = Date.parse('2026-05-22T12:00:00.000Z');
 const agoH = (h: number) => new Date(NOW - h * 3600_000).toISOString();
 
-async function seed(id: string, lastFullCycleAt?: string, opts: { local_path?: string | null } = {}): Promise<void> {
-  const config = lastFullCycleAt
-    ? JSON.stringify({ last_full_cycle_at: lastFullCycleAt })
-    : '{}';
+async function seed(
+  id: string,
+  lastFullCycleAt?: string,
+  opts: { local_path?: string | null; federated?: boolean } = {},
+): Promise<void> {
+  // LOCAL PATCH: the check is federated-only, so fixtures default to federated.
+  const federated = opts.federated !== false;
+  const config = JSON.stringify({
+    ...(lastFullCycleAt ? { last_full_cycle_at: lastFullCycleAt } : {}),
+    ...(federated ? { federated: true } : {}),
+  });
   const localPath = opts.local_path === undefined ? `/tmp/${id}` : opts.local_path;
   await engine.executeRaw(
     `INSERT INTO sources (id, name, local_path, config, archived, created_at)
@@ -46,6 +53,18 @@ describe('doctor checkCycleFreshness', () => {
   test('empty (no federated sources) returns ok', async () => {
     // resetPgliteState reseeds the default source with no local_path
     await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    const result = await checkCycleFreshness(engine, { nowMs: NOW });
+    expect(result.status).toBe('ok');
+    expect(result.message).toMatch(/No federated sources/);
+  });
+
+  // LOCAL PATCH (not upstream at v0.46.19.0): retired / deliberately
+  // unfederated sources are unreachable from cross-source search, so their
+  // cycle age cannot make search stale. They must not produce warn or fail.
+  test('non-federated sources are ignored entirely', async () => {
+    await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    await seed('retired', agoH(999), { federated: false });
+    await seed('never-cycled-retired', undefined, { federated: false });
     const result = await checkCycleFreshness(engine, { nowMs: NOW });
     expect(result.status).toBe('ok');
     expect(result.message).toMatch(/No federated sources/);
