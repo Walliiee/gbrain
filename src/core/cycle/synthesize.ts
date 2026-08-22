@@ -397,6 +397,31 @@ export async function runPhaseSynthesize(
 
     // Cooldown check (skipped for explicit --input / --date / --from / --to runs).
     const explicitTarget = opts.inputFile || opts.date || opts.from || opts.to;
+
+    // SOURCE ALLOWLIST — checked BEFORE the cooldown so a disallowed source can
+    // neither consume nor stamp the cooldown key.
+    //
+    // `dream.synthesize.session_corpus_dir` is a single GLOBAL directory, but the
+    // synthesis output is source-scoped. On a multi-source nightly cron every
+    // source therefore synthesizes the SAME transcripts into its own checkout, and
+    // the only thing deciding which source's repo the reflections land in is
+    // `dream.synthesize.last_completion_ts` — one global cooldown key claimed by
+    // whichever source runs first AND is not capped that night. Run order and the
+    // per-source daily cap, not intent, pick the destination: a source that is
+    // capped out returns without stamping the cooldown (CX8), handing the baton to
+    // the next source in the loop, which writes personal reflections into a repo
+    // that has nothing to do with them.
+    //
+    // Unset (the default) preserves legacy behavior exactly.
+    if (!explicitTarget && config.sourceAllowlist.length > 0) {
+      const cycleSource = opts.sourceId ?? 'default';
+      if (!config.sourceAllowlist.includes(cycleSource)) {
+        return skipped('source_not_allowed',
+          `source "${cycleSource}" is not in dream.synthesize.source_allowlist ` +
+          `(${config.sourceAllowlist.join(', ')})`);
+      }
+    }
+
     if (!explicitTarget) {
       const cooldown = await checkCooldown(engine, config.cooldownHours);
       if (cooldown.active) {
@@ -1168,6 +1193,12 @@ export interface SynthConfig {
   maxTurns: number;
   /** dream.synthesize.max_submissions_per_source_per_day, default 0 = disabled (D2D). Docs recommend 200 for busy deployments. */
   maxSubmissionsPerSourcePerDay: number;
+  /**
+   * dream.synthesize.source_allowlist — comma-separated source ids permitted to
+   * run a CORPUS-SCAN synthesize. Empty (default) = every source may, which is
+   * the legacy behavior. See the gate in runPhaseSynthesize for why this exists.
+   */
+  sourceAllowlist: string[];
   cooldownHours: number;
   /**
    * D1: Override the per-chunk token budget (model_context × HEADROOM_RATIO
@@ -1275,6 +1306,8 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
   const maxTurns = Math.max(1, Math.floor(await getNumberConfig(engine, 'dream.synthesize.max_turns', DEFAULT_MAX_TURNS)) || 1);
   const maxSubmissionsPerSourcePerDay = Math.max(0,
     Math.floor(await getNumberConfig(engine, 'dream.synthesize.max_submissions_per_source_per_day', 0)));
+  const sourceAllowlist = ((await engine.getConfig('dream.synthesize.source_allowlist')) ?? '')
+    .split(',').map(s => s.trim()).filter(Boolean);
   // getNumberConfig (not `parseInt(str, 10) || N`) so a configured 0 is honored — a bare
   // `|| N` coerces an explicit 0 back to the default (cooldown 0 = "no cooldown").
   const cooldownHours = Math.max(0, await getNumberConfig(engine, 'dream.synthesize.cooldown_hours', 12));
@@ -1349,6 +1382,7 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
     },
     maxTurns,
     maxSubmissionsPerSourcePerDay,
+    sourceAllowlist,
     cooldownHours,
     maxPromptTokens,
     maxChunksPerTranscript,
