@@ -499,9 +499,22 @@ export function linkReadScopeOpts(ctx: OperationContext): { sourceId?: string; s
  * What this deliberately does NOT do:
  *   - widen a federated grant array (OAuth grant governs — passes through);
  *   - widen when the transport left `localFederatedSourceIds` unset, which is
- *     exactly the case for an EXPLICIT `--source X` / `GBRAIN_SOURCE` /
- *     `.gbrain-source` binding (tier `flag`/`env`/`dotfile`) and for any
- *     remote caller. Explicit scope stays scalar, as with search;
+ *     the case for an EXPLICIT `--source X` / `GBRAIN_SOURCE` / `.gbrain-source`
+ *     binding (tier `flag`/`env`/`dotfile`). Explicit scope stays scalar, as
+ *     with search.
+ *
+ *     CORRECTION (2026-08-22, same day): an earlier draft of this comment also
+ *     claimed the floor is unset "for any remote caller". THAT IS WRONG — do
+ *     not rely on it. `http-transport.ts` sets `localFederatedSourceIds`
+ *     whenever `auth.hasSourceGrant === false` (the #3242 federated read
+ *     floor), so an UNGRANTED remote token DOES receive the floor and this
+ *     function DOES widen for it. What keeps that safe is PARITY, not
+ *     exclusion: the identical floor already governs `search`, `get_page`,
+ *     `get_links` and `get_backlinks` for that same caller, so traversal
+ *     reaches nothing those ops did not already return. A token WITH an
+ *     operator-set grant (`hasSourceGrant === true`) never receives the floor
+ *     and is governed by its grant array, which passes through untouched.
+ *     These two are now coupled: if you change #3242's floor, change this too;
  *   - reach a PARKED or RETIRED source. `localFederatedSourceIds` is built
  *     from `config.federated = true AND archived = false`, so an unfederated
  *     source (`gbrain sources unfederate`) is absent from the floor and stays
