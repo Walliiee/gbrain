@@ -256,9 +256,9 @@ const think: Operation = {
 // refine, resolve, or supersede a take. Backed by the same md-canonical
 // write-through core as the CLI (src/core/takes-write.ts): fence-derived row
 // numbers, markdown written first, the DB mirrored with the reconcile
-// primitive — and the markdown write is REQUIRED (no sync.repo_path on the
-// host → 'unavailable' with detail takes_mirror_unavailable), because a
-// DB-only row would be clobbered by the next md→DB reconcile.
+// primitive — and the markdown write is REQUIRED (no markdown tree resolvable
+// for the page's source → 'unavailable' with detail takes_mirror_unavailable),
+// because a DB-only row would be clobbered by the next md→DB reconcile.
 //
 // Trust model (ungated by design — the put_page precedent: writes are
 // consented via scope + the holder fence; publish gates cover owner-content
@@ -290,13 +290,21 @@ function takesWriteAllowList(ctx: OperationContext): readonly string[] | null {
   return ctx.remote !== false ? (ctx.takesHoldersAllowList ?? ['world']) : null;
 }
 
+/**
+ * Repo dir for a takes WRITE. Threads `ctx.sourceId` so the resolver can fall
+ * back to the page's OWN source working tree when the legacy `sync.repo_path`
+ * key is unset — which is the normal state on a multi-source brain, and used to
+ * make every MCP takes write fail `takes_mirror_unavailable` while the CLI
+ * escaped through `--dir`. Same per-source topology `resolveTakesFilePath`
+ * already uses for the file itself.
+ */
 async function opBrainDir(ctx: OperationContext): Promise<string> {
-  const dir = await resolveTakesRepoDir(ctx.engine);
+  const dir = await resolveTakesRepoDir(ctx.engine, ctx.sourceId);
   if (!dir) {
     const err = new OperationError(
       'unavailable',
       'Takes are markdown-canonical and this brain has no writable markdown repo configured.',
-      'Configure sync.repo_path on the brain host, then retry.',
+      "Give this source a working tree (`gbrain sources add <id> --path <dir>`) on the brain host, then retry.",
     );
     err.detail = 'takes_mirror_unavailable';
     throw err;
@@ -321,7 +329,7 @@ function mapTakesWriteError(err: unknown): never {
       }
       case 'mirror_unavailable': {
         const e = new OperationError('unavailable', err.message,
-          'Configure sync.repo_path on the brain host, then retry.');
+          "Give this source a working tree (`gbrain sources add <id> --path <dir>`) on the brain host, then retry.");
         e.detail = 'takes_mirror_unavailable';
         throw e;
       }

@@ -23,6 +23,7 @@ import {
   updateTakeOnPage,
   supersedeTakeOnPage,
   resolveTakeOnPage,
+  resolveTakesRepoDir,
   TakesWriteError,
 } from '../core/takes-write.ts';
 import { resolveSourceId } from '../core/source-resolver.ts';
@@ -40,7 +41,17 @@ function flagPresent(args: string[], name: string): boolean {
   return args.includes(name);
 }
 
-async function resolveBrainDir(engine: BrainEngine | null, explicitDir: string | null): Promise<string> {
+/**
+ * --dir wins; otherwise defer to the shared resolver, which tries the legacy
+ * `sync.repo_path` first and then the page's OWN source working tree. Threading
+ * `sourceId` is what makes `gbrain takes add <slug>` work without --dir on a
+ * multi-source brain (same fallback the takes_* MCP ops now use).
+ */
+async function resolveBrainDir(
+  engine: BrainEngine | null,
+  explicitDir: string | null,
+  sourceId?: string,
+): Promise<string> {
   if (explicitDir) {
     if (!existsSync(explicitDir)) {
       console.error(`--dir path does not exist: ${explicitDir}`);
@@ -49,8 +60,8 @@ async function resolveBrainDir(engine: BrainEngine | null, explicitDir: string |
     return explicitDir;
   }
   if (engine) {
-    const configured = await engine.getConfig('sync.repo_path');
-    if (configured && existsSync(configured)) return configured;
+    const resolved = await resolveTakesRepoDir(engine, sourceId);
+    if (resolved) return resolved;
   }
   console.error('No brain directory configured. Pass --dir <path> or run `gbrain init` first.');
   process.exit(1);
@@ -190,7 +201,7 @@ async function cmdAdd(engine: BrainEngine, args: string[], sourceId?: string): P
   const source = flagValue(args, '--source');
   const since = flagValue(args, '--since');
   const dirArg = flagValue(args, '--dir');
-  const brainDir = await resolveBrainDir(engine, dirArg ?? null);
+  const brainDir = await resolveBrainDir(engine, dirArg ?? null, sourceId);
 
   try {
     const { rowNum } = await addTakeToPage(
@@ -219,7 +230,7 @@ async function cmdUpdate(engine: BrainEngine, args: string[], sourceId?: string)
   const since = flagValue(args, '--since');
   if (since !== undefined) fields.since_date = since;
   const dirArg = flagValue(args, '--dir');
-  const brainDir = await resolveBrainDir(engine, dirArg ?? null);
+  const brainDir = await resolveBrainDir(engine, dirArg ?? null, sourceId);
 
   // v0.46.x (EV1): markdown is canonical, so a row missing from the on-disk
   // fence now REFUSES the whole write instead of the old DB-update-then-warn
@@ -248,7 +259,7 @@ async function cmdSupersede(engine: BrainEngine, args: string[], sourceId?: stri
   const claim = flagValue(args, '--claim');
   if (!claim) { console.error('Missing --claim'); process.exit(1); }
   const dirArg = flagValue(args, '--dir');
-  const brainDir = await resolveBrainDir(engine, dirArg ?? null);
+  const brainDir = await resolveBrainDir(engine, dirArg ?? null, sourceId);
 
   // v0.46.x (EV1): fence-first — kind/holder inherit from the MARKDOWN row
   // (canonical), the fence assigns the new row number, and a row absent from
@@ -319,7 +330,7 @@ async function cmdResolve(engine: BrainEngine, args: string[], sourceId?: string
   const source = flagValue(args, '--evidence') ?? flagValue(args, '--source');
   const resolvedBy = flagValue(args, '--by') ?? resolveOwnerHolder({ configValue: await engine.getConfig('emotional_weight.user_holder') });
   const dirArg = flagValue(args, '--dir');
-  const brainDir = await resolveBrainDir(engine, dirArg ?? null);
+  const brainDir = await resolveBrainDir(engine, dirArg ?? null, sourceId);
 
   // Back-compat --outcome maps onto quality; the shared core takes quality only.
   const finalQuality = quality ?? (outcome === true ? 'correct' : 'incorrect');

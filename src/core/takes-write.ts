@@ -62,7 +62,7 @@ export type TakesWriteErrorCode =
   | 'row_inactive'        // superseded rows can't be updated/resolved again
   | 'holder_denied'       // add with a holder outside the allow-list
   | 'no_fields'           // update with zero mutable fields
-  | 'mirror_unavailable'  // sync.repo_path unset, page file absent, or write target escapes the source root
+  | 'mirror_unavailable'  // no markdown tree resolvable (sync.repo_path AND the source's local_path), page file absent, or write target escapes the source root
   | 'page_locked'         // lock contention within the timeout (retryable)
   | 'fence_unparsed'      // the page's fence has parser-skipped rows a whole-fence re-render would delete
   | 'invalid_input';      // free-text field carries control chars, fence markers, or out-of-range values
@@ -107,14 +107,45 @@ function mirrorErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** The page's own source working tree, when the sources row carries one. */
+async function sourceLocalPath(engine: BrainEngine, sourceId: string): Promise<string | null> {
+  const rows = await engine.executeRaw<{ local_path: string | null }>(
+    `SELECT local_path FROM sources WHERE id = $1`,
+    [sourceId],
+  );
+  return rows[0]?.local_path ?? null;
+}
+
 /**
- * Resolve the markdown brain dir for takes write-through. Returns null when
- * `sync.repo_path` is unset or missing on disk — callers decide the refusal
+ * Resolve the markdown brain dir for takes write-through.
+ *
+ * Precedence:
+ *   1. `sync.repo_path` — the LEGACY pre-v0.18 single-source key. Kept FIRST so
+ *      brains that have it configured resolve exactly the dir they always did.
+ *   2. The page's OWN source `local_path` (v0.46.19.1). Multi-source brains
+ *      never set `sync.repo_path` (it is read by sync/write-through/the
+ *      conversation parser/the archive crawler, so setting it to unblock takes
+ *      would repoint four unrelated subsystems), which left every MCP takes
+ *      WRITE dead on `takes_mirror_unavailable` while the CLI escaped through
+ *      `--dir`. `resolveTakesFilePath` below ALREADY prefers the source's
+ *      working tree over `brainDir` for the actual file, so deriving the dir
+ *      per-source here is the same topology, not a new one.
+ *
+ * Returns null when neither resolves on disk — callers decide the refusal
  * shape (ops: 'mirror_unavailable'; CLI: its historical error text + exit 1).
  */
-export async function resolveTakesRepoDir(engine: BrainEngine): Promise<string | null> {
+export async function resolveTakesRepoDir(
+  engine: BrainEngine,
+  sourceId?: string,
+): Promise<string | null> {
   const configured = await engine.getConfig('sync.repo_path');
   if (configured && existsSync(configured)) return configured;
+  try {
+    const local = await sourceLocalPath(engine, sourceId ?? 'default');
+    if (local && existsSync(local)) return local;
+  } catch {
+    // A sources lookup failure is not a reason to write into the wrong tree.
+  }
   return null;
 }
 
@@ -140,14 +171,10 @@ async function resolveTakesFilePath(
   sourceId?: string,
 ): Promise<{ path: string; writeRoot: string }> {
   const src = sourceId ?? 'default';
-  const rows = await engine.executeRaw<{ local_path: string | null }>(
-    `SELECT local_path FROM sources WHERE id = $1`,
-    [src],
-  );
-  const sourceLocalPath = rows[0]?.local_path ?? null;
-  if (sourceLocalPath) {
+  const localPath = await sourceLocalPath(engine, src);
+  if (localPath) {
     // A source's own working tree files pages at its root (default layout).
-    return { path: resolvePageFilePath(sourceLocalPath, slug, 'default'), writeRoot: sourceLocalPath };
+    return { path: resolvePageFilePath(localPath, slug, 'default'), writeRoot: localPath };
   }
   return { path: resolvePageFilePath(brainDir, slug, src), writeRoot: brainDir };
 }

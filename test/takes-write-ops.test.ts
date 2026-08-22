@@ -397,6 +397,53 @@ describe('takes-write adversarial regressions (F1 cross-holder / P1-2 containmen
     expect(onDisk).toContain('| 1 | Ships consensus fact | fact | world | 0.8 |');
   });
 
+  test('no sync.repo_path: the write falls back to the page source\'s own local_path and still lands', async () => {
+    // The multi-source reality: `sync.repo_path` is the LEGACY pre-v0.18
+    // single-source key and is unset on brains that use `sources add`. Before
+    // the fallback, every takes_* MCP write died on takes_mirror_unavailable
+    // while the CLI escaped through --dir. The dir is now derived per-source.
+    const sourceRoot = mkdtempSync(join(tmpdir(), 'gbrain-takes-nosync-root-'));
+    const fallbackEngine = new Proxy(engine, {
+      get(target, prop) {
+        if (prop === 'executeRaw') {
+          return async (sql: unknown, params: unknown) => {
+            if (typeof sql === 'string' && /SELECT local_path FROM sources/i.test(sql)) {
+              return [{ local_path: sourceRoot }];
+            }
+            return (target as unknown as { executeRaw: (s: unknown, p: unknown) => Promise<unknown> })
+              .executeRaw(sql, params);
+          };
+        }
+        const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const slug = 'notes/no-sync-repo-path';
+    await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: 'x' });
+    await engine.unsetConfig('sync.repo_path');
+    try {
+      const res = await dispatchToolCall(fallbackEngine, 'takes_add', {
+        slug, claim: 'lands via the source local_path with no sync.repo_path', kind: 'fact', holder: 'world',
+      }, { ...STDIO_WORLD });
+      expect(res.isError ?? false).toBe(false);
+      expect(parsed(res).row_num).toBe(1);
+      const onDisk = join(sourceRoot, `${slug}.md`);
+      expect(existsSync(onDisk)).toBe(true);
+      expect(parseTakesFence(readFileSync(onDisk, 'utf-8')).takes.some(
+        t => t.claim === 'lands via the source local_path with no sync.repo_path',
+      )).toBe(true);
+      // And a resolve over the same fallback path works too (the whole point:
+      // agents can promote AND resolve, not just add).
+      const resv = parsed(await dispatchToolCall(fallbackEngine, 'takes_resolve', {
+        slug, row_num: 1, quality: 'correct',
+      }, { ...STDIO_WORLD }));
+      expect(resv.quality).toBe('correct');
+      expect(resv.resolved_by).toBe('mcp:stdio');
+    } finally {
+      await engine.setConfig('sync.repo_path', repo);
+    }
+  });
+
   test('P1-2: a symlinked page dir that escapes the repo root is refused; nothing is written outside the tree', async () => {
     const external = mkdtempSync(join(tmpdir(), 'gbrain-takes-external-'));
     // repo/escape-link → external (a sibling tree outside the repo root).
