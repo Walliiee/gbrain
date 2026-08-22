@@ -2365,6 +2365,8 @@ E. Candidate TASKS (work the transcript shows is still open):
    Write one page per candidate task, at most 3, and only when ALL of these hold:
    - The transcript shows a commitment, a request, or an unfinished piece of work — not a wish, not an idea, not something you think would be a good idea.
    - It was NOT completed inside this same transcript. If the work was done in-session, it is not a task; it belongs in a reflection or nowhere.
+   - **THE BRAIN DOES NOT ALREADY KNOW IT.** This is the test that matters and it was missing until 2026-08-22. ${linkManifestBlock ? 'SEARCH FIRST: look for this work in `tasks/current`, in `decisions/`, and in `learnings/`. If any of them already tracks it — open OR closed — do not propose it. A task the brain already has is not a candidate, it is noise, and a task the brain has already CLOSED is worse than noise because it manufactures a backlog that makes Mike look more blocked than he is.' : 'You have NO search tool in this run, so you CANNOT check whether the brain already knows this. Propose ONLY when the transcript itself shows the work is still open at the END of the session AND names an owner. When in doubt, do not propose — a missed task costs one nightly cycle; a duplicated one costs review time forever.'}
+   - It is not a restatement of another proposal you are writing in this same run. One defect discussed twice in a transcript is ONE task.
    - You can quote the exact sentence that creates it.
    Body MUST contain, as literal headed sections:
    \`## Proposed task\` — one imperative sentence.
