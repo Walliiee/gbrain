@@ -546,8 +546,12 @@ export async function runPhaseSynthesize(
     const childIds: number[] = [];
     /** Map child job_id → chunk metadata for D6 orchestrator-side slug rewrite. */
     const chunkInfo = new Map<number, { idx: number; hash6: string }>();
-    /** #1978: map child job_id → source transcript path so written pages get a raw_source stamp. */
-    const jobRawSource = new Map<number, string>();
+    /**
+     * #1978: map child job_id → the source transcript's path AND content
+     * digest, so written pages get a raw trace that survives the corpus file
+     * moving (path alone dies on the first archive/relocate).
+     */
+    const jobRawSource = new Map<number, { path: string; hash?: string }>();
     /** Skip reasons for the cycle report (D5 cap hits, D8 legacy-key skips). */
     const skipReports: Array<{ filePath: string; reason: string }> = [];
 
@@ -814,7 +818,7 @@ export async function runPhaseSynthesize(
           transcriptFreshIds.push(child.id);
         }
         childIds.push(child.id);
-        jobRawSource.set(child.id, t.filePath);
+        jobRawSource.set(child.id, { path: t.filePath, hash: t.contentHash });
         if (isChunked) {
           chunkInfo.set(child.id, { idx: i, hash6 });
         }
@@ -873,7 +877,7 @@ export async function runPhaseSynthesize(
         const cancelled = await queue.cancelJob(row.id);
         if (cancelled) {
           const src = jobRawSource.get(row.id);
-          if (src) budgetExhaustedDeferrals.push(basename(src));
+          if (src) budgetExhaustedDeferrals.push(basename(src.path));
         }
       }
     }
@@ -938,7 +942,7 @@ export async function runPhaseSynthesize(
     await stampDreamProvenance(engine, writtenRefs, summaryDate);
 
     // Dual-write: reverse-render each DB row → markdown file.
-    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId);
+    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, summaryDate);
 
     // Summary index page (deterministic; orchestrator-written via direct
     // engine.putPage so no allow-list path needed).
@@ -2348,8 +2352,8 @@ async function collectChildPutPageSlugs(
   childIds: number[],
   chunkInfo: Map<number, { idx: number; hash6: string }>,
   sourceId = 'default',
-  jobRawSource?: Map<number, string>,
-): Promise<Array<{ slug: string; source_id: string; raw_source?: string }>> {
+  jobRawSource?: Map<number, string | { path: string; hash?: string }>,
+): Promise<DreamPageRef[]> {
   if (childIds.length === 0) return [];
   // Raw fetch — NO SELECT DISTINCT. Preserves per-child slug duplicates so
   // the orchestrator sees what each child wrote. COALESCE handles both
@@ -2373,7 +2377,7 @@ async function collectChildPutPageSlugs(
   );
   // #1978: slug → source transcript path (first writer wins) so the
   // provenance stamp can record WHERE the synthesized content came from.
-  const rewritten = new Map<string, string | undefined>();
+  const rewritten = new Map<string, string | { path: string; hash?: string } | undefined>();
   for (const r of rows) {
     if (typeof r.slug !== 'string' || r.slug.length === 0) continue;
     // Postgres decodes the BIGINT FK as bigint; both metadata maps are keyed
@@ -2386,8 +2390,18 @@ async function collectChildPutPageSlugs(
     }
   }
   return Array.from(rewritten.keys()).sort().map(slug => {
-    const raw_source = rewritten.get(slug);
-    return { slug, source_id: sourceId, ...(raw_source ? { raw_source } : {}) };
+    // Back-compat: callers (and pinned tests) may still map job_id → a bare
+    // path string. Normalize both shapes here so the hash is optional, never
+    // required.
+    const trace = rewritten.get(slug);
+    const path = typeof trace === 'string' ? trace : trace?.path;
+    const hash = typeof trace === 'string' ? undefined : trace?.hash;
+    return {
+      slug,
+      source_id: sourceId,
+      ...(path ? { raw_source: path } : {}),
+      ...(path && hash ? { raw_source_hash: hash } : {}),
+    };
   });
 }
 
@@ -2461,44 +2475,221 @@ function findLegacyCompletion(
   return null;
 }
 
+// ── Generated-record contract stamp ──────────────────────────────────
+
+/**
+ * Scopes the shared record contract accepts. A gbrain source id that already
+ * IS a valid scope maps straight through; anything else falls back to
+ * `shared` — the widest non-restricted scope, so a page is never mislabelled
+ * as protected `adaptig` material it does not belong to.
+ */
+const RECORD_SCOPES = new Set(['adaptig', 'mike-business', 'shared']);
+
+/** Default shelf life of a dream-generated page, in days. */
+const GENERATED_TTL_DAYS = 90;
+
+/** Owner recorded on dream output: the producer, not a human. */
+const GENERATED_OWNER = 'gbrain-dream';
+
+/** A page a dream child wrote, plus the raw trace it was synthesized from. */
+export interface DreamPageRef {
+  slug: string;
+  source_id: string;
+  /** Absolute path of the source transcript. */
+  raw_source?: string;
+  /** Full sha256 hex of that transcript's bytes. */
+  raw_source_hash?: string;
+}
+
+export interface GeneratedRecordContext {
+  /** gbrain source the page belongs to. Maps to the record `scope`. */
+  sourceId?: string;
+  /** Cycle date, `YYYY-MM-DD`. Defaults to today. */
+  cycleDate?: string;
+  /** Absolute path of the transcript this page was synthesized from. */
+  rawSourcePath?: string;
+  /** Full sha256 hex of that transcript's bytes. */
+  rawSourceHash?: string;
+  /** Explicit `derived_from` when the caller knows a better reference. */
+  derivedFrom?: string;
+  /** Explicit `source_refs`; defaults to `[derived_from]`. */
+  sourceRefs?: string[];
+  /** Extra keys merged into `forced` (e.g. the summary's raw_trace exemption). */
+  extraForced?: Record<string, unknown>;
+}
+
+/**
+ * A raw-source reference that survives the corpus file moving.
+ *
+ * `raw_source` on its own is a bare filesystem path: the moment the corpus
+ * root changes or the transcript is archived, the provenance claim is
+ * unverifiable AND unfindable. Pinning the content digest into the reference
+ * makes the claim checkable against the bytes rather than the location.
+ */
+function rawSourceRef(path: string, hash?: string): string {
+  return hash ? `file://${path}#sha256=${hash.slice(0, 12)}` : `file://${path}`;
+}
+
+/** `YYYY-MM-DD` + n days, UTC, same shape back. Invalid input passes through. */
+function addDays(isoDate: string, days: number): string {
+  const base = new Date(`${isoDate}T00:00:00Z`);
+  if (Number.isNaN(base.getTime())) return isoDate;
+  base.setUTCDate(base.getUTCDate() + days);
+  return base.toISOString().slice(0, 10);
+}
+
+/**
+ * The frontmatter every dream-generated page must carry, split into the two
+ * merge classes the record contract needs.
+ *
+ * WHY THIS EXISTS. Generated pages used to carry exactly three keys —
+ * `dream_generated`, `dream_cycle_date`, `raw_source`. A governed retrieval
+ * policy demotes replaceable output through weights keyed on `generated:
+ * true` and `canonical: false`; with neither key present the demotion could
+ * never fire, so fresh synthesis systematically outranked the canonical
+ * record on its own subject. Measured on one query before this change: the
+ * generated page held rank 1 at score 1.0000 while the canonical record on
+ * the same subject sat at rank 9.
+ *
+ * `defaults` merge UNDER whatever the page already carries, so a subagent's
+ * own `status` survives and a re-render never resets `created`. `forced`
+ * merge OVER, because they are guarantees the orchestrator makes on the
+ * subagent's behalf: dream output is never canonical, is always flagged
+ * generated, and always states its provenance and raw trace.
+ *
+ * Deliberately absent: `ingested_at`, `ingested_via`, `source_kind`,
+ * `source_uri`, `captured_at`, `captured_via`. Those are server-managed
+ * ingestion metadata; a record validator rejects them inside source Markdown.
+ */
+export function generatedRecordStamp(
+  ctx: GeneratedRecordContext = {},
+): { defaults: Record<string, unknown>; forced: Record<string, unknown> } {
+  const cycleDate = ctx.cycleDate ?? today();
+  const scope = ctx.sourceId && RECORD_SCOPES.has(ctx.sourceId) ? ctx.sourceId : 'shared';
+  const rawRef = ctx.rawSourcePath ? rawSourceRef(ctx.rawSourcePath, ctx.rawSourceHash) : undefined;
+  const derivedFrom = ctx.derivedFrom ?? rawRef ?? `gbrain:dream-cycle/${cycleDate}`;
+  const sourceRefs = ctx.sourceRefs?.length ? ctx.sourceRefs : [derivedFrom];
+  return {
+    defaults: {
+      scope,
+      status: 'active',
+      owner: GENERATED_OWNER,
+      visibility: 'internal',
+      sensitivity: 'standard',
+      record_version: 1,
+      created: cycleDate,
+      expires_at: addDays(cycleDate, GENERATED_TTL_DAYS),
+      promotion_target: `${scope}:learnings`,
+      derived_from: derivedFrom,
+      source_refs: sourceRefs,
+    },
+    forced: {
+      canonical: false,
+      generated: true,
+      authority_level: 'derived',
+      provenance: 'synthesis',
+      updated_at: cycleDate,
+      dream_generated: true,
+      dream_cycle_date: cycleDate,
+      ...(ctx.rawSourcePath
+        ? {
+            raw_source: ctx.rawSourcePath,
+            raw_source_name: basename(ctx.rawSourcePath),
+            ...(ctx.rawSourceHash ? { raw_source_sha256: `sha256:${ctx.rawSourceHash}` } : {}),
+          }
+        : {}),
+      ...(ctx.extraForced ?? {}),
+    },
+  };
+}
+
+/**
+ * The record contract requires exactly one H1 in the body, equal to `title`.
+ * `serializePageToMarkdown` writes the title into FRONTMATTER only, and the
+ * synthesis subagent writes prose with no top-level heading — so every
+ * generated page failed `validate --strict` with `missing_h1` (3 of 3 on the
+ * proving run). Normalize here, in the producer:
+ *
+ *   - no H1 at all      → prepend one built from the page title;
+ *   - first H1 differs  → rewrite that heading to the title, because a title
+ *                         and its own H1 disagreeing is itself a contract
+ *                         violation (`title_h1_mismatch`).
+ *
+ * Idempotent: a re-render, or a sync round-trip that folded the H1 into
+ * `compiled_truth`, never adds a second heading. The H1 regex deliberately
+ * mirrors the validator's own (`(?m)^#\s+(.+?)\s*$`) so "has an H1" means
+ * the same thing on both sides.
+ */
+export function ensureBodyH1(body: string, title: string): string {
+  const heading = title.trim();
+  if (!heading) return body;
+  const h1 = /^#[ \t]+(.+?)[ \t]*$/m;
+  const match = h1.exec(body);
+  if (!match) return `# ${heading}\n\n${body.replace(/^\n+/, '')}`;
+  if (match[1].split(/\s+/).join(' ') === heading.split(/\s+/).join(' ')) return body;
+  return body.slice(0, match.index) + `# ${heading}` + body.slice(match.index + match[0].length);
+}
+
+/** Apply the stamp to an existing frontmatter object: defaults under, forced over. */
+export function applyGeneratedStamp(
+  existing: Record<string, unknown> | null | undefined,
+  ctx: GeneratedRecordContext = {},
+): Record<string, unknown> {
+  const { defaults, forced } = generatedRecordStamp(ctx);
+  return { ...defaults, ...(existing ?? {}), ...forced };
+}
+
 // ── Dream-provenance DB stamp (#2569) ────────────────────────────────
 
 /**
- * Persist the dream-output identity marker (`dream_generated: true` +
- * `dream_cycle_date`) into the `pages.frontmatter` JSONB row for every page
- * a synthesize child wrote. Render-time `frontmatterOverrides` alone only
- * reach the markdown FILE — the DB row stayed unstamped, so DB consumers
- * couldn't enumerate generated pages and a later put_page write-through
- * (which re-renders from the DB row) silently erased the marker.
+ * Persist the FULL generated-record contract into the `pages.frontmatter`
+ * JSONB row for every page a synthesize child wrote. Render-time
+ * `frontmatterOverrides` alone only reach the markdown FILE — the DB row
+ * stayed unstamped, so DB consumers couldn't enumerate generated pages and a
+ * later put_page write-through (which re-renders from the DB row) silently
+ * erased the marker.
  *
- * Plain UPDATE through executeRawJsonb (raw object bound to $3::jsonb —
+ * The stamp is no longer three identity keys. It is the whole contract
+ * (`generatedRecordStamp`), because the retrieval policy that demotes
+ * replaceable output reads `generated` / `canonical` / `authority_level` /
+ * `status` / `expires_at` — none of which the three-key stamp ever emitted,
+ * so the demotion never fired and generated pages buried canonical truth.
+ *
+ * Merge order is `defaults || existing || forced`: a subagent's own choices
+ * survive where the contract allows them, and the orchestrator's guarantees
+ * (never canonical, always generated, always provenanced) win outright.
+ *
+ * Plain UPDATE through executeRawJsonb (raw objects bound to `$N::jsonb` —
  * never JSON.stringify into a ::jsonb cast; engine-parity safe, no new
  * engine method). Best-effort per row: a stamp failure never kills the
- * phase (the render-time override still covers the file).
+ * phase (the render-time stamp still covers the file).
  */
 async function stampDreamProvenance(
   engine: BrainEngine,
-  refs: Array<{ slug: string; source_id: string; raw_source?: string }>,
+  refs: DreamPageRef[],
   cycleDate: string,
 ): Promise<void> {
   if (refs.length === 0) return;
   const { executeRawJsonb } = await import('../sql-query.ts');
-  for (const { slug, source_id, raw_source } of refs) {
+  for (const { slug, source_id, raw_source, raw_source_hash } of refs) {
+    // #1978 raw-source persistence: record the transcript the synthesis was
+    // derived from — path, basename and content digest — so `gbrain doctor`
+    // (raw_provenance check) can verify the trace and a reader can still find
+    // the evidence after the corpus file moves.
+    const { defaults, forced } = generatedRecordStamp({
+      sourceId: source_id,
+      cycleDate,
+      rawSourcePath: raw_source,
+      rawSourceHash: raw_source_hash,
+    });
     try {
       await executeRawJsonb(
         engine,
         `UPDATE pages
-            SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $3::jsonb
+            SET frontmatter = $3::jsonb || COALESCE(frontmatter, '{}'::jsonb) || $4::jsonb
           WHERE slug = $1 AND source_id = $2`,
         [slug, source_id],
-        // #1978 raw-source persistence: record the transcript path the
-        // synthesis was derived from, so `gbrain doctor` (raw_provenance
-        // check) can verify every generated page carries a raw trace.
-        [{
-          dream_generated: true,
-          dream_cycle_date: cycleDate,
-          ...(raw_source ? { raw_source } : {}),
-        }],
+        [defaults, forced],
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -2512,18 +2703,26 @@ async function stampDreamProvenance(
 async function reverseWriteRefs(
   engine: BrainEngine,
   brainDir: string,
-  refs: Array<{ slug: string; source_id: string }>,
+  refs: DreamPageRef[],
   nativeSourceId = 'default',
+  cycleDate?: string,
 ): Promise<number> {
   let count = 0;
-  for (const { slug, source_id } of refs) {
+  for (const { slug, source_id, raw_source, raw_source_hash } of refs) {
     // v0.32.8 F6: validate source_id is filesystem-safe before any join().
     validateSourceId(source_id);
     const page = await engine.getPage(slug, { sourceId: source_id });
     if (!page) continue;
     const tags = await engine.getTags(slug, { sourceId: source_id });
     try {
-      const md = renderPageToMarkdown(page, tags);
+      // The DB row is already stamped, so this context is belt-and-braces —
+      // it also covers a row that lost its stamp to a write-through.
+      const md = renderPageToMarkdown(page, tags, {
+        sourceId: source_id,
+        cycleDate,
+        rawSourcePath: raw_source,
+        rawSourceHash: raw_source_hash,
+      });
       // v0.32.8 F6: foreign-source pages land at brainDir/.sources/<id>/<slug>.md
       // so same-slug-different-source pages don't collide. Pages belonging to
       // the cycle's own source (#1586: brainDir IS that source's checkout —
@@ -2544,25 +2743,36 @@ async function reverseWriteRefs(
 }
 
 /**
- * Render a Page to markdown, stamping the dream-output identity marker into
- * frontmatter. This stamp is the explicit identity surface checked by
- * `isDreamOutput` in transcript-discovery.ts. Stamping at render time covers
+ * Render a Page to markdown, stamping the FULL generated-record contract into
+ * frontmatter. `dream_generated` remains the explicit identity surface checked
+ * by `isDreamOutput` in transcript-discovery.ts. Stamping at render time covers
  * every reverse-write path (subagent reflections + originals + summary) with
  * one funnel; the prior content-pattern guard could miss real output because
  * `serializeMarkdown` does not embed the page slug in the body.
+ *
+ * The stamp used to be two keys, which is why generated pages outranked
+ * canonical records: a retrieval policy that demotes replaceable output keys
+ * on `generated` / `canonical`, and neither was ever written. See
+ * `generatedRecordStamp` for the full rationale and merge order.
  */
-export function renderPageToMarkdown(page: Page, tags: string[]): string {
-  // v0.38 DRY: the dream-output identity stamp (dream_generated +
-  // dream_cycle_date) is the ONLY thing that differs from the v0.38
-  // put_page write-through renderer. Both call the shared
-  // serializePageToMarkdown helper in markdown.ts; this wrapper passes
-  // the dream-specific overrides. Future markdown-shape changes happen
-  // in one place.
-  return serializePageToMarkdown(page, tags, {
-    frontmatterOverrides: {
-      dream_generated: true,
-      dream_cycle_date: today(),
-    },
+export function renderPageToMarkdown(
+  page: Page,
+  tags: string[],
+  ctx: GeneratedRecordContext = {},
+): string {
+  // v0.38 DRY: the generated-record stamp is the ONLY thing that differs from
+  // the v0.38 put_page write-through renderer. Both call the shared
+  // serializePageToMarkdown helper in markdown.ts; this wrapper passes the
+  // dream-specific frontmatter. Future markdown-shape changes happen in one
+  // place. `applyGeneratedStamp` folds the page's own frontmatter in at the
+  // right precedence, so passing the result as overrides is exact.
+  const title = page.title ?? '';
+  const withH1 = { ...page, compiled_truth: ensureBodyH1(page.compiled_truth ?? '', title) };
+  return serializePageToMarkdown(withH1, tags, {
+    frontmatterOverrides: applyGeneratedStamp(
+      (page.frontmatter ?? {}) as Record<string, unknown>,
+      ctx,
+    ),
   });
 }
 
@@ -2596,19 +2806,28 @@ async function writeSummaryPage(
   }
 
   const body = lines.join('\n');
-  // Stamp the dream-output identity marker into the summary's frontmatter.
+  // Stamp the full generated-record contract into the summary's frontmatter.
   // parseMarkdown below round-trips it into the DB-stored frontmatter, so the
-  // marker survives any later reverse-render of the summary page.
-  const fullMarkdown = serializeMarkdown(
-    {
-      dream_generated: true,
-      dream_cycle_date: summaryDate,
-      // #1978: deterministic index page — no source document of its own;
-      // raw traces live on the listed pages. Explicit exemption keeps the
-      // doctor raw_provenance check quiet.
+  // stamp survives any later reverse-render of the summary page. The summary
+  // is generated output like any other page and must be demoted like one —
+  // it is an index of replaceable pages, never an authority.
+  const { defaults, forced } = generatedRecordStamp({
+    sourceId,
+    cycleDate: summaryDate,
+    // #1978: deterministic index page — no source document of its own; raw
+    // traces live on the listed pages. Explicit exemption keeps the doctor
+    // raw_provenance check quiet.
+    derivedFrom: `gbrain:dream-cycle/${summaryDate}`,
+    sourceRefs: writtenSlugs.length > 0
+      ? writtenSlugs.map(s => `${sourceId}:${s}`)
+      : [`gbrain:dream-cycle/${summaryDate}`],
+    extraForced: {
       raw_trace_exempt: true,
       raw_trace_exempt_reason: 'deterministic dream-cycle index; raw traces live on listed pages',
-    } as Record<string, unknown>,
+    },
+  });
+  const fullMarkdown = serializeMarkdown(
+    { ...defaults, ...forced } as Record<string, unknown>,
     body,
     '',
     { type: 'note' as string, title: `Dream cycle ${summaryDate}`, tags: ['dream-cycle'] },

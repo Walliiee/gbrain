@@ -37,7 +37,7 @@ import type { Page, PageType } from '../types.ts';
 // data-dir, on Postgres because the parent phase itself occupies a worker
 // slot and can deadlock a fully-occupied worker (#2050). synthesize.ts
 // drains its own children the same way.
-import { loadAllowedSlugPrefixes, loadOutputRoot, runSubagentsInline } from './synthesize.ts';
+import { applyGeneratedStamp, ensureBodyH1, loadAllowedSlugPrefixes, loadOutputRoot, runSubagentsInline } from './synthesize.ts';
 import { probeChatModel } from '../ai/gateway.ts';
 import { normalizeModelId } from '../model-id.ts';
 
@@ -277,8 +277,14 @@ export async function runPhasePatterns(
     const cycleSourceId = opts.sourceId ?? 'default';
     const writtenRefs = await collectChildPutPageSlugs(engine, [job.id], cycleSourceId);
 
-    // Reverse-write to fs.
-    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId);
+    // Reverse-write to fs. Pattern pages are dream output too: they carry the
+    // same generated-record stamp as the synthesize phase's pages, or the
+    // retrieval policy's `generated`/`canonical` demotion cannot fire on them
+    // either and a cross-session pattern outranks the canonical record.
+    const patternCycleDate = new Date().toISOString().slice(0, 10);
+    const reverseWriteCount = await reverseWriteRefs(
+      engine, opts.brainDir, writtenRefs, cycleSourceId, patternCycleDate,
+    );
 
     const details = {
       reflections_considered: reflections.length,
@@ -519,6 +525,7 @@ async function reverseWriteRefs(
   brainDir: string,
   refs: Array<{ slug: string; source_id: string }>,
   nativeSourceId = 'default',
+  cycleDate?: string,
 ): Promise<number> {
   let count = 0;
   for (const { slug, source_id } of refs) {
@@ -529,7 +536,7 @@ async function reverseWriteRefs(
     if (!page) continue;
     const tags = await engine.getTags(slug, { sourceId: source_id });
     try {
-      const md = renderPageToMarkdown(page, tags);
+      const md = renderPageToMarkdown(page, tags, source_id, cycleDate);
       // v0.32.8 F6: foreign-source pages land under brainDir/.sources/<id>/<slug>.md
       // so same-slug-different-source pages don't collide on disk. Pages belonging
       // to the cycle's own source (#1586: brainDir IS that source's checkout —
@@ -549,11 +556,23 @@ async function reverseWriteRefs(
   return count;
 }
 
-function renderPageToMarkdown(page: Page, tags: string[]): string {
-  const frontmatter = (page.frontmatter ?? {}) as Record<string, unknown>;
+function renderPageToMarkdown(
+  page: Page,
+  tags: string[],
+  sourceId?: string,
+  cycleDate?: string,
+): string {
+  // Same generated-record contract the synthesize phase stamps. Before this,
+  // pattern pages carried NO lifecycle frontmatter at all — not even
+  // `dream_generated` — so nothing downstream could tell replaceable
+  // cross-session synthesis apart from a maintained canonical record.
+  const frontmatter = applyGeneratedStamp(
+    (page.frontmatter ?? {}) as Record<string, unknown>,
+    { sourceId, cycleDate },
+  );
   return serializeMarkdown(
     frontmatter,
-    page.compiled_truth ?? '',
+    ensureBodyH1(page.compiled_truth ?? '', page.title ?? ''),
     page.timeline ?? '',
     {
       type: (page.type as string) ?? 'note',
