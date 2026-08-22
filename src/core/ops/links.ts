@@ -8,7 +8,13 @@
  */
 
 import type { Operation } from './contract.ts';
-import { enforceClientSlugFence, linkReadScopeOpts, sourceScopeOpts } from './context.ts';
+import {
+  enforceClientSlugFence,
+  graphTraversalScopeOpts,
+  linkReadScopeOpts,
+  resolveLinkEndpointSource,
+  sourceScopeOpts,
+} from './context.ts';
 
 // --- Links ---
 
@@ -33,6 +39,8 @@ const add_link: Operation = {
     link_type: { type: 'string', description: 'Link type (e.g., invested_in, works_at)' },
     context: { type: 'string', description: 'Context for the link' },
     link_source: { type: 'string', description: "Provenance tag (kebab-case, e.g. 'citation-graph'). Defaults to 'manual'. Reconciliation-managed built-ins (markdown/frontmatter/mentions/wikilink-resolved) are rejected." },
+    from_source_id: { type: 'string', description: "Source the `from` page lives in. Defaults to your own source scope. Set BOTH this and to_source_id to write a CROSS-SOURCE edge, e.g. a person page in 'adaptig' pointing at a decision in 'shared'." },
+    to_source_id: { type: 'string', description: "Source the `to` page lives in. Defaults to your own source scope. See from_source_id." },
   },
   mutating: true,
   scope: 'write',
@@ -52,11 +60,15 @@ const add_link: Operation = {
         `use 'manual' (the default) or a custom kebab tag like 'citation-graph'`,
       );
     }
-    // v0.31.8 (D7): single ctx.sourceId scopes both endpoints + origin. Cross-
-    // source link creation is out of scope for this wave; use the engine API
-    // directly for that edge case.
-    const linkOpts = ctx.sourceId
-      ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId, originSourceId: ctx.sourceId }
+    // XSRC (fork patch, 2026-08-22): endpoints resolve INDEPENDENTLY so a cross-source edge is
+    // writable through the normal surface. Omitting both params reproduces the
+    // pre-fix behavior exactly (both = ctx.sourceId). `originSourceId` follows
+    // the FROM endpoint: the origin page is the page whose content produced the
+    // edge, and for a hand-created edge that is the from page's source.
+    const fromSourceId = resolveLinkEndpointSource(ctx, p.from_source_id, 'from_source_id', 'add_link');
+    const toSourceId = resolveLinkEndpointSource(ctx, p.to_source_id, 'to_source_id', 'add_link');
+    const linkOpts = fromSourceId || toSourceId
+      ? { fromSourceId, toSourceId, originSourceId: fromSourceId }
       : undefined;
     await ctx.engine.addLink( // gbrain-allow-direct-insert: add_link MCP op is the explicit canonical surface for manual link creation; auto-link reconciliation runs separately via auto_link post-hook
       p.from as string, p.to as string,
@@ -77,14 +89,20 @@ const remove_link: Operation = {
     to: { type: 'string', required: true, description: 'Slug of the page the link points to.' },
     link_type: { type: 'string', description: 'Only remove edges of this link type (omit = all types)' },
     link_source: { type: 'string', description: 'Only remove edges of this provenance (e.g. citation-graph); omit = any provenance' },
+    from_source_id: { type: 'string', description: 'Source the `from` page lives in. Defaults to your own source scope. Needed to remove a cross-source edge written with add_link.' },
+    to_source_id: { type: 'string', description: 'Source the `to` page lives in. Defaults to your own source scope.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     enforceClientSlugFence(ctx, p.from as string, 'remove_link');
     if (ctx.dryRun) return { dry_run: true, action: 'remove_link', from: p.from, to: p.to };
-    const linkOpts = ctx.sourceId
-      ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId }
+    // XSRC (fork patch, 2026-08-22): mirror add_link's independent endpoint resolution — an edge the
+    // op layer can create must be one the op layer can delete.
+    const fromSourceId = resolveLinkEndpointSource(ctx, p.from_source_id, 'from_source_id', 'remove_link');
+    const toSourceId = resolveLinkEndpointSource(ctx, p.to_source_id, 'to_source_id', 'remove_link');
+    const linkOpts = fromSourceId || toSourceId
+      ? { fromSourceId, toSourceId }
       : undefined;
     await ctx.engine.removeLink(
       p.from as string, p.to as string,
@@ -177,7 +195,11 @@ const traverse_graph: Operation = {
     // walks stay within the auth'd client's accessible sources. Pre-fix,
     // traverseGraph / traversePaths happily followed edges into pages from
     // foreign sources, leaking topology + page metadata via the graph op.
-    const scope = sourceScopeOpts(ctx);
+    // XSRC (fork patch, 2026-08-22): graphTraversalScopeOpts, not sourceScopeOpts. The #861 seal below
+    // stays intact for remote callers; a trusted local caller with an
+    // UNQUALIFIED scope now walks the federated floor, so a cross-source edge
+    // is reachable instead of silently dropped at the seed/step/SELECT joins.
+    const scope = graphTraversalScopeOpts(ctx);
     // Backward compat: when neither link_type nor direction is provided, return
     // the legacy GraphNode[] shape. Once either is set, switch to GraphPath[].
     if (linkType === undefined && direction === undefined) {

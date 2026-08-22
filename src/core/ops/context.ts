@@ -477,6 +477,106 @@ export function linkReadScopeOpts(ctx: OperationContext): { sourceId?: string; s
 }
 
 /**
+ * XSRC (fork patch, 2026-08-22) — source scope for GRAPH TRAVERSAL (`traverse_graph`).
+ *
+ * `traverse_graph` was sealed in v0.34.1 (#861) with the generic
+ * `sourceScopeOpts`, which predates BOTH the link-read scope (#2200) and the
+ * federated read floor (#2561/#3242). The seal itself is deliberate and stays:
+ * a REMOTE caller must never walk an edge into a page outside its grant. But
+ * the scalar branch it emits for a TRUSTED LOCAL caller pins seed, step and
+ * SELECT joins to one source id, so an edge whose far endpoint lives in a
+ * sibling source is invisible even to the machine owner — while `search`,
+ * `get_page`, `get_links` and `get_backlinks` all show it. That asymmetry is
+ * incidental, not a boundary: it made every cross-source edge in the table
+ * unreachable through the graph API.
+ *
+ * So: delegate to `sourceScopeOpts` (unchanged precedence, unchanged remote
+ * behavior), then widen an UNQUALIFIED scalar scope to the transport-computed
+ * federated floor — the SAME `ctx.localFederatedSourceIds` set that
+ * `federatedSearchScope` uses, and the same gate (field presence, decided by
+ * the transport, never by a caller param).
+ *
+ * What this deliberately does NOT do:
+ *   - widen a federated grant array (OAuth grant governs — passes through);
+ *   - widen when the transport left `localFederatedSourceIds` unset, which is
+ *     exactly the case for an EXPLICIT `--source X` / `GBRAIN_SOURCE` /
+ *     `.gbrain-source` binding (tier `flag`/`env`/`dotfile`) and for any
+ *     remote caller. Explicit scope stays scalar, as with search;
+ *   - reach a PARKED or RETIRED source. `localFederatedSourceIds` is built
+ *     from `config.federated = true AND archived = false`, so an unfederated
+ *     source (`gbrain sources unfederate`) is absent from the floor and stays
+ *     untraversable. Traversal reachability therefore tracks the federation
+ *     ruling exactly, with no second list to keep in sync.
+ */
+export function graphTraversalScopeOpts(ctx: OperationContext): { sourceId?: string; sourceIds?: string[] } {
+  const scope = sourceScopeOpts(ctx);
+  if (
+    scope.sourceId !== undefined &&
+    scope.sourceIds === undefined &&
+    ctx.localFederatedSourceIds !== undefined &&
+    ctx.localFederatedSourceIds.length > 1
+  ) {
+    return { sourceIds: ctx.localFederatedSourceIds };
+  }
+  return scope;
+}
+
+/**
+ * XSRC (fork patch, 2026-08-22) — resolve ONE link endpoint's source id for the `add_link` /
+ * `remove_link` write ops.
+ *
+ * Pre-fix, both ops hard-coded `fromSourceId = toSourceId = originSourceId =
+ * ctx.sourceId` with the comment "cross-source link creation is out of scope
+ * for this wave; use the engine API directly for that edge case". Both engines
+ * (`postgres-engine.addLink`, `pglite-engine.addLink`) have accepted
+ * independent `fromSourceId` / `toSourceId` since v0.18 — the restriction only
+ * ever existed at the op layer, so the single most valuable edge shape in a
+ * multi-source brain (a person page in one source pointing at a decision in
+ * another) could not be written through the CLI or MCP at all.
+ *
+ * FAIL-CLOSED resolution, mirroring `resolveRequestedScope`:
+ *   - omitted            → `ctx.sourceId` (byte-identical to the old behavior)
+ *   - equal to ctx.sourceId → accepted (no cross-source hop requested)
+ *   - `__all__`          → invalid_params. A write names exactly ONE source;
+ *                          the span-everything sentinel is a read concept.
+ *   - trusted local (`ctx.remote === false`) → accepted. The user owns the
+ *                          machine and named the source deliberately.
+ *   - remote WITH a federated grant containing it → accepted.
+ *   - anything else      → permission_denied.
+ *
+ * Note the asymmetry with reads is intentional: a remote caller cannot widen
+ * into a source it was not granted, and a caller with no grant array at all
+ * cannot leave its scalar source.
+ */
+export function resolveLinkEndpointSource(
+  ctx: OperationContext,
+  requested: unknown,
+  endpoint: 'from_source_id' | 'to_source_id',
+  opName: string,
+): string | undefined {
+  if (requested === undefined || requested === null || requested === '') return ctx.sourceId;
+  if (typeof requested !== 'string') {
+    throw new OperationError('invalid_params', `${endpoint} must be a source id string`);
+  }
+  if (requested === ALL_SOURCES) {
+    throw new OperationError(
+      'invalid_params',
+      `${endpoint} cannot be '${ALL_SOURCES}' — ${opName} writes one edge between two named pages, so each endpoint resolves to exactly one source.`,
+      'Pass the concrete source id (see `gbrain sources list`).',
+    );
+  }
+  if (requested === ctx.sourceId) return requested;
+  if (ctx.remote === false) return requested;
+  const allowed = ctx.auth?.allowedSources;
+  if (allowed && allowed.length > 0 && allowed.includes(requested)) return requested;
+  throw new OperationError(
+    'permission_denied',
+    `source '${requested}' is outside your granted sources`,
+    `Omit ${endpoint} to use your own source scope, or request access to '${requested}'.`,
+  );
+}
+
+/**
  * Resolve a per-call requested source scope against the caller's trust + grant.
  * FAIL-CLOSED: anything not strictly `ctx.remote === false` is untrusted.
  *

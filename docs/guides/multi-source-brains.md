@@ -217,6 +217,37 @@ Reads span federated sources by default. Writes require a resolved
 source (explicit, inferred, or default). The resolver never picks a
 source silently when ambiguous — it errors with a clear fix.
 
+## Cross-source links
+
+A link's two endpoints resolve independently. Both default to your
+resolved source, so nothing changes for a single-source edge; name the
+far source to write an edge that crosses:
+
+```bash
+# A person page in `adaptig` that points at a decision in `shared`
+cd ~/adaptig-AI-brain
+gbrain link 10-company/people/person-casper-guldager \
+            decisions/2026-08-18-ship-the-dashboard \
+            --to-source-id shared \
+            --link_type wants --link_source citation-graph
+
+# Same flags on the way back out
+gbrain unlink <from> <to> --to-source-id shared --link_source citation-graph
+```
+
+`--from-source-id` exists for the mirror case. Over MCP the same two
+params are `from_source_id` / `to_source_id`. A remote caller may only
+name a source inside its grant; a local CLI caller may name any source.
+
+Traversal follows the same federation rule as search: `gbrain graph`
+walks the **federated floor** — your resolved source plus every other
+`federated: true`, non-archived source — so a cross-source edge is
+returned. Pass `--source <id>` and the scope narrows back to that one
+source, exactly as it does for `gbrain search`. An **unfederated**
+(`gbrain sources unfederate`) or **archived** source is never part of the
+floor, so its edges stay unreachable in both directions until you
+re-federate it.
+
 ## Durability: keep a brain repo in sync (auto-harden)
 
 A long-lived agent that writes to a knowledge-wiki git repo needs three

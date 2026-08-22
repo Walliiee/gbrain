@@ -40,6 +40,8 @@ export {
   sourceScopeOpts,
   thinkSourceScopeOpts,
   linkReadScopeOpts,
+  graphTraversalScopeOpts,
+  resolveLinkEndpointSource,
   resolveRequestedScope,
   federatedSearchScope,
   resolveCodeIntelScope,
