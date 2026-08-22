@@ -25,7 +25,7 @@
  * risk codex flagged in #1451 review was consistency, not throughput.
  */
 
-import { existsSync, readFileSync, readdirSync, type Dirent } from 'fs';
+import { existsSync, readFileSync, readdirSync, statSync, type Dirent } from 'fs';
 import { join } from 'path';
 import { parseResolverEntries, type ResolverEntry } from './check-resolvable.ts';
 import { findAllResolverFiles } from './resolver-filenames.ts';
@@ -84,10 +84,27 @@ function loadFrontmatterEntries(skillsDir: string): SkillTriggerEntry[] {
   }
 
   for (const dirent of dirents) {
-    if (!dirent.isDirectory()) continue;
     const name = dirent.name;
     if (name.startsWith('_') || name.startsWith('.')) continue;
     if (FRONTMATTER_SKIP_DIRS.has(name)) continue;
+
+    // `Dirent.isDirectory()` is lstat-shaped: it returns FALSE for a
+    // symlink pointing at a directory. `skill-manifest.ts:deriveManifest`
+    // walks this same tree with `statSync` (which FOLLOWS symlinks), so a
+    // symlinked skill was COUNTED in the manifest while its `triggers:`
+    // frontmatter was never read here — making every symlinked skill
+    // permanently "unreachable" no matter what its frontmatter said.
+    // Resolve the same way the manifest does. `statSync` in a try/catch
+    // turns a dangling symlink (ENOENT) or a symlink cycle (ELOOP) into a
+    // skip rather than a throw; cycles cannot run away because this walk
+    // is one level deep and never recurses.
+    let isDir = false;
+    try {
+      isDir = statSync(join(skillsDir, name)).isDirectory();
+    } catch {
+      continue;
+    }
+    if (!isDir) continue;
 
     const skillMdPath = join(skillsDir, name, 'SKILL.md');
     if (!existsSync(skillMdPath)) continue;
