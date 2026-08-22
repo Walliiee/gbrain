@@ -159,7 +159,9 @@
       "wiki/originals/*",
       "wiki/personal/patterns/*",
       "wiki/people/*",
-      "dream-cycle-summaries/*"
-    ]
+      "dream-cycle-summaries/*",
+      "dream-cycle-proposals/*"
+    ],
+    "proposals_note": "`dream-cycle-proposals/*` is a REVIEW QUEUE, not a write target for truth. It holds candidate tasks and candidate corrections the synthesis subagent extracted from a transcript. Every page under it is stamped canonical:false, generated:true, authority_level:derived, status:proposed with a 30-day expiry — the four levers the retrieval policy multiplies, so a proposal ranks at roughly 0.06x a canonical record and drops out of normal search entirely once it expires. Nothing here is acted on until a human moves it. Deliberately NOT allow-listed, and must never be added: tasks/*, decisions/*, learnings/*, context/*, agent-runs/*. An LLM does not write Mike's task list or edit a decision record."
   }
 }

@@ -57,7 +57,7 @@ import { isQueueQuotaExceededError } from '../minions/admission.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
 import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
 import { runSubagentsInline, runDrainRenewalTick, percentile, INLINE_LOCK_MS } from './inline-drain.ts';
-import { buildManifestContext, buildLinkManifest, type ManifestContext } from './link-manifest.ts';
+import { buildManifestContext, buildLinkManifest, DREAM_PROPOSAL_PREFIX, type ManifestContext } from './link-manifest.ts';
 
 // Re-exports: the drain was peeled to inline-drain.ts (dream-wave C7);
 // patterns.ts and the __testing surface import from here unchanged.
@@ -2286,6 +2286,16 @@ function buildSynthesisPrompt(
   const crossRefRule = linkManifestBlock
     ? 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Pick targets from the LINK CANDIDATES above (or another page you write in this response); use the search tool, if available, only when no candidate fits.'
     : 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Use the search tool to find existing pages first.';
+  // Task F's hard gate is only satisfiable if the subagent has some way to
+  // learn a REAL slug. With a manifest it reads one off the list; without a
+  // manifest the only route is the search tool, which the oneshot path does
+  // not have. Telling a tool-less run to "take a slug from LINK CANDIDATES"
+  // when no such block exists is an invitation to invent one, so the
+  // manifest-less wording forbids corrections outright rather than leaving
+  // the model to improvise a target.
+  const correctionTargetRule = linkManifestBlock
+    ? 'taken from LINK CANDIDATES above, or found with the search tool if one is available.'
+    : 'found with the search tool. If this run has no search tool, you cannot verify that any target exists — write NO correction pages at all.';
   // OV-7: the write allow-list must live in the PROMPT, not only in the
   // put_page tool schema — the oneshot path never sees a tool schema.
   const allowedPathsBlock = allowedSlugPrefixes.length > 0
@@ -2315,6 +2325,39 @@ B. Originals (new ideas, frames, theses, mental models):
 C. People mentions: ${linkManifestBlock ? 'check LINK CANDIDATES (and the search tool, when available) first' : 'search first, when a search tool is available'}; never write over an existing person page (the orchestrator handles people enrichment via timeline entries — your job is the reflection/original synthesis, NOT modifying existing person pages).
 
 D. If nothing in this transcript meets the bar (significance filter already passed but the content is still routine), return without writing anything.
+
+E. Candidate TASKS (work the transcript shows is still open):
+   slug: \`${DREAM_PROPOSAL_PREFIX}${dateHint}-task-<short-slug>-${hashSuffix}\`
+   Write one page per candidate task, at most 3, and only when ALL of these hold:
+   - The transcript shows a commitment, a request, or an unfinished piece of work — not a wish, not an idea, not something you think would be a good idea.
+   - It was NOT completed inside this same transcript. If the work was done in-session, it is not a task; it belongs in a reflection or nowhere.
+   - You can quote the exact sentence that creates it.
+   Body MUST contain, as literal headed sections:
+   \`## Proposed task\` — one imperative sentence.
+   \`## Owner\` — who does it, named from the transcript.
+   \`## Done when\` — an observable condition someone else could check.
+   \`## Evidence\` — the verbatim quote, in quotation marks, that creates the task.
+   \`## Why this is not already done\` — one sentence.
+
+F. Candidate CORRECTIONS (the transcript contradicts something the brain already says):
+   slug: \`${DREAM_PROPOSAL_PREFIX}${dateHint}-correction-<short-slug>-${hashSuffix}\`
+   Write one page per correction, at most 3.
+   HARD GATE — a correction that cannot name its target is worthless, so:
+   - You MUST name an EXISTING page, by \`<source-id>:<slug>\`, ${correctionTargetRule} Do NOT invent a slug. Do NOT guess. If you cannot name a real existing page, DO NOT WRITE THE PAGE AT ALL.
+   - You have NOT read the target record. All you have is its title and a short preview. So you MUST NOT write "The record states:" followed by quotation marks — you cannot quote a page you have not read, and inventing one is the single worst thing you can do here. Quotation marks in a correction page are reserved for the TRANSCRIPT and nothing else.
+   - You MUST be specific about WHICH belief you are challenging. "This record feels out of date" is not a correction.
+   - You MUST quote the transcript evidence verbatim.
+   Body MUST contain, as literal headed sections:
+   \`## Target record\` — \`<source-id>:<slug>\`, plus a \`[[<slug>]]\` wikilink to it.
+   \`## Claim challenged\` — in YOUR OWN WORDS and with no quotation marks, the belief you think that record holds, followed by the sentence: "Not verified against the record itself — only its title and preview were available."
+   \`## What this transcript says instead\` — the verbatim transcript evidence, in quotation marks.
+   \`## Confidence and what would settle it\` — one sentence naming what a human should check. Always include: whether the record already says this, since a record that was corrected after it was written still reads as stale from the outside.
+
+PROPOSAL RULES (apply to E and F only)
+- These are PROPOSALS for a human to review. You are NOT writing the task list and you are NOT editing the target record. Never write to \`tasks/\`, \`decisions/\`, \`learnings/\`, \`context/\` or \`agent-runs/\` — those writes are rejected.
+- Fewer and specific beats more and generic. Zero task proposals and zero correction proposals is a correct, common outcome. Do not manufacture one to look productive.
+- Reject your own draft if it would read as advice to anyone in any session — "add tests", "document this", "follow up with the client". A proposal that is not anchored to this transcript's specifics is filler; drop it.
+- Every proposal page still needs at least one resolving wikilink (see rule 2). For a correction that is the target record; for a task, link ${linkManifestBlock ? 'a related existing page from LINK CANDIDATES' : 'a related existing page you found with the search tool'} or another page in this response.
 
 TRANSCRIPT (${transcriptHeader})
 ---
@@ -2488,6 +2531,42 @@ const RECORD_SCOPES = new Set(['adaptig', 'mike-business', 'shared']);
 /** Default shelf life of a dream-generated page, in days. */
 const GENERATED_TTL_DAYS = 90;
 
+/**
+ * Review-queue prefix for candidate tasks and candidate corrections mined out
+ * of a transcript (Tasks E and F in the synthesis prompt).
+ *
+ * WHY A QUEUE AND NOT A DIRECT WRITE. Mike asked the dream cycle to mine
+ * sessions for tasks, corrections and additions. The obvious implementation —
+ * let the subagent append to `tasks/current.md`, or edit the decision record
+ * it thinks is wrong — is not acceptable at any confidence level: a model
+ * that mis-reads one transcript would silently rewrite the canonical task
+ * list or a ratified ruling, and nothing downstream could tell the difference
+ * between that and a human edit. So the phase extracts PROPOSALS and stops.
+ * A human moves a proposal into `tasks/`, `decisions/` or `learnings/`; the
+ * cycle never does. `tasks/*`, `decisions/*`, `learnings/*`, `context/*` and
+ * `agent-runs/*` stay off the allow-list in `_brain-filing-rules.json`, so
+ * the refusal is enforced server-side by put_page, not by prompt discipline.
+ *
+ * The literal lives in link-manifest.ts — the one module both this file and
+ * the oneshot slug fence already import. Re-exported here because this is
+ * where the concept belongs.
+ */
+export { DREAM_PROPOSAL_PREFIX };
+
+/**
+ * Proposals expire faster than ordinary generated output. A 90-day-old
+ * "candidate task" is not a task, it is noise that outlived the conversation
+ * it came from — and `_retrieval_factor` drops an expired non-canonical
+ * record from search outright, which is exactly the disposal behavior an
+ * unreviewed proposal should have.
+ */
+const PROPOSAL_TTL_DAYS = 30;
+
+/** True when a slug lands in the review queue rather than the brain proper. */
+export function isProposalSlug(slug: string | undefined): boolean {
+  return typeof slug === 'string' && slug.startsWith(DREAM_PROPOSAL_PREFIX);
+}
+
 /** Owner recorded on dream output: the producer, not a human. */
 const GENERATED_OWNER = 'gbrain-dream';
 
@@ -2502,6 +2581,12 @@ export interface DreamPageRef {
 }
 
 export interface GeneratedRecordContext {
+  /**
+   * Slug of the page being stamped. Only load-bearing for the review queue:
+   * a `dream-cycle-proposals/` slug gets `status: proposed` FORCED (not
+   * defaulted), so a subagent cannot write itself an `active` proposal.
+   */
+  slug?: string;
   /** gbrain source the page belongs to. Maps to the record `scope`. */
   sourceId?: string;
   /** Cycle date, `YYYY-MM-DD`. Defaults to today. */
@@ -2569,6 +2654,7 @@ export function generatedRecordStamp(
   const rawRef = ctx.rawSourcePath ? rawSourceRef(ctx.rawSourcePath, ctx.rawSourceHash) : undefined;
   const derivedFrom = ctx.derivedFrom ?? rawRef ?? `gbrain:dream-cycle/${cycleDate}`;
   const sourceRefs = ctx.sourceRefs?.length ? ctx.sourceRefs : [derivedFrom];
+  const proposal = isProposalSlug(ctx.slug);
   return {
     defaults: {
       scope,
@@ -2578,7 +2664,7 @@ export function generatedRecordStamp(
       sensitivity: 'standard',
       record_version: 1,
       created: cycleDate,
-      expires_at: addDays(cycleDate, GENERATED_TTL_DAYS),
+      expires_at: addDays(cycleDate, proposal ? PROPOSAL_TTL_DAYS : GENERATED_TTL_DAYS),
       promotion_target: `${scope}:learnings`,
       derived_from: derivedFrom,
       source_refs: sourceRefs,
@@ -2591,6 +2677,27 @@ export function generatedRecordStamp(
       updated_at: cycleDate,
       dream_generated: true,
       dream_cycle_date: cycleDate,
+      // Review queue: FORCED, never defaulted. `status` normally merges under
+      // the page's own frontmatter so a subagent's judgment survives — but a
+      // proposal that calls itself `active` is a proposal that has quietly
+      // promoted itself, and `expires_at` is the only thing that eventually
+      // disposes of an unreviewed one. Neither is the model's to choose.
+      ...(proposal
+        ? {
+            status: 'proposed',
+            proposal: true,
+            expires_at: addDays(cycleDate, PROPOSAL_TTL_DAYS),
+            review_state: 'pending',
+            // Where a HUMAN would file this if they accept it. Derived from
+            // the slug discriminator the prompt templates emit; a correction
+            // names its own target record in the body, so the generic
+            // `decisions/learnings` landing zone is as specific as the
+            // orchestrator can honestly be.
+            promotion_target: (ctx.slug ?? '').includes('-task-')
+              ? `${scope}:tasks/current`
+              : `${scope}:decisions|learnings (see 'Target record' in body)`,
+          }
+        : {}),
       ...(ctx.rawSourcePath
         ? {
             raw_source: ctx.rawSourcePath,
@@ -2677,6 +2784,7 @@ async function stampDreamProvenance(
     // (raw_provenance check) can verify the trace and a reader can still find
     // the evidence after the corpus file moves.
     const { defaults, forced } = generatedRecordStamp({
+      slug,
       sourceId: source_id,
       cycleDate,
       rawSourcePath: raw_source,
@@ -2718,6 +2826,7 @@ async function reverseWriteRefs(
       // The DB row is already stamped, so this context is belt-and-braces —
       // it also covers a row that lost its stamp to a write-through.
       const md = renderPageToMarkdown(page, tags, {
+        slug,
         sourceId: source_id,
         cycleDate,
         rawSourcePath: raw_source,
@@ -2767,7 +2876,17 @@ export function renderPageToMarkdown(
   // place. `applyGeneratedStamp` folds the page's own frontmatter in at the
   // right precedence, so passing the result as overrides is exact.
   const title = page.title ?? '';
-  const withH1 = { ...page, compiled_truth: ensureBodyH1(page.compiled_truth ?? '', title) };
+  // The markdown FILE is what `bin/brain validate` reads and what the
+  // retrieval wrapper resolves a hit's lifecycle from, so a proposal's `type`
+  // is pinned here rather than trusted from the model. `note` keeps a
+  // candidate task out of any `type: task` enumeration — it is a note ABOUT a
+  // possible task, and nothing should be able to mistake the two.
+  const pinnedType = isProposalSlug(ctx.slug) ? 'note' : page.type;
+  const withH1 = {
+    ...page,
+    type: pinnedType,
+    compiled_truth: ensureBodyH1(page.compiled_truth ?? '', title),
+  };
   return serializePageToMarkdown(withH1, tags, {
     frontmatterOverrides: applyGeneratedStamp(
       (page.frontmatter ?? {}) as Record<string, unknown>,

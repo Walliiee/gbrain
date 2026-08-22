@@ -41,7 +41,7 @@ import { matchesSlugAllowList } from '../../ops/context.ts';
 import { autoLinkWrittenPage } from '../../ops/pages.ts';
 import { serializeMarkdown } from '../../markdown.ts';
 import type { PageType } from '../../types.ts';
-import { LINK_CANDIDATES_HEADER } from '../../cycle/link-manifest.ts';
+import { LINK_CANDIDATES_HEADER, DREAM_PROPOSAL_PREFIX } from '../../cycle/link-manifest.ts';
 import { acquireLease, releaseLease, RateLeaseUnavailableError } from '../rate-leases.ts';
 import { isRetryableConnError } from '../../retry-matcher.ts';
 import { logSubagentHeartbeat } from './subagent-audit.ts';
@@ -87,7 +87,7 @@ export const ONESHOT_TOOL_USE_ID_PREFIX = 'oneshot-';
  */
 export const ONESHOT_SYSTEM = `You are a knowledge-synthesis engine. You have NO tools. Read the user message (task instructions + transcript) and respond with ONLY a JSON object — no prose before or after, no code fence — in exactly this shape:
 
-{"pages": [{"slug": "<full slug obeying ALLOWED WRITE PATHS and the Task A/B templates, ending with the hash suffix from CONTEXT>",
+{"pages": [{"slug": "<full slug obeying ALLOWED WRITE PATHS and the Task A/B/E/F slug templates, ending with the hash suffix from CONTEXT>",
             "title": "<short human title>",
             "type": "note",
             "body": "<markdown page body. MUST contain at least one wikilink like [[people/jane-doe]] whose target is taken from LINK CANDIDATES or is another page in this response. Follow every OUTPUT POLICY rule from the user message.>"}],
@@ -406,9 +406,17 @@ export async function runSubagentOneshot(args: OneshotArgs): Promise<OneshotOutc
 
   // ── Validate ALL pages before ANY write ─────────────────────────────────
   const prefixes = data.allowed_slug_prefixes ?? [];
-  // CDX-9 task shapes: reflections/originals sub-trees of the allow-list.
+  // CDX-9 task shapes: reflections/originals sub-trees of the allow-list,
+  // plus the dream review queue (prompt Tasks E and F — candidate tasks and
+  // candidate corrections). This is a SECOND fence on top of
+  // `matchesSlugAllowList`: the allow-list says which paths exist at all, this
+  // says which of them a synthesis child may write. `dream-cycle-summaries/*`
+  // is deliberately absent from both lists — the orchestrator owns the index,
+  // and prompt Task C forbids touching person pages.
   const taskShapePrefixes = prefixes
-    .filter(p => p.includes('/personal/reflections/') || p.includes('/originals/'))
+    .filter(p => p.includes('/personal/reflections/')
+      || p.includes('/originals/')
+      || p.startsWith(DREAM_PROPOSAL_PREFIX))
     .map(p => (p.endsWith('/*') ? p.slice(0, -1) : p.endsWith('/') ? p : `${p}/`));
   const inBatch = new Set(parsed.pages.map(p => p.slug));
   // Duplicate slugs inside one batch would make the second write silently
