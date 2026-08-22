@@ -134,8 +134,19 @@ export async function runPhasePatterns(
       );
     }
 
-    // Gather reflections within lookback window.
-    const reflections = await gatherReflections(engine, config.lookbackDays, config.sourceSlugPrefix);
+    // Gather reflections within lookback window, SCOPED TO THIS CYCLE'S SOURCE.
+    // #1586's unfixed third half: the write path was scoped (collectChildPutPageSlugs
+    // / reverseWriteRefs both take cycleSourceId) but the READ path was not, so a
+    // per-source cycle synthesized patterns out of EVERY source's reflections and
+    // filed the result under the source it happened to be running for. Measured
+    // 2026-08-22: reflections live only in `shared` (17) and `default` (1), yet a
+    // `--source adaptig` cycle wrote 3 pattern pages stamped `scope: adaptig` into
+    // the team-facing ~/adaptig-AI-brain checkout, and `--source hermes-native`
+    // wrote 3 more into ~/.hermes/brain. Personal reflections must not fan out
+    // into every source's repo.
+    const reflections = await gatherReflections(
+      engine, config.lookbackDays, config.sourceSlugPrefix, opts.sourceId ?? 'default',
+    );
     if (reflections.length < config.minEvidence) {
       return skipped(
         'insufficient_evidence',
@@ -430,18 +441,23 @@ async function gatherReflections(
   engine: BrainEngine,
   lookbackDays: number,
   sourceSlugPrefix = 'wiki/personal/reflections',
+  sourceId = 'default',
 ): Promise<ReflectionRef[]> {
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
   // Reflections live under the configured source slug prefix (bound as a
-  // parameter; see PatternsConfig.sourceSlugPrefix / dream.patterns.source_slug_prefix).
+  // parameter; see PatternsConfig.sourceSlugPrefix / dream.patterns.source_slug_prefix)
+  // AND inside the cycle's own source — the write path is source-scoped, so the
+  // read path must be too or patterns cross-contaminate sources.
   const rows = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null }>(
     `SELECT slug, title, compiled_truth
        FROM pages
       WHERE slug LIKE $2
         AND updated_at >= $1::timestamptz
+        AND COALESCE(NULLIF(source_id, ''), 'default') = $3
+        AND deleted_at IS NULL
       ORDER BY updated_at DESC
       LIMIT 100`,
-    [since, `${sourceSlugPrefix}/%`],
+    [since, `${sourceSlugPrefix}/%`, sourceId],
   );
   return rows.map(r => ({
     slug: r.slug,
