@@ -562,7 +562,7 @@ export class MinionQueue {
         opts?.queue ?? 'default',
         childStatus,
         opts?.priority ?? 0,
-        data ?? {},
+        JSON.stringify(data ?? {}),
         opts?.max_attempts ?? 3,
         opts?.backoff_type ?? 'exponential',
         opts?.backoff_delay ?? 1000,
@@ -587,7 +587,7 @@ export class MinionQueue {
         opts?.remove_on_complete ?? false,
         opts?.remove_on_fail ?? false,
         opts?.idempotency_key ?? null,
-        opts?.quiet_hours ?? null,
+        opts?.quiet_hours == null ? null : JSON.stringify(opts.quiet_hours),
         opts?.stagger_key ?? null,
       ];
       if (hasMaxStalled) params.push(clampedMaxStalled);
