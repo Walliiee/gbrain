@@ -656,11 +656,17 @@ describe('runDream — --source / --source-id (v0.41.13)', () => {
 
 describe('runDream → checkCycleFreshness end-to-end (D5)', () => {
   test('stale source becomes fresh after dream --source (column-name drift guard)', async () => {
+    // `federated: true` is load-bearing, not incidental: checkCycleFreshness
+    // only scores FEDERATED sources (local patch 14e6c124d). An unfederated
+    // source is deliberately not cycled, so counting it would pin the check
+    // permanently red on any brain that carries archived or code-only sources.
+    // Without this flag the fixture is skipped and `beforeCheck` is 'ok',
+    // which silently guts the drift guard this test exists to be.
     // Seed source with last_full_cycle_at backdated 25h (above warn floor).
     const stale = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path, config, archived, created_at)
-       VALUES ('gamma', 'gamma', $1, jsonb_build_object('last_full_cycle_at', $2::text), false, NOW())`,
+       VALUES ('gamma', 'gamma', $1, jsonb_build_object('last_full_cycle_at', $2::text, 'federated', true), false, NOW())`,
       [repo, stale],
     );
 

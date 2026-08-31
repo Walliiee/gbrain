@@ -107,7 +107,14 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/minions-shell-pglite.test.ts",
     "test/e2e/worker-abort-recovery.test.ts",
     "test/e2e/connector-sync-handler-pglite.test.ts",
+    "test/e2e/minions-jsonb-payload-postgres.test.ts",
   ],
+  // The minion JSONB payload shape is a POSTGRES-ONLY property: PGLite reports
+  // jsonb_typeof 'object' even for a double-encoded write, so the unit lane
+  // cannot fail on it (verified by re-introducing the defect). batch-rows owns
+  // sanitizeJsonbDeep, which keeps a lone UTF-16 surrogate from aborting the
+  // write with SQLSTATE 22P02.
+  "src/core/batch-rows.ts": ["test/e2e/minions-jsonb-payload-postgres.test.ts"],
   // v0.46.31.0 chat-connectors wave (mapped at the test-gap-wave merge —
   // these arrived unclaimed): connector classify/sync core + doctor check.
   "src/core/connectors/**": [
