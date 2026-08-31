@@ -4,8 +4,10 @@
  * markdown repo as sync.repo_path).
  *
  * Pins the load-bearing trust + md-canonical semantics:
- *   - mirror-mandatory refusal (takes_mirror_unavailable) when sync.repo_path
- *     is unset [EV1]
+ *   - mirror-mandatory refusal (takes_mirror_unavailable) when the page has no
+ *     markdown home at all — neither sync.repo_path nor a source local_path
+ *     [EV1]; the per-source fallback that keeps a multi-source brain writable
+ *     when only sync.repo_path is missing (#4473)
  *   - holder WRITE fence: hit/miss/[] deny-all/undefined→['world'] default,
  *     threaded through dispatchToolCall (the wiring, not just the handler)
  *     [CEO-F8]
@@ -26,8 +28,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { __takesWriteTesting } from '../src/core/takes-write.ts';
+import { runTakes } from '../src/commands/takes.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { parseTakesFence, TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../src/core/takes-fence.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let repo: string;
@@ -549,6 +553,80 @@ describe('takes-write adversarial regressions (F1 cross-holder / P1-2 containmen
       t => t.claim === 'lands under the source local_path',
     )).toBe(true);
   });
+
+  test('no sync.repo_path: the write falls back to the page source\'s own local_path — add AND resolve land', async () => {
+    // The multi-source reality: `sync.repo_path` is the LEGACY pre-v0.18
+    // single-source key and is unset on brains built with `sources add`.
+    // opBrainDir used to refuse a null outright, so ALL FOUR takes_* write
+    // verbs died on takes_mirror_unavailable there while the CLI escaped
+    // through --dir. The null now flows to resolveTakesFilePath, which files
+    // the page under its OWN source working tree (#4473).
+    const sourceRoot = mkdtempSync(join(tmpdir(), 'gbrain-takes-nosync-root-'));
+    const fallbackEngine = new Proxy(engine, {
+      get(target, prop) {
+        if (prop === 'executeRaw') {
+          return async (sql: unknown, params: unknown) => {
+            if (typeof sql === 'string' && /SELECT\s+(?:s\.)?local_path[\s\S]+FROM sources/i.test(sql)) {
+              return [{ local_path: sourceRoot, source_path: null }];
+            }
+            return (target as unknown as { executeRaw: (s: unknown, p: unknown) => Promise<unknown> })
+              .executeRaw(sql, params);
+          };
+        }
+        const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const slug = 'notes/no-sync-repo-path';
+    await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: `about ${slug}` });
+    await engine.unsetConfig('sync.repo_path');
+    try {
+      const add = await dispatchToolCall(fallbackEngine, 'takes_add', {
+        slug, claim: 'lands via the source local_path with no sync.repo_path', kind: 'fact', holder: 'world',
+      }, { ...STDIO_WORLD });
+      expect(add.isError ?? false).toBe(false);
+      expect(parsed(add).row_num).toBe(1);
+      const onDisk = join(sourceRoot, `${slug}.md`);
+      expect(existsSync(onDisk)).toBe(true);
+      expect(parseTakesFence(readFileSync(onDisk, 'utf-8')).takes.some(
+        t => t.claim === 'lands via the source local_path with no sync.repo_path',
+      )).toBe(true);
+      // And a resolve over the same fallback path works too — the whole point
+      // is that agents can promote AND resolve, not just add.
+      const resv = parsed(await dispatchToolCall(fallbackEngine, 'takes_resolve', {
+        slug, row_num: 1, quality: 'correct',
+      }, { ...STDIO_WORLD }));
+      expect(resv.quality).toBe('correct');
+      expect(resv.resolved_by).toBe('mcp:stdio');
+    } finally {
+      await engine.setConfig('sync.repo_path', repo);
+    }
+  });
+
+  test('no sync.repo_path AND no source local_path: still the mirror_unavailable refusal, with both remedies named', async () => {
+    // The other arm — a host-repo page with nowhere to land must NOT silently
+    // become a DB-only row. PGLite seeds `default` with local_path NULL, so
+    // unsetting the config leaves genuinely no markdown home.
+    const slug = 'notes/no-home-at-all';
+    await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: `about ${slug}` });
+    await engine.unsetConfig('sync.repo_path');
+    try {
+      const res = await dispatchToolCall(engine, 'takes_add', {
+        slug, claim: 'nowhere to land', kind: 'fact', holder: 'world',
+      }, { ...STDIO_WORLD });
+      expect(res.isError).toBe(true);
+      const body = parsed(res);
+      expect(body.error).toBe('unavailable');
+      expect(body.detail).toBe('takes_mirror_unavailable');
+      // The e2e Postgres twin pins `sync.repo_path` in the suggestion; the
+      // per-source remedy is named alongside it, not instead of it.
+      expect(body.suggestion).toContain('sync.repo_path');
+      expect(body.suggestion).toContain('gbrain sources add');
+      expect(await engine.listTakes({ page_slug: slug })).toHaveLength(0);
+    } finally {
+      await engine.setConfig('sync.repo_path', repo);
+    }
+  });
 });
 
 describe('concurrency [ENG-E4/EV11]', () => {
@@ -648,5 +726,50 @@ describe('takes-write recorded source_path routing (#3605)', () => {
     expect(add.row_num).toBe(1);
     expect(readFileSync(capturedAbs, 'utf-8')).toContain('captured file is the file of record');
     expect(existsSync(join(repo, `${slug}.md`))).toBe(false);
+  });
+});
+
+// The CLI half of the same fallback. `--dir` used to be the ONLY reason
+// `gbrain takes add` worked on a multi-source brain — resolveBrainDir exited 1
+// when `sync.repo_path` was unset — while the takes_* MCP verbs had no
+// equivalent escape at all. Pinned here so the CLI half can't be dropped at a
+// future upgrade without a red test.
+describe('takes CLI without --dir (per-source fallback)', () => {
+  test('add lands in the page source\'s own local_path when sync.repo_path is unset', async () => {
+    const sourceRoot = mkdtempSync(join(tmpdir(), 'gbrain-takes-cli-nodir-'));
+    const cliEngine = new Proxy(engine, {
+      get(target, prop) {
+        if (prop === 'executeRaw') {
+          return async (sql: unknown, params: unknown) => {
+            if (typeof sql === 'string' && /SELECT\s+(?:s\.)?local_path[\s\S]+FROM sources/i.test(sql)) {
+              return [{ local_path: sourceRoot, source_path: null }];
+            }
+            return (target as unknown as { executeRaw: (s: unknown, p: unknown) => Promise<unknown> })
+              .executeRaw(sql, params);
+          };
+        }
+        const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const slug = 'notes/cli-no-dir';
+    await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: `about ${slug}` });
+    await engine.unsetConfig('sync.repo_path');
+    try {
+      await withEnv({ GBRAIN_SOURCE: 'default' }, async () => {
+        await runTakes(cliEngine, [
+          'add', slug, '--claim', 'CLI take, no --dir', '--kind', 'take', '--who', 'world',
+        ]);
+      });
+      const onDisk = join(sourceRoot, `${slug}.md`);
+      expect(existsSync(onDisk)).toBe(true);
+      expect(parseTakesFence(readFileSync(onDisk, 'utf-8')).takes.some(
+        t => t.claim === 'CLI take, no --dir',
+      )).toBe(true);
+      // Not a stray twin in the (now unconfigured) host repo.
+      expect(existsSync(join(repo, `${slug}.md`))).toBe(false);
+    } finally {
+      await engine.setConfig('sync.repo_path', repo);
+    }
   });
 });

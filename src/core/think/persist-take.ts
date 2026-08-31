@@ -18,9 +18,14 @@
  *   - persistence goes md-first through addTakeToPage (the same canonical
  *     write-through every takes verb uses: fence row on disk, DB mirrored,
  *     mirror failure downgraded to a warning).
- *   - no brain repo (resolveTakesRepoDir null) → TAKE_MIRROR_UNAVAILABLE
- *     warning, nothing written (md is canonical; a DB-only take would be
- *     clobbered by the next reconcile).
+ *   - no markdown home at all → TAKE_MIRROR_UNAVAILABLE warning, nothing
+ *     written (md is canonical; a DB-only take would be clobbered by the next
+ *     reconcile). #4473: a null `resolveTakesRepoDir` is NOT that case by
+ *     itself — the host `sync.repo_path` key is unset on every multi-source
+ *     brain, so the null is passed straight through and addTakeToPage lands
+ *     the row in the anchor page's OWN source `local_path`. Only the
+ *     'mirror_unavailable' refusal it raises when neither resolves is the
+ *     real no-home case.
  *
  * Remote (MCP) callers never reach this — the `think` op forces
  * safeTake=false for ctx.remote !== false, unchanged.
@@ -103,13 +108,11 @@ export async function persistTakeFromSynthesis(
     return { take_row: null, warnings };
   }
 
+  // #4473: may be null (sync.repo_path is the legacy pre-v0.18 single-source
+  // key and is unset on every brain built with `sources add`). Carried through
+  // as-is — refusing here made `think --take` dead on exactly those brains even
+  // though the anchor page's own source has a working tree to write into.
   const brainDir = await resolveTakesRepoDir(engine);
-  if (!brainDir) {
-    // md is canonical for takes — with no repo there is nothing durable to
-    // write (a DB-only row would be deleted by the next fence reconcile).
-    warnings.push('TAKE_MIRROR_UNAVAILABLE');
-    return { take_row: null, warnings };
-  }
 
   const holder = resolveOwnerHolder({
     configValue: await engine.getConfig('emotional_weight.user_holder'),
@@ -131,6 +134,14 @@ export async function persistTakeFromSynthesis(
     }
     return { take_row: rowNum, path: mirror.path, warnings };
   } catch (e) {
+    // The one no-markdown-home refusal keeps its own machine-stable code (md
+    // is canonical: nothing durable could be written). resolveTakesFilePath —
+    // not this function — decides it, because only it can see whether the
+    // anchor page's source carries a local_path (#4473).
+    if (e instanceof TakesWriteError && e.code === 'mirror_unavailable') {
+      warnings.push('TAKE_MIRROR_UNAVAILABLE');
+      return { take_row: null, warnings };
+    }
     // Typed write refusals (page not found, lock timeout, fence malformed)
     // become a loud warning + null row — think's answer already printed and
     // must not be lost to a persistence failure.

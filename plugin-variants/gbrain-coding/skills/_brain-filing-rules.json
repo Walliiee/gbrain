@@ -160,6 +160,7 @@
       "wiki/personal/patterns/*",
       "wiki/people/*",
       "dream-cycle-summaries/*"
-    ]
+    ],
+    "proposals_note": "The synthesize phase appends ONE further prefix at run time that is deliberately NOT in `globs`: `dream-cycle-proposals/*`, the review queue holding the candidate tasks and candidate corrections the subagent mined from a transcript (prompt Tasks E and F). It is phase-derived for the same reason the per-lane namespace globs are \u2014 this list resolves to the FIRST existing copy of this file on a four-rung ladder, so an operator copy in a brain repo would shadow the bundled one and silently un-authorize the queue, and put_page would then reject every proposal write with no error surface. The literal lives in src/core/cycle/link-manifest.ts (DREAM_PROPOSAL_PREFIX); the patterns phase does not get the lane. Every page under it is stamped canonical:false, generated:true, authority_level:derived, status:proposed with a 30-day expiry \u2014 the levers a retrieval policy multiplies \u2014 so a proposal ranks far below a canonical record and drops out of normal search entirely once it expires. Nothing there is acted on until a human moves it. Deliberately absent from BOTH lists, and never to be added: tasks/*, decisions/*, learnings/*, context/*, agent-runs/*. An LLM does not write the task list or edit a decision record."
   }
 }

@@ -99,6 +99,50 @@ export const sanitizeForJsonb = (s: string): string => ensureWellFormed(stripNul
 export const sanitizeText = <T extends string | null | undefined>(s: T): T =>
   (typeof s === 'string' ? (sanitizeForJsonb(s) as T) : s);
 
+/** Plain `{}`-literal or null-prototype object — NOT Date/Map/class instances,
+ *  which postgres.js serializes through their own toJSON and must pass through
+ *  this walk untouched. */
+const isPlainObject = (v: unknown): v is Record<string, unknown> => {
+  if (v === null || typeof v !== 'object') return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+};
+
+/**
+ * Deep `sanitizeForJsonb` over a whole JSONB param — every string VALUE and
+ * every object KEY, recursively.
+ *
+ * The per-field row builders below cover the batch-insert paths, where the
+ * column list is known. A whole-payload bind (`minion_jobs.data`,
+ * `minion_jobs.result`, `minion_inbox.payload`) has no such list: the payload
+ * is caller-shaped free prose — a subagent prompt, a job result, a child's
+ * error text — so the #2011 lone surrogate can sit at any depth. One escaped
+ * through a truncated emoji in a subagent prompt (`You are Lens 🔭\uD83D`) and
+ * every affected job died `invalid input syntax for type json` (SQLSTATE
+ * 22P02); because the whole phase rethrows non-quota errors, one bad transcript
+ * aborts an entire dream synthesize run.
+ *
+ * Cast through `$N::text::jsonb` does NOT save you here — a lone surrogate is
+ * invalid JSON text too, so it fails on either binding form. Sanitizing is the
+ * only fix; the binding form is a separate concern (pass raw objects, never
+ * `JSON.stringify` into `$N::jsonb` — see the NUL/JSONB policy above).
+ *
+ * Depth-bounded so a cyclic payload can never hang the walk: past the cap the
+ * value passes through and postgres.js raises its own "circular structure"
+ * TypeError, exactly as it would have without this helper.
+ */
+export const sanitizeJsonbDeep = <T>(value: T, depth = 0): T => {
+  if (typeof value === 'string') return sanitizeForJsonb(value) as T;
+  if (depth >= 64 || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(v => sanitizeJsonbDeep(v, depth + 1)) as T;
+  if (!isPlainObject(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) {
+    out[sanitizeForJsonb(k)] = sanitizeJsonbDeep(v, depth + 1);
+  }
+  return out as T;
+};
+
 /** One links row, keys === the jsonb_to_recordset column list. */
 export interface LinkRow {
   from_slug: string;

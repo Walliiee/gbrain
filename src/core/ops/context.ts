@@ -576,6 +576,69 @@ export function parseSourceIdParam(
 }
 
 /**
+ * XSRC (fork patch, 2026-08-22) — resolve ONE link endpoint's source id for the
+ * `add_link` / `remove_link` write ops.
+ *
+ * Pre-fix both ops hard-coded `fromSourceId = toSourceId = originSourceId =
+ * ctx.sourceId` under the comment "cross-source link creation is out of scope
+ * for this wave; use the engine API directly for that edge case". Both engines
+ * (`postgres-engine.addLink`, `pglite-engine.addLink`) have resolved the two
+ * endpoints independently and source-qualified since v0.18, so the restriction
+ * only ever existed at the op layer — and it made the single most valuable edge
+ * shape in a multi-source brain (a person page in one source pointing at a
+ * decision in another) impossible to write through the CLI or MCP at all. It
+ * failed with `addLink failed: to page "X" (source=S) not found`, naming the
+ * NEAR source for the FAR page.
+ *
+ * FAIL-CLOSED resolution, mirroring `resolveRequestedScope`:
+ *   - omitted / empty         → `ctx.sourceId` (byte-identical to the old behavior)
+ *   - `__all__`               → invalid_params. A write names exactly ONE
+ *                               source; the span-everything sentinel is a read
+ *                               concept.
+ *   - malformed               → invalid_params via `parseSourceIdParam` (#4329:
+ *                               a caller-supplied source is honored or rejected
+ *                               loudly, never silently dropped)
+ *   - equal to `ctx.sourceId` → accepted (no cross-source hop requested)
+ *   - trusted local (`ctx.remote === false`) → accepted; the user owns the
+ *                               machine and named the source deliberately
+ *   - remote WITH a federated grant containing it → accepted
+ *   - anything else           → permission_denied
+ *
+ * The asymmetry with reads is intentional: a remote caller cannot widen into a
+ * source it was not granted, and a caller with no grant array at all cannot
+ * leave its scalar source. The resolved id is then handed to
+ * `requireWritablePage` as THAT endpoint's write source, so #4109's
+ * source-boundary diagnostics stay exact per endpoint instead of reporting the
+ * near source for both.
+ */
+export function resolveLinkEndpointSource(
+  ctx: OperationContext,
+  requested: unknown,
+  endpoint: 'from_source_id' | 'to_source_id',
+  opName: string,
+): string | undefined {
+  if (requested === undefined || requested === null || requested === '') return ctx.sourceId;
+  if (requested === ALL_SOURCES) {
+    throw new OperationError(
+      'invalid_params',
+      `${endpoint} cannot be '${ALL_SOURCES}' — ${opName} writes one edge between two named pages, so each endpoint resolves to exactly one source.`,
+      'Pass the concrete source id (see `gbrain sources list`).',
+    );
+  }
+  // Non-nullish and not the sentinel, so the parser always returns a string.
+  const sourceId = parseSourceIdParam(requested, `${opName} ${endpoint}`) as string;
+  if (sourceId === ctx.sourceId) return sourceId;
+  if (ctx.remote === false) return sourceId;
+  const allowed = ctx.auth?.allowedSources;
+  if (allowed && allowed.length > 0 && allowed.includes(sourceId)) return sourceId;
+  throw new OperationError(
+    'permission_denied',
+    `source '${sourceId}' is outside your granted sources`,
+    `Omit ${endpoint} to use your own source scope, or request access to '${sourceId}'.`,
+  );
+}
+
+/**
  * #2561 / #3242 — source scope for the page-visibility read ops (`search`,
  * `query`, `get_page`, `list_pages`, `resolve_slugs`).
  *
@@ -620,6 +683,66 @@ export function federatedSearchScope(
 }
 
 /**
+ * XSRC (fork patch, 2026-08-22) — source scope for GRAPH TRAVERSAL
+ * (`traverse_graph`). The graph-walk sibling of `federatedSearchScope` above:
+ * same floor, same guards, different engine surface.
+ *
+ * `traverse_graph` was sealed in v0.34.1 (#861) with the generic
+ * `sourceScopeOpts`, which predates BOTH the link-read scope (#2200) and the
+ * federated read floor (#2561/#3242). The seal itself is deliberate and stays:
+ * a caller must never walk an edge into a page outside its scope. But the
+ * scalar branch `sourceScopeOpts` emits pins the seed, the recursive step and
+ * the SELECT joins to ONE source id, so an edge whose far endpoint lives in a
+ * sibling source is invisible even to the machine owner — while `search`,
+ * `get_page`, `get_links` and `get_backlinks` all show it. That asymmetry is
+ * incidental, not a boundary: measured on a real 20-source brain, 0 of 128
+ * cross-source edges were reachable through the graph API.
+ *
+ * So: delegate to `sourceScopeOpts` (unchanged precedence, unchanged remote
+ * behavior), then widen an UNQUALIFIED scalar scope to the transport-computed
+ * federated floor — the SAME `ctx.localFederatedSourceIds` set under the SAME
+ * guards `federatedSearchScope` uses one function up. The two are coupled: if
+ * you change #3242's floor, change this too.
+ *
+ * What this deliberately does NOT do:
+ *   - widen a federated grant. `ctx.auth.allowedSources` governs and passes
+ *     through untouched — including the empty-array case, which
+ *     `sourceScopeOpts` refuses to read as "no filter";
+ *   - widen when the transport left `localFederatedSourceIds` unset, which is
+ *     exactly an EXPLICIT `--source X` / `GBRAIN_SOURCE` / `.gbrain-source`
+ *     binding (tier `flag`/`env`/`dotfile`). Explicit scope stays scalar, as
+ *     with search;
+ *   - reach a PARKED or RETIRED source. `localFederatedSourceIds` is built
+ *     from `config.federated = true AND archived = false`, so an unfederated
+ *     source (`gbrain sources unfederate`) is absent from the floor and stays
+ *     untraversable in BOTH directions. Traversal reachability tracks the
+ *     federation flag exactly, with no second list to keep in sync.
+ *
+ * A REMOTE caller DOES reach this widening, and that is intended:
+ * `http-transport.ts` and `serve-http.ts` set `localFederatedSourceIds`
+ * whenever `auth.hasSourceGrant === false` (the #3242 no-grant floor), so an
+ * UNGRANTED legacy bearer token receives the floor here too. What keeps that
+ * safe is PARITY, not exclusion — the identical floor already governs `search`,
+ * `get_page`, `get_links` and `get_backlinks` for that same caller, so
+ * traversal reaches nothing those ops did not already return. A token WITH an
+ * operator-set grant (`hasSourceGrant === true`) never receives the floor and
+ * is governed by its grant array.
+ */
+export function graphTraversalScopeOpts(ctx: OperationContext): { sourceId?: string; sourceIds?: string[] } {
+  const scope = sourceScopeOpts(ctx);
+  if (
+    ctx.auth?.allowedSources === undefined &&
+    scope.sourceId !== undefined &&
+    scope.sourceIds === undefined &&
+    ctx.localFederatedSourceIds !== undefined &&
+    ctx.localFederatedSourceIds.length > 1
+  ) {
+    return { sourceIds: ctx.localFederatedSourceIds };
+  }
+  return scope;
+}
+
+/**
  * #4109 — preflight a page endpoint for a same-source graph mutation
  * (add_link / add_timeline_entry).
  *
@@ -633,14 +756,23 @@ export function federatedSearchScope(
  * from absence: the diagnostic lookup uses `federatedSearchScope`, the SAME
  * visibility ladder as `get_page`, so this preflight can never become a
  * cross-source existence oracle.
+ *
+ * XSRC (fork patch, 2026-08-22): `writeSourceId` overrides the ambient
+ * `ctx.sourceId` for THIS endpoint. `add_link` resolves its two endpoints
+ * independently (`resolveLinkEndpointSource`), so each must be preflighted
+ * against the source it actually resolved to — otherwise a legitimate
+ * cross-source edge is rejected here before the engine ever sees it. Omitted
+ * (add_timeline_entry, and add_link when neither param was passed) keeps the
+ * ambient scalar write source, byte-identical to #4109.
  */
 export async function requireWritablePage(
   ctx: OperationContext,
   slug: string,
   operation: string,
   endpoint: 'from' | 'to' | 'page',
+  writeSourceId?: string,
 ): Promise<void> {
-  const writeSource = ctx.sourceId || 'default';
+  const writeSource = writeSourceId || ctx.sourceId || 'default';
   // Graph rows may reference soft-deleted pages — includeDeleted preserves
   // that engine mutation contract for the exact write source. The federated
   // diagnostic lookup below intentionally stays active-page-only so a
@@ -661,7 +793,13 @@ export async function requireWritablePage(
       throw new OperationError(
         'permission_denied',
         `${operation}${endpoint === 'page' ? '' : ` ${endpoint}`} page "${slug}" is readable from source "${visible.source_id}" but this client writes to source "${writeSource}".`,
-        'Graph mutations are same-source by design. Use a client whose write source owns the page, or import the page into your write source first.',
+        // XSRC (fork patch, 2026-08-22): a LINK endpoint ('from'/'to') can now
+        // name its own source, so the actionable fix is the endpoint param —
+        // not "import the page first". Single-slug mutations ('page', i.e.
+        // add_timeline_entry) are still same-source by design.
+        endpoint === 'page'
+          ? 'Graph mutations are same-source by design. Use a client whose write source owns the page, or import the page into your write source first.'
+          : `Pass ${endpoint}_source_id: "${visible.source_id}" to write the edge across the source boundary (allowed for a local caller, or a remote caller granted that source), or import the page into "${writeSource}" first.`,
       );
     }
   }
@@ -686,11 +824,13 @@ export async function reclassifyMutationTimePageMiss(
   slug: string,
   operation: string,
   endpoint: 'from' | 'to' | 'page',
+  writeSourceId?: string,
 ): Promise<never> {
-  await requireWritablePage(ctx, slug, operation, endpoint);
+  const writeSource = writeSourceId || ctx.sourceId || 'default';
+  await requireWritablePage(ctx, slug, operation, endpoint, writeSource);
   throw new OperationError(
     'page_not_found',
-    `${operation}${endpoint === 'page' ? '' : ` ${endpoint}`} page "${slug}" was unavailable in writable source "${ctx.sourceId || 'default'}" during the mutation.`,
+    `${operation}${endpoint === 'page' ? '' : ` ${endpoint}`} page "${slug}" was unavailable in writable source "${writeSource}" during the mutation.`,
   );
 }
 

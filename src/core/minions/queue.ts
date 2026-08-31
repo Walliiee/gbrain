@@ -37,6 +37,7 @@ import {
   logBatchRetry as auditLogBatchRetry,
   logBatchExhausted as auditLogBatchExhausted,
 } from '../audit/batch-retry-audit.ts';
+import { sanitizeJsonbDeep } from '../batch-rows.ts';
 /** Trusted 4th argument, kept outside user-spread job options. */
 export interface TrustedSubmitOpts {
   /** Allow PROTECTED_JOB_NAMES; CLI or operation-local callers only. */
@@ -607,7 +608,12 @@ export class MinionQueue {
         opts?.queue ?? 'default',
         childStatus,
         opts?.priority ?? 0,
-        data ?? {},
+        // Raw object, never JSON.stringify — postgres.js applies the jsonb
+        // serializer to $5::jsonb itself and stringifying first stores a jsonb
+        // STRING SCALAR. Sanitized deep because the payload is caller-shaped
+        // free prose (a subagent prompt) and a lone surrogate at any depth is
+        // rejected at the cast with SQLSTATE 22P02, killing the job.
+        sanitizeJsonbDeep(data ?? {}),
         opts?.max_attempts ?? 3,
         opts?.backoff_type ?? 'exponential',
         opts?.backoff_delay ?? 1000,
@@ -632,7 +638,7 @@ export class MinionQueue {
         opts?.remove_on_complete ?? false,
         opts?.remove_on_fail ?? false,
         opts?.idempotency_key ?? null,
-        opts?.quiet_hours ?? null,
+        sanitizeJsonbDeep(opts?.quiet_hours ?? null),
         opts?.stagger_key ?? null,
         opts?.private_queue_owner_job_id ?? null,
         opts?.private_queue_owner_token ?? null,
@@ -1105,7 +1111,7 @@ export class MinionQueue {
              SELECT 1 FROM minion_jobs
              WHERE id = $1 AND status NOT IN ('completed','failed','dead','cancelled')
            )`,
-          [parentJobId, childDone]
+          [parentJobId, sanitizeJsonbDeep(childDone)]
         );
       }
 
@@ -1573,7 +1579,7 @@ export class MinionQueue {
            SELECT 1 FROM minion_jobs
            WHERE id = $1 AND status NOT IN ('completed','failed','dead','cancelled')
          )`,
-        [parentJobId, childDone]
+        [parentJobId, sanitizeJsonbDeep(childDone)]
       );
     }
 
@@ -1705,7 +1711,7 @@ export class MinionQueue {
           finished_at = now(), lock_token = NULL, lock_until = NULL, updated_at = now()
          WHERE id = $2 AND status = 'active' AND lock_token = $3
          RETURNING *`,
-        [result ?? null, id, lockToken]
+        [sanitizeJsonbDeep(result ?? null), id, lockToken]
       );
       if (rows.length === 0) return null;
 
@@ -1742,7 +1748,7 @@ export class MinionQueue {
              SELECT 1 FROM minion_jobs
              WHERE id = $1 AND status NOT IN ('completed','failed','dead','cancelled')
            )`,
-          [completed.parent_job_id, childDone]
+          [completed.parent_job_id, sanitizeJsonbDeep(childDone)]
         );
 
         // Fold-in resolveParent: flip parent to waiting once all children are
@@ -1850,7 +1856,7 @@ export class MinionQueue {
              SELECT 1 FROM minion_jobs
              WHERE id = $1 AND status NOT IN ('completed','failed','dead','cancelled')
            )`,
-          [failed.parent_job_id, childDone]
+          [failed.parent_job_id, sanitizeJsonbDeep(childDone)]
         );
 
         if (failed.on_child_fail === 'fail_parent') {

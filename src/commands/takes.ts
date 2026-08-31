@@ -23,6 +23,7 @@ import {
   updateTakeOnPage,
   supersedeTakeOnPage,
   resolveTakeOnPage,
+  resolveTakesRepoDir,
   TakesWriteError,
 } from '../core/takes-write.ts';
 import { resolveSourceId } from '../core/source-resolver.ts';
@@ -50,7 +51,22 @@ function flagPresent(args: string[], name: string): boolean {
   return args.includes(name);
 }
 
-async function resolveBrainDir(engine: BrainEngine | null, explicitDir: string | null): Promise<string> {
+/**
+ * Resolve the HOST brain dir for a takes write.
+ *
+ *   1. `--dir` wins (exits 1 when it doesn't exist — a real mistake).
+ *   2. The legacy pre-v0.18 `sync.repo_path` key, via the shared resolver.
+ *   3. `null` — NOT an error. The write-through core falls back to the page's
+ *      OWN source `local_path` (#4473) and refuses with 'mirror_unavailable'
+ *      only when that is missing too. This is what makes `gbrain takes add
+ *      <slug>` work without `--dir` on a multi-source brain, where
+ *      `sync.repo_path` is normally unset — `--dir` used to be the only reason
+ *      the CLI worked at all there while the takes_* MCP verbs did not.
+ */
+async function resolveBrainDir(
+  engine: BrainEngine | null,
+  explicitDir: string | null,
+): Promise<string | null> {
   if (explicitDir) {
     if (!existsSync(explicitDir)) {
       console.error(`--dir path does not exist: ${explicitDir}`);
@@ -58,12 +74,7 @@ async function resolveBrainDir(engine: BrainEngine | null, explicitDir: string |
     }
     return explicitDir;
   }
-  if (engine) {
-    const configured = await engine.getConfig('sync.repo_path');
-    if (configured && existsSync(configured)) return configured;
-  }
-  console.error('No brain directory configured. Pass --dir <path> or run `gbrain init` first.');
-  process.exit(1);
+  return engine ? resolveTakesRepoDir(engine) : null;
 }
 
 /**
@@ -75,6 +86,19 @@ function exitTakesError(err: unknown): never {
     switch (err.code) {
       case 'page_not_found':
         console.error(`${err.message} Run \`gbrain sync\` first.`);
+        process.exit(1);
+      case 'mirror_unavailable':
+        // `hint` on this code is the MACHINE detail ('takes_mirror_unavailable'
+        // / 'path_escapes_source_root'), not user prose. The no-markdown-home
+        // arm is the one `resolveBrainDir` used to refuse itself (and the one
+        // `takes propose --accept` used to pre-refuse), so it keeps a
+        // remedy line; the containment arm has none to offer.
+        console.error(
+          err.hint === 'takes_mirror_unavailable'
+            ? `${err.message} Pass --dir <path>, give the source a working tree ` +
+              '(`gbrain sources add <id> --path <dir>`), or configure sync.repo_path.'
+            : err.message,
+        );
         process.exit(1);
       default:
         console.error(err.hint && err.code !== 'holder_denied' ? `${err.message} ${err.hint}` : err.message);
@@ -576,6 +600,10 @@ async function cmdPropose(engine: BrainEngine, args: string[], sourceId: string)
   if (acceptRaw !== undefined) {
     const id = parseId(acceptRaw, '--accept');
     const dirArg = flagValue(args, '--dir');
+    // Nullable by design, exactly like every other takes mutate above: the
+    // fence write resolves the proposal source's own local_path (#4473) and
+    // only `exitTakesError`'s mirror_unavailable arm refuses, so a
+    // multi-source brain with `sync.repo_path` unset can still accept.
     const brainDir = await resolveBrainDir(engine, dirArg ?? null);
     try {
       const { proposal, rowNum } = await acceptProposal({ engine, brainDir, sourceId, actedBy }, id);

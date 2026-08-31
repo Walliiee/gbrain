@@ -63,7 +63,7 @@ export type TakesWriteErrorCode =
   | 'row_inactive'        // superseded rows can't be updated/resolved again
   | 'holder_denied'       // add with a holder outside the allow-list
   | 'no_fields'           // update with zero mutable fields
-  | 'mirror_unavailable'  // sync.repo_path unset, page file absent, or write target escapes the source root
+  | 'mirror_unavailable'  // no markdown home (no host repo AND no source local_path), page file absent, or write target escapes the source root
   | 'page_locked'         // lock contention within the timeout (retryable)
   | 'fence_unparsed'      // the page's fence has parser-skipped rows a whole-fence re-render would delete
   | 'invalid_input';      // free-text field carries control chars, fence markers, or out-of-range values
@@ -85,8 +85,17 @@ export type HolderAllowList = readonly string[] | null | undefined;
 export interface TakesWriteTarget {
   engine: BrainEngine;
   slug: string;
-  /** Brain repo dir (resolveTakesRepoDir or an explicit CLI --dir). */
-  brainDir: string;
+  /**
+   * HOST brain repo dir (`resolveTakesRepoDir`, or an explicit CLI `--dir`),
+   * or null when the host has none.
+   *
+   * #4473: null is survivable, not a refusal — `resolveTakesFilePath` resolves
+   * the page's OWN source `local_path` first and only throws
+   * 'mirror_unavailable' when that is missing too. Every mutate accepts it, so
+   * a multi-source brain (where `sync.repo_path` is the legacy pre-v0.18
+   * single-source key and is normally unset) can still write takes.
+   */
+  brainDir: string | null;
   /** Scalar source scope for the pages lookup (writes are scalar). */
   sourceId?: string;
   allowList?: HolderAllowList;
@@ -109,9 +118,18 @@ function mirrorErrorMessage(err: unknown): string {
 }
 
 /**
- * Resolve the markdown brain dir for takes write-through. Returns null when
- * `sync.repo_path` is unset or missing on disk — callers decide the refusal
- * shape (ops: 'mirror_unavailable'; CLI: its historical error text + exit 1).
+ * Resolve the HOST markdown brain dir for takes write-through — the legacy
+ * pre-v0.18 `sync.repo_path` key only. Returns null when it is unset or
+ * missing on disk.
+ *
+ * A null is NOT a refusal by itself: callers pass it straight through as
+ * `TakesWriteTarget.brainDir`, and `resolveTakesFilePath` prefers the page's
+ * OWN source `local_path` anyway, refusing with 'mirror_unavailable' only when
+ * neither resolves (#4473). Deliberately NOT source-aware itself: the other
+ * callers (takes bootstrap, think's persist-take) treat the result as "the
+ * shared host repo" and nest foreign sources under `.sources/<id>/`, so
+ * returning one source's checkout here would file another source's pages
+ * inside it.
  */
 export async function resolveTakesRepoDir(engine: BrainEngine): Promise<string | null> {
   const configured = await engine.getConfig('sync.repo_path');
@@ -503,11 +521,8 @@ export async function addTakeToPage(
  * that the next md→DB reconcile / extract rebuild silently clobbered. This
  * routes the whole per-page batch through the same fence pipeline as
  * addTakeToPage (lock → page id → fence append → md write → DB mirror), with
- * two bootstrap-specific differences:
+ * one bootstrap-specific difference:
  *
- *   - `brainDir` may be null (sync.repo_path unset): a page whose source
- *     carries its own local_path still resolves; a host-repo page throws
- *     'mirror_unavailable' and the caller skips + counts it.
  *   - The page FILE must already exist. Bootstrap sweeps a whole corpus, and
  *     minting fence-only twin .md files for DB-born pages would recreate
  *     divergence at scale (#3605's stray-twin lesson) — a missing file is a
@@ -517,7 +532,7 @@ export async function addTakeToPage(
  * so the historical (page_id, row_num=1) collision posture is gone.
  */
 export async function appendTakesToPageMdFirst(
-  target: Omit<TakesWriteTarget, 'brainDir'> & { brainDir: string | null },
+  target: TakesWriteTarget,
   rows: ReadonlyArray<AddTakeInput>,
 ): Promise<{ rowNums: number[]; mirror: TakeMirror }> {
   for (const row of rows) {

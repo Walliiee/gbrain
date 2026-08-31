@@ -42,6 +42,8 @@ export {
   linkReadScopeOpts,
   resolveRequestedScope,
   federatedSearchScope,
+  graphTraversalScopeOpts,
+  resolveLinkEndpointSource,
   resolveCodeIntelScope,
   resolvePerCallMode,
 } from './ops/context.ts';

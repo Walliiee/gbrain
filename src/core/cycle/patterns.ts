@@ -38,7 +38,13 @@ import type { Page, PageType } from '../types.ts';
 // data-dir, on Postgres because the parent phase itself occupies a worker
 // slot and can deadlock a fully-occupied worker (#2050). synthesize.ts
 // drains its own children the same way.
-import { loadAllowedSlugPrefixes, loadOutputRoot, runSubagentsInline } from './synthesize.ts';
+import {
+  applyGeneratedStamp,
+  ensureBodyH1,
+  loadAllowedSlugPrefixes,
+  loadOutputRoot,
+  runSubagentsInline,
+} from './synthesize.ts';
 import { probeChatModel } from '../ai/gateway.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { throwIfAborted } from '../abort-check.ts';
@@ -145,8 +151,17 @@ export async function runPhasePatterns(
       );
     }
 
-    // Gather reflections within lookback window.
-    const reflections = await gatherReflections(engine, config.lookbackDays, config.sourceSlugPrefix);
+    // Gather reflections within lookback window, SCOPED TO THIS CYCLE'S SOURCE.
+    // #1586's unfixed third half: the write path is scoped (collectChildPutPageSlugs
+    // and reverseWriteRefs both take cycleSourceId) but the READ path was not, so a
+    // per-source cycle synthesized patterns out of EVERY source's reflections and
+    // filed the result under whichever source it happened to be running for.
+    // Measured on a 7-source brain: reflections lived in two sources only, yet a
+    // `--source adaptig` cycle wrote pattern pages stamped `scope: adaptig` into the
+    // team-facing checkout. Personal reflections must not fan out into every repo.
+    const reflections = await gatherReflections(
+      engine, config.lookbackDays, config.sourceSlugPrefix, opts.sourceId ?? 'default',
+    );
     if (reflections.length < config.minEvidence) {
       return skipped(
         'insufficient_evidence',
@@ -478,18 +493,24 @@ async function gatherReflections(
   engine: BrainEngine,
   lookbackDays: number,
   sourceSlugPrefix = 'wiki/personal/reflections',
+  sourceId = 'default',
 ): Promise<ReflectionRef[]> {
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
   // Reflections live under the configured source slug prefix (bound as a
-  // parameter; see PatternsConfig.sourceSlugPrefix / dream.patterns.source_slug_prefix).
+  // parameter; see PatternsConfig.sourceSlugPrefix / dream.patterns.source_slug_prefix)
+  // AND inside the cycle's own source — the write path is source-scoped, so the read
+  // path must be too or patterns cross-contaminate sources. Sources with fewer than
+  // min_evidence reflections of their own now skip via the insufficient_evidence path.
   const rows = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null }>(
     `SELECT slug, title, compiled_truth
        FROM pages
       WHERE slug LIKE $2
         AND updated_at >= $1::timestamptz
+        AND COALESCE(NULLIF(source_id, ''), 'default') = $3
+        AND deleted_at IS NULL
       ORDER BY updated_at DESC
       LIMIT 100`,
-    [since, `${sourceSlugPrefix}/%`],
+    [since, `${sourceSlugPrefix}/%`, sourceId],
   );
   return rows.map(r => ({
     slug: r.slug,
@@ -592,7 +613,7 @@ async function reverseWriteRefs(
     // getPage/getTags must not reach this ref's file write.
     throwIfAborted(signal, '[dream] patterns reverse-write');
     try {
-      const md = renderPageToMarkdown(page, tags);
+      const md = renderPageToMarkdown(page, tags, source_id);
       // v0.32.8 F6: foreign-source pages land under brainDir/.sources/<id>/<slug>.md
       // so same-slug-different-source pages don't collide on disk. Pages belonging
       // to the cycle's own source (#1586: brainDir IS that source's checkout —
@@ -612,11 +633,22 @@ async function reverseWriteRefs(
   return count;
 }
 
-function renderPageToMarkdown(page: Page, tags: string[]): string {
-  const frontmatter = (page.frontmatter ?? {}) as Record<string, unknown>;
+function renderPageToMarkdown(page: Page, tags: string[], sourceId?: string): string {
+  // Pattern pages are dream output too, so they carry the same generated-record
+  // stamp the synthesize phase writes. Before this they carried NO lifecycle
+  // frontmatter at all — not even `dream_generated` — so the retrieval policy's
+  // `generated`/`canonical` demotion could not fire on them and a replaceable
+  // cross-session pattern outranked the canonical record on its own subject.
+  const frontmatter = applyGeneratedStamp(
+    (page.frontmatter ?? {}) as Record<string, unknown>,
+    { sourceId },
+  );
   return serializeMarkdown(
     frontmatter,
-    page.compiled_truth ?? '',
+    // The record contract requires an H1 equal to `title`; serializeMarkdown puts
+    // the title in frontmatter only, so without this every pattern page fails
+    // `validate --strict` with missing_h1.
+    ensureBodyH1(page.compiled_truth ?? '', page.title ?? ''),
     page.timeline ?? '',
     {
       type: (page.type as string) ?? 'note',

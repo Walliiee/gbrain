@@ -146,7 +146,15 @@ export async function checkCycleFreshness(
   opts?: { nowMs?: number },
 ): Promise<Check> {
   try {
-    const sources = await engine.listAllSources({ localPathOnly: true });
+    // LOCAL PATCH (not upstream at v0.47.8.0): same federation predicate as
+    // checkSyncFreshness and core/sources-ops.ts isFederated() — a strict
+    // `=== true`. A retired, deliberately-unfederated source is unreachable
+    // from cross-source search, so its cycle age cannot make search stale;
+    // reporting it as a hard FAIL only masks real staleness on live sources.
+    // The empty-set branch below already said "No federated sources to cycle",
+    // so federated-only was always the intent here too.
+    const allSources = await engine.listAllSources({ localPathOnly: true });
+    const sources = allSources.filter((s) => s.config?.federated === true);
     if (sources.length === 0) {
       return {
         name: 'cycle_freshness',

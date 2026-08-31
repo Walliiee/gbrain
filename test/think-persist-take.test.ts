@@ -10,8 +10,12 @@
  *      markers removed, fence-cell sanitization, bounded length.
  *   2. Happy path on PGLite + a tmp brain repo: fence row lands on DISK
  *      (md-first) AND the DB mirror row exists; take_row returned.
- *   3. Warning paths: synthesisOk=false, empty answer, no brain repo
+ *   3. Warning paths: synthesisOk=false, empty answer, no markdown home at all
  *      (TAKE_MIRROR_UNAVAILABLE), missing anchor page (TAKE_WRITE_FAILED).
+ *   4. #4473: `sync.repo_path` unset is NOT by itself "no markdown home" — the
+ *      key is the legacy pre-v0.18 single-source one and is unset on every
+ *      brain built with `sources add`. When the anchor page's source carries
+ *      its own local_path the take must still land, in THAT tree.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
@@ -27,17 +31,20 @@ import {
 
 let engine: PGLiteEngine;
 let brainDir: string;
+let sourceRoot: string;
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
   brainDir = mkdtempSync(join(tmpdir(), 'gbrain-2556-'));
+  sourceRoot = mkdtempSync(join(tmpdir(), 'gbrain-2556-src-'));
 }, 60_000);
 
 afterAll(async () => {
   if (engine) await engine.disconnect();
   if (brainDir) rmSync(brainDir, { recursive: true, force: true });
+  if (sourceRoot) rmSync(sourceRoot, { recursive: true, force: true });
 }, 60_000);
 
 describe('#2556 claimFromAnswer (pure)', () => {
@@ -85,12 +92,56 @@ describe('#2556 persistTakeFromSynthesis (PGLite + tmp repo)', () => {
     expect(r.warnings).toContain('TAKE_SKIPPED_EMPTY_ANSWER');
   });
 
-  test('no brain repo → TAKE_MIRROR_UNAVAILABLE (md is canonical)', async () => {
-    // sync.repo_path unset at this point.
-    const r = await persistTakeFromSynthesis(engine, { answer: 'A real claim.', synthesisOk: true }, { anchor: 'x' });
+  test('no markdown home AT ALL → TAKE_MIRROR_UNAVAILABLE (md is canonical)', async () => {
+    // sync.repo_path unset at this point, and PGLite seeds `default` with
+    // local_path NULL — genuinely nowhere for the row to land.
+    //
+    // The anchor page must EXIST. addTakeToPage resolves the page id BEFORE
+    // the file path, so pointing this at a missing slug would report
+    // page_not_found and the test would pass for the wrong reason (it did:
+    // the old fixture used anchor 'x', which no page ever backed).
+    await engine.putPage('notes/no-home-at-all', {
+      type: 'note' as never,
+      title: 'No home at all',
+      compiled_truth: 'A page with nowhere to write.',
+    });
+    const r = await persistTakeFromSynthesis(
+      engine,
+      { answer: 'A real claim.', synthesisOk: true },
+      { anchor: 'notes/no-home-at-all' },
+    );
     expect(r.take_row).toBeNull();
     expect(r.warnings).toContain('TAKE_MIRROR_UNAVAILABLE');
-  });
+  }, 60_000);
+
+  test('#4473 sync.repo_path unset but the source HAS a local_path → the take lands in THAT tree', async () => {
+    // Mike's real configuration: 22 sources, each with its own working tree,
+    // and the legacy pre-v0.18 `sync.repo_path` key never set. persist-take
+    // used to refuse on the null host repo before addTakeToPage ever ran, so
+    // `think --take` was dead on every such brain even though the anchor
+    // page's own source had a tree standing right there.
+    await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [sourceRoot]);
+    try {
+      await engine.putPage('notes/per-source-fallback', {
+        type: 'note' as never,
+        title: 'Per source fallback',
+        compiled_truth: 'A page whose source owns the working tree.',
+      });
+      const r = await persistTakeFromSynthesis(
+        engine,
+        { answer: 'The per-source fallback carries the take.', synthesisOk: true },
+        { anchor: 'notes/per-source-fallback' },
+      );
+      expect(r.warnings.filter(w => w.startsWith('TAKE_'))).toEqual([]);
+      expect(r.take_row).toBe(1);
+      // Filed under the SOURCE's tree, not the (absent) host repo.
+      expect(r.path).toBe(join(sourceRoot, 'notes/per-source-fallback.md'));
+      expect(existsSync(r.path!)).toBe(true);
+      expect(readFileSync(r.path!, 'utf-8')).toContain('The per-source fallback carries the take.');
+    } finally {
+      await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+    }
+  }, 60_000);
 
   test('happy path: fence row on disk + DB mirror row + take_row', async () => {
     await engine.setConfig('sync.repo_path', brainDir);

@@ -65,7 +65,12 @@ import { isQueueQuotaExceededError } from '../minions/admission.ts';
 import { waitForCompletionRenewing, TimeoutError } from '../minions/wait-for-completion.ts';
 import type { MinionJobInput, SubagentHandlerData } from '../minions/types.ts';
 import { runSubagentsInline, runDrainRenewalTick, percentile, INLINE_LOCK_MS } from './inline-drain.ts';
-import { buildManifestContext, buildLinkManifest, type ManifestContext } from './link-manifest.ts';
+import {
+  buildManifestContext,
+  buildLinkManifest,
+  DREAM_PROPOSAL_PREFIX,
+  type ManifestContext,
+} from './link-manifest.ts';
 import { throwIfAborted } from '../abort-check.ts';
 
 // Re-exports: the drain was peeled to inline-drain.ts (dream-wave C7), the
@@ -74,6 +79,25 @@ import { throwIfAborted } from '../abort-check.ts';
 export { runSubagentsInline, runDrainRenewalTick };
 import { loadAllowedSlugPrefixes } from './filing-rules.ts';
 export { loadAllowedSlugPrefixes };
+
+/**
+ * Append the review-queue glob to a loaded allow-list, in place, idempotently.
+ *
+ * Exported so the authorization is pinned by a test rather than only asserted in
+ * a comment: the whole point of the proposals lane is that a rejected write is
+ * SILENT (put_page refuses server-side with no error surface), so the day this
+ * glob goes missing the cycle keeps reporting success and simply stops producing
+ * proposals. That is the failure this lane was built to prevent, and an unpinned
+ * rule is not a rule.
+ *
+ * Call it only AFTER the fail-closed empty-allow-list check, so a broken
+ * filing-rules file can never be resurrected into a one-glob allow-list.
+ */
+export function withProposalLane(prefixes: string[]): string[] {
+  const proposalGlob = `${DREAM_PROPOSAL_PREFIX}*`;
+  if (!prefixes.includes(proposalGlob)) prefixes.push(proposalGlob);
+  return prefixes;
+}
 import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscript } from './transcript-discovery.ts';
 import { loadStorageConfig, isDbOnly } from '../storage-config.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
@@ -428,6 +452,31 @@ async function runPhaseSynthesizeInner(
 
     // Cooldown check (skipped for explicit --input / --date / --from / --to runs).
     const explicitTarget = opts.inputFile || opts.date || opts.from || opts.to;
+
+    // SOURCE ALLOWLIST — checked BEFORE the cooldown so a disallowed source can
+    // neither consume nor stamp the cooldown key.
+    //
+    // `dream.synthesize.session_corpus_dir` is a single GLOBAL directory, but the
+    // synthesis output is source-scoped. On a multi-source nightly cron every
+    // source therefore synthesizes the SAME transcripts into its own checkout, and
+    // the only thing deciding which source's repo the reflections land in is
+    // `dream.synthesize.last_completion_ts` — one global cooldown key claimed by
+    // whichever source runs first AND is not capped that night. Run order and the
+    // per-source daily cap, not intent, pick the destination: a capped source
+    // returns without stamping the cooldown, handing the baton to the next source
+    // in the loop, which writes personal reflections into a repo that has nothing
+    // to do with them.
+    //
+    // Unset (the default) preserves legacy behavior exactly.
+    if (!explicitTarget && config.sourceAllowlist.length > 0) {
+      const cycleSource = opts.sourceId ?? 'default';
+      if (!config.sourceAllowlist.includes(cycleSource)) {
+        return skipped('source_not_allowed',
+          `source "${cycleSource}" is not in dream.synthesize.source_allowlist ` +
+          `(${config.sourceAllowlist.join(', ')})`);
+      }
+    }
+
     if (!explicitTarget) {
       const cooldown = await checkCooldown(engine, config.cooldownHours);
       if (cooldown.active) {
@@ -583,6 +632,17 @@ async function runPhaseSynthesizeInner(
       return failed(makeError('InternalError', 'NO_ALLOWLIST',
         'skills/_brain-filing-rules.json missing dream_synthesize_paths.globs'));
     }
+    // The review queue (prompt Tasks E and F) is phase-derived rather than read
+    // from the filing rules, the same shape as #4117's namespace globs and for a
+    // sharper reason: loadAllowedSlugPrefixes resolves the FIRST EXISTING
+    // `_brain-filing-rules.json` on a four-rung ladder, so an operator copy in a
+    // brain repo shadows the bundled one. A proposals glob living only in the
+    // bundled file would vanish the moment someone's brain repo grew its own
+    // copy, and put_page would then reject every proposal write server-side with
+    // no error surface. Appended AFTER the fail-closed check above, so a broken
+    // filing-rules file can never be resurrected into a one-glob allow-list. The
+    // patterns phase does not get this lane — it writes no proposals.
+    withProposalLane(allowedSlugPrefixes);
 
     // #4216: pre-retrieval manifest context — one slug snapshot + basename
     // index per phase, reused across every transcript's LINK CANDIDATES
@@ -619,8 +679,12 @@ async function runPhaseSynthesizeInner(
     const childIds: number[] = [];
     /** Map child job_id → chunk metadata for D6 orchestrator-side slug rewrite. */
     const chunkInfo = new Map<number, { idx: number; hash6: string }>();
-    /** #1978: map child job_id → source transcript path so written pages get a raw_source stamp. */
-    const jobRawSource = new Map<number, string>();
+    /**
+     * #1978: map child job_id → the source transcript's path AND content digest,
+     * so written pages get a raw trace that survives the corpus file moving (a
+     * bare path dies on the first archive/relocate).
+     */
+    const jobRawSource = new Map<number, { path: string; hash?: string }>();
     /** Skip reasons for the cycle report (D5 cap hits, D8 legacy-key skips). */
     const skipReports: Array<{ filePath: string; reason: string }> = [];
 
@@ -896,7 +960,7 @@ async function runPhaseSynthesizeInner(
           transcriptFreshIds.push(child.id);
         }
         childIds.push(child.id);
-        jobRawSource.set(child.id, t.filePath);
+        jobRawSource.set(child.id, { path: t.filePath, hash: t.contentHash });
         if (isChunked) {
           chunkInfo.set(child.id, { idx: i, hash6 });
         }
@@ -956,7 +1020,7 @@ async function runPhaseSynthesizeInner(
         const cancelled = await queue.cancelJob(row.id);
         if (cancelled) {
           const src = jobRawSource.get(row.id);
-          if (src) budgetExhaustedDeferrals.push(basename(src));
+          if (src) budgetExhaustedDeferrals.push(basename(src.path));
         }
       }
     }
@@ -1351,6 +1415,12 @@ export interface SynthConfig {
   maxTurns: number;
   /** dream.synthesize.max_submissions_per_source_per_day, default 0 = disabled (D2D). Docs recommend 200 for busy deployments. */
   maxSubmissionsPerSourcePerDay: number;
+  /**
+   * dream.synthesize.source_allowlist — comma-separated source ids permitted to
+   * run a CORPUS-SCAN synthesize. Empty (default) = every source may, which is
+   * the legacy behavior. See the gate in runPhaseSynthesizeInner for why.
+   */
+  sourceAllowlist: string[];
   cooldownHours: number;
   /**
    * D1: Override the per-chunk token budget (model_context × HEADROOM_RATIO
@@ -1530,6 +1600,8 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
   const maxTurns = Math.max(1, Math.floor(await getNumberConfig(engine, 'dream.synthesize.max_turns', DEFAULT_MAX_TURNS)) || 1);
   const maxSubmissionsPerSourcePerDay = Math.max(0,
     Math.floor(await getNumberConfig(engine, 'dream.synthesize.max_submissions_per_source_per_day', 0)));
+  const sourceAllowlist = ((await engine.getConfig('dream.synthesize.source_allowlist')) ?? '')
+    .split(',').map(id => id.trim()).filter(Boolean);
   // getNumberConfig (not `parseInt(str, 10) || N`) so a configured 0 is honored — a bare
   // `|| N` coerces an explicit 0 back to the default (cooldown 0 = "no cooldown").
   const cooldownHours = Math.max(0, await getNumberConfig(engine, 'dream.synthesize.cooldown_hours', 12));
@@ -1614,6 +1686,7 @@ export async function loadSynthConfig(engine: BrainEngine): Promise<SynthConfig>
     },
     maxTurns,
     maxSubmissionsPerSourcePerDay,
+    sourceAllowlist,
     cooldownHours,
     maxPromptTokens,
     maxChunksPerTranscript,
@@ -2623,6 +2696,15 @@ function buildSynthesisPrompt(
   const crossRefRule = linkManifestBlock
     ? 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Pick targets from the LINK CANDIDATES above (or another page you write in this response); use the search tool, if available, only when no candidate fits.'
     : 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Use the search tool to find existing pages first.';
+  // Task F's hard gate is only satisfiable if the subagent has some way to learn
+  // a REAL slug. With a manifest it reads one off the list; without a manifest the
+  // only route is the search tool, which the oneshot path does not have. Telling a
+  // tool-less run to "take a slug from LINK CANDIDATES" when no such block exists
+  // is an invitation to invent one, so the manifest-less wording forbids
+  // corrections outright rather than leaving the model to improvise a target.
+  const correctionTargetRule = linkManifestBlock
+    ? 'taken from LINK CANDIDATES above, or found with the search tool if one is available.'
+    : 'found with the search tool. If this run has no search tool, you cannot verify that any target exists — write NO correction pages at all.';
   // OV-7: the write allow-list must live in the PROMPT, not only in the
   // put_page tool schema — the oneshot path never sees a tool schema.
   const allowedPathsBlock = allowedSlugPrefixes.length > 0
@@ -2654,6 +2736,41 @@ B. Originals (new ideas, frames, theses, mental models):
 C. People mentions: ${linkManifestBlock ? 'check LINK CANDIDATES (and the search tool, when available) first' : 'search first, when a search tool is available'}; never write over an existing person page (the orchestrator handles people enrichment via timeline entries — your job is the reflection/original synthesis, NOT modifying existing person pages).
 
 D. If nothing in this transcript meets the bar (significance filter already passed but the content is still routine), return without writing anything.
+
+E. Candidate TASKS (work the transcript shows is still open):
+   slug: \`${DREAM_PROPOSAL_PREFIX}${dateHint}-task-<short-slug>-${hashSuffix}\`
+   Write one page per candidate task, at most 3, and only when ALL of these hold:
+   - The transcript shows a commitment, a request, or an unfinished piece of work — not a wish, not an idea, not something you think would be a good idea.
+   - It was NOT completed inside this same transcript. If the work was done in-session, it is not a task; it belongs in a reflection or nowhere.
+   - **THE BRAIN DOES NOT ALREADY KNOW IT.** This is the test that matters. ${linkManifestBlock ? 'SEARCH FIRST: look for this work in `tasks/current`, in `decisions/`, and in `learnings/`. If any of them already tracks it — open OR closed — do not propose it. A task the brain already has is not a candidate, it is noise, and a task the brain has already CLOSED is worse than noise because it manufactures a backlog that makes the owner look more blocked than they are.' : 'You have NO search tool in this run, so you CANNOT check whether the brain already knows this. Propose ONLY when the transcript itself shows the work is still open at the END of the session AND names an owner. When in doubt, do not propose — a missed task costs one nightly cycle; a duplicated one costs review time forever.'}
+   - It is not a restatement of another proposal you are writing in this same run. One defect discussed twice in a transcript is ONE task.
+   - You can quote the exact sentence that creates it.
+   Body MUST contain, as literal headed sections:
+   \`## Proposed task\` — one imperative sentence.
+   \`## Owner\` — who does it, named from the transcript.
+   \`## Done when\` — an observable condition someone else could check.
+   \`## Evidence\` — the verbatim quote, in quotation marks, that creates the task.
+   \`## Why this is not already done\` — one sentence.
+
+F. Candidate CORRECTIONS (the transcript contradicts something the brain already says):
+   slug: \`${DREAM_PROPOSAL_PREFIX}${dateHint}-correction-<short-slug>-${hashSuffix}\`
+   Write one page per correction, at most 3.
+   HARD GATE — a correction that cannot name its target is worthless, so:
+   - You MUST name an EXISTING page, by \`<source-id>:<slug>\`, ${correctionTargetRule} Do NOT invent a slug. Do NOT guess. If you cannot name a real existing page, DO NOT WRITE THE PAGE AT ALL.
+   - You have NOT read the target record. All you have is its title and a short preview. So you MUST NOT write "The record states:" followed by quotation marks — you cannot quote a page you have not read, and inventing one is the single worst thing you can do here. Quotation marks in a correction page are reserved for the TRANSCRIPT and nothing else.
+   - You MUST be specific about WHICH belief you are challenging. "This record feels out of date" is not a correction.
+   - You MUST quote the transcript evidence verbatim.
+   Body MUST contain, as literal headed sections:
+   \`## Target record\` — \`<source-id>:<slug>\`, plus a \`[[<slug>]]\` wikilink to it.
+   \`## Claim challenged\` — in YOUR OWN WORDS and with no quotation marks, the belief you think that record holds, followed by the sentence: "Not verified against the record itself — only its title and preview were available."
+   \`## What this transcript says instead\` — the verbatim transcript evidence, in quotation marks.
+   \`## Confidence and what would settle it\` — one sentence naming what a human should check. Always include: whether the record already says this, since a record that was corrected after it was written still reads as stale from the outside.
+
+PROPOSAL RULES (apply to E and F only)
+- These are PROPOSALS for a human to review. You are NOT writing the task list and you are NOT editing the target record. Never write to \`tasks/\`, \`decisions/\`, \`learnings/\`, \`context/\` or \`agent-runs/\` — those writes are rejected.
+- Fewer and specific beats more and generic. Zero task proposals and zero correction proposals is a correct, common outcome. Do not manufacture one to look productive.
+- Reject your own draft if it would read as advice to anyone in any session — "add tests", "document this", "follow up with the client". A proposal that is not anchored to this transcript's specifics is filler; drop it.
+- Every proposal page still needs at least one resolving wikilink (see rule 2). For a correction that is the target record; for a task, link ${linkManifestBlock ? 'a related existing page from LINK CANDIDATES' : 'a related existing page you found with the search tool'} or another page in this response.
 
 TRANSCRIPT (${transcriptHeader})
 ---
@@ -2691,12 +2808,12 @@ async function collectChildPutPageSlugs(
   childIds: number[],
   chunkInfo: Map<number, { idx: number; hash6: string }>,
   sourceId = 'default',
-  jobRawSource?: Map<number, string>,
+  jobRawSource?: Map<number, string | { path: string; hash?: string }>,
   // F6 out-param (backwards-compatible with the __testing call sites):
   // collects the job ids that produced ≥1 put_page write, so the caller can
   // count zero-page children without a second subagent_tool_executions scan.
   outJobsWithPages?: Set<number>,
-): Promise<Array<{ slug: string; source_id: string; raw_source?: string }>> {
+): Promise<DreamPageRef[]> {
   if (childIds.length === 0) return [];
   // Raw fetch — NO SELECT DISTINCT. Preserves per-child slug duplicates so
   // the orchestrator sees what each child wrote. COALESCE handles both
@@ -2720,7 +2837,7 @@ async function collectChildPutPageSlugs(
   );
   // #1978: slug → source transcript path (first writer wins) so the
   // provenance stamp can record WHERE the synthesized content came from.
-  const rewritten = new Map<string, string | undefined>();
+  const rewritten = new Map<string, string | { path: string; hash?: string } | undefined>();
   for (const r of rows) {
     if (typeof r.slug !== 'string' || r.slug.length === 0) continue;
     // Postgres decodes the BIGINT FK as bigint; both metadata maps are keyed
@@ -2734,8 +2851,17 @@ async function collectChildPutPageSlugs(
     }
   }
   return Array.from(rewritten.keys()).sort().map(slug => {
-    const raw_source = rewritten.get(slug);
-    return { slug, source_id: sourceId, ...(raw_source ? { raw_source } : {}) };
+    // Back-compat: callers (and pinned tests) may still map job_id → a bare path
+    // string. Normalize both shapes here so the digest is optional, never required.
+    const trace = rewritten.get(slug);
+    const path = typeof trace === 'string' ? trace : trace?.path;
+    const hash = typeof trace === 'string' ? undefined : trace?.hash;
+    return {
+      slug,
+      source_id: sourceId,
+      ...(path ? { raw_source: path } : {}),
+      ...(path && hash ? { raw_source_hash: hash } : {}),
+    };
   });
 }
 
@@ -2809,48 +2935,308 @@ function findLegacyCompletion(
   return null;
 }
 
+// ── Generated-record contract stamp ──────────────────────────────────
+
+/**
+ * Scopes the shared record contract accepts. A gbrain source id that already IS
+ * a valid scope maps straight through; anything else falls back to `shared` —
+ * the widest non-restricted scope, so a page is never mislabelled as protected
+ * `adaptig` material it does not belong to.
+ */
+const RECORD_SCOPES = new Set(['adaptig', 'mike-business', 'shared']);
+
+/** Default shelf life of a dream-generated page, in days. */
+const GENERATED_TTL_DAYS = 90;
+
+/**
+ * Review-queue prefix for candidate tasks and candidate corrections mined out of
+ * a transcript (prompt Tasks E and F).
+ *
+ * WHY A QUEUE AND NOT A DIRECT WRITE. The obvious implementation — let the
+ * subagent append to `tasks/current`, or edit the decision record it thinks is
+ * wrong — is not acceptable at any confidence level: a model that mis-reads one
+ * transcript would silently rewrite the canonical task list or a ratified
+ * ruling, and nothing downstream could tell that apart from a human edit. So the
+ * phase extracts PROPOSALS and stops. A human moves a proposal into `tasks/`,
+ * `decisions/` or `learnings/`; the cycle never does. Those prefixes stay off
+ * the allow-list in `skills/_brain-filing-rules.json`, so the refusal is
+ * enforced server-side by put_page, not by prompt discipline.
+ *
+ * The literal lives in link-manifest.ts — the one module both this file and the
+ * oneshot slug fence already import. Re-exported here because this is where the
+ * concept belongs.
+ */
+export { DREAM_PROPOSAL_PREFIX };
+
+/**
+ * Proposals expire faster than ordinary generated output. A 90-day-old
+ * "candidate task" is not a task, it is noise that outlived the conversation it
+ * came from — and an expired non-canonical record drops out of search outright,
+ * which is exactly the disposal behavior an unreviewed proposal should have.
+ */
+const PROPOSAL_TTL_DAYS = 30;
+
+/** True when a slug lands in the review queue rather than the brain proper. */
+export function isProposalSlug(slug: string | undefined): boolean {
+  return typeof slug === 'string' && slug.startsWith(DREAM_PROPOSAL_PREFIX);
+}
+
+/** Owner recorded on dream output: the producer, not a human. */
+const GENERATED_OWNER = 'gbrain-dream';
+
+/** A page a dream child wrote, plus the raw trace it was synthesized from. */
+export interface DreamPageRef {
+  slug: string;
+  source_id: string;
+  /** Absolute path of the source transcript. */
+  raw_source?: string;
+  /** Full sha256 hex of that transcript's bytes. */
+  raw_source_hash?: string;
+}
+
+export interface GeneratedRecordContext {
+  /**
+   * Slug of the page being stamped. Only load-bearing for the review queue: a
+   * `dream-cycle-proposals/` slug gets `status: proposed` FORCED (not
+   * defaulted), so a subagent cannot write itself an `active` proposal.
+   */
+  slug?: string;
+  /** gbrain source the page belongs to. Maps to the record `scope`. */
+  sourceId?: string;
+  /** Cycle date, `YYYY-MM-DD`. Defaults to today. */
+  cycleDate?: string;
+  /** Absolute path of the transcript this page was synthesized from. */
+  rawSourcePath?: string;
+  /** Full sha256 hex of that transcript's bytes. */
+  rawSourceHash?: string;
+  /** Explicit `derived_from` when the caller knows a better reference. */
+  derivedFrom?: string;
+  /** Explicit `source_refs`; defaults to `[derived_from]`. */
+  sourceRefs?: string[];
+  /** Extra keys merged into `forced` (e.g. the summary's raw_trace exemption). */
+  extraForced?: Record<string, unknown>;
+}
+
+/**
+ * A raw-source reference that survives the corpus file moving.
+ *
+ * `raw_source` on its own is a bare filesystem path: the moment the corpus root
+ * changes or the transcript is archived, the provenance claim is unverifiable
+ * AND unfindable. Pinning the content digest into the reference makes the claim
+ * checkable against the bytes rather than the location.
+ */
+function rawSourceRef(path: string, hash?: string): string {
+  return hash ? `file://${path}#sha256=${hash.slice(0, 12)}` : `file://${path}`;
+}
+
+/** `YYYY-MM-DD` + n days, UTC, same shape back. Invalid input passes through. */
+function addDays(isoDate: string, days: number): string {
+  const base = new Date(`${isoDate}T00:00:00Z`);
+  if (Number.isNaN(base.getTime())) return isoDate;
+  base.setUTCDate(base.getUTCDate() + days);
+  return base.toISOString().slice(0, 10);
+}
+
+/**
+ * The frontmatter every dream-generated page must carry, split into the two
+ * merge classes the record contract needs.
+ *
+ * WHY THIS EXISTS. Generated pages used to carry exactly three keys —
+ * `dream_generated`, `dream_cycle_date`, `raw_source`. A governed retrieval
+ * policy demotes replaceable output through weights keyed on `generated: true`
+ * and `canonical: false`; with neither key present the demotion could never
+ * fire, so fresh synthesis systematically outranked the canonical record on its
+ * own subject. Measured on one query before this change: the generated page held
+ * rank 1 at score 1.0000; after it, rank 10 at 0.1861 with the canonical record
+ * back at rank 1.
+ *
+ * `defaults` merge UNDER whatever the page already carries, so a subagent's own
+ * `status` survives and a re-render never resets `created`. `forced` merge OVER,
+ * because they are guarantees the orchestrator makes on the subagent's behalf:
+ * dream output is never canonical, is always flagged generated, and always
+ * states its provenance and raw trace.
+ *
+ * Deliberately absent: `ingested_at`, `ingested_via`, `source_kind`,
+ * `source_uri`, `captured_at`, `captured_via`. Those are server-managed
+ * ingestion metadata; a record validator rejects them inside source Markdown.
+ */
+export function generatedRecordStamp(
+  ctx: GeneratedRecordContext = {},
+): { defaults: Record<string, unknown>; forced: Record<string, unknown> } {
+  const cycleDate = ctx.cycleDate ?? today();
+  const scope = ctx.sourceId && RECORD_SCOPES.has(ctx.sourceId) ? ctx.sourceId : 'shared';
+  const rawRef = ctx.rawSourcePath ? rawSourceRef(ctx.rawSourcePath, ctx.rawSourceHash) : undefined;
+  const derivedFrom = ctx.derivedFrom ?? rawRef ?? `gbrain:dream-cycle/${cycleDate}`;
+  const sourceRefs = ctx.sourceRefs?.length ? ctx.sourceRefs : [derivedFrom];
+  const proposal = isProposalSlug(ctx.slug);
+  return {
+    defaults: {
+      // Position, not value, is what these two buy here — the value is
+      // guaranteed by `forced` below. `serializeMarkdown` emits keys in
+      // insertion order and a key's slot comes from its FIRST appearance, so
+      // seeding them in `defaults` renders the identity marker at the TOP of the
+      // frontmatter. The self-consumption guard's marker regex only scans 2000
+      // chars past the `---`, and a summary page's `source_refs` list can be
+      // longer than that — a dream page the guard cannot see is a dream page
+      // that gets re-ingested as a transcript.
+      dream_generated: true,
+      dream_cycle_date: cycleDate,
+      scope,
+      status: 'active',
+      owner: GENERATED_OWNER,
+      visibility: 'internal',
+      sensitivity: 'standard',
+      record_version: 1,
+      created: cycleDate,
+      expires_at: addDays(cycleDate, proposal ? PROPOSAL_TTL_DAYS : GENERATED_TTL_DAYS),
+      promotion_target: `${scope}:learnings`,
+      derived_from: derivedFrom,
+      source_refs: sourceRefs,
+    },
+    forced: {
+      canonical: false,
+      generated: true,
+      authority_level: 'derived',
+      provenance: 'synthesis',
+      updated_at: cycleDate,
+      dream_generated: true,
+      dream_cycle_date: cycleDate,
+      // Review queue: FORCED, never defaulted. `status` normally merges under the
+      // page's own frontmatter so a subagent's judgment survives — but a proposal
+      // that calls itself `active` is a proposal that has quietly promoted itself,
+      // and `expires_at` is the only thing that eventually disposes of an
+      // unreviewed one. Neither is the model's to choose.
+      ...(proposal
+        ? {
+            status: 'proposed',
+            proposal: true,
+            expires_at: addDays(cycleDate, PROPOSAL_TTL_DAYS),
+            review_state: 'pending',
+            // Where a HUMAN would file this if they accept it. Derived from the
+            // slug discriminator the prompt templates emit; a correction names
+            // its own target record in the body, so the generic
+            // decisions/learnings landing zone is as specific as the
+            // orchestrator can honestly be.
+            promotion_target: (ctx.slug ?? '').includes('-task-')
+              ? `${scope}:tasks/current`
+              : `${scope}:decisions|learnings (see 'Target record' in body)`,
+          }
+        : {}),
+      ...(ctx.rawSourcePath
+        ? {
+            raw_source: ctx.rawSourcePath,
+            raw_source_name: basename(ctx.rawSourcePath),
+            ...(ctx.rawSourceHash ? { raw_source_sha256: `sha256:${ctx.rawSourceHash}` } : {}),
+          }
+        : {}),
+      ...(ctx.extraForced ?? {}),
+    },
+  };
+}
+
+/**
+ * The record contract requires exactly one H1 in the body, equal to `title`.
+ * `serializePageToMarkdown` writes the title into FRONTMATTER only, and the
+ * synthesis subagent writes prose with no top-level heading — so every generated
+ * page failed `validate --strict` with `missing_h1` (3 of 3 on the proving run).
+ * Normalize here, in the producer:
+ *
+ *   - no H1 at all      → prepend one built from the page title;
+ *   - first H1 differs  → rewrite that heading to the title, because a title and
+ *                         its own H1 disagreeing is itself a contract violation
+ *                         (`title_h1_mismatch`).
+ *
+ * Idempotent: a re-render, or a sync round-trip that folded the H1 into
+ * `compiled_truth`, never adds a second heading. The H1 regex deliberately
+ * mirrors the validator's own (`(?m)^#\s+(.+?)\s*$`) so "has an H1" means the
+ * same thing on both sides.
+ */
+export function ensureBodyH1(body: string, title: string): string {
+  const heading = title.trim();
+  if (!heading) return body;
+  const h1 = /^#[ \t]+(.+?)[ \t]*$/m;
+  const match = h1.exec(body);
+  if (!match) return `# ${heading}\n\n${body.replace(/^\n+/, '')}`;
+  if (match[1].split(/\s+/).join(' ') === heading.split(/\s+/).join(' ')) return body;
+  return body.slice(0, match.index) + `# ${heading}` + body.slice(match.index + match[0].length);
+}
+
+/**
+ * Apply the stamp to an existing frontmatter object: defaults under, forced over.
+ *
+ * When the caller does not name a cycle date, the row's OWN `dream_cycle_date`
+ * is the authority — `stampDreamProvenance` writes the DB row before any
+ * reverse-render, so a `--date 2026-08-22` backfill must not re-render as today.
+ * Falling through to `today()` only when the row carries no stamp at all keeps a
+ * row that lost its stamp to a put_page write-through renderable.
+ */
+export function applyGeneratedStamp(
+  existing: Record<string, unknown> | null | undefined,
+  ctx: GeneratedRecordContext = {},
+): Record<string, unknown> {
+  const fm = existing ?? {};
+  const cycleDate = ctx.cycleDate
+    ?? (typeof fm.dream_cycle_date === 'string' ? fm.dream_cycle_date : undefined);
+  const { defaults, forced } = generatedRecordStamp({ ...ctx, cycleDate });
+  return { ...defaults, ...fm, ...forced };
+}
+
 // ── Dream-provenance DB stamp (#2569) ────────────────────────────────
 
 /**
- * Persist the dream-output identity marker (`dream_generated: true` +
- * `dream_cycle_date`) into the `pages.frontmatter` JSONB row for every page
- * a synthesize child wrote. Render-time `frontmatterOverrides` alone only
- * reach the markdown FILE — the DB row stayed unstamped, so DB consumers
- * couldn't enumerate generated pages and a later put_page write-through
- * (which re-renders from the DB row) silently erased the marker.
+ * Persist the FULL generated-record contract into the `pages.frontmatter` JSONB
+ * row for every page a synthesize child wrote. Render-time
+ * `frontmatterOverrides` alone only reach the markdown FILE — the DB row stayed
+ * unstamped, so DB consumers couldn't enumerate generated pages and a later
+ * put_page write-through (which re-renders from the DB row) silently erased the
+ * marker.
  *
- * Plain UPDATE through executeRawJsonb (raw object bound to $3::jsonb —
- * never JSON.stringify into a ::jsonb cast; engine-parity safe, no new
- * engine method). Best-effort per row: a stamp failure never kills the
- * phase (the render-time override still covers the file).
+ * The stamp is no longer three identity keys. It is the whole contract
+ * (`generatedRecordStamp`), because the retrieval policy that demotes
+ * replaceable output reads `generated` / `canonical` / `authority_level` /
+ * `status` / `expires_at` — none of which the three-key stamp emitted, so the
+ * demotion never fired and generated pages buried canonical truth.
+ *
+ * Merge order is `defaults || existing || forced`: a subagent's own choices
+ * survive where the contract allows them, and the orchestrator's guarantees
+ * (never canonical, always generated, always provenanced) win outright.
+ *
+ * Plain UPDATE through executeRawJsonb (raw objects bound to `$N::jsonb` —
+ * never JSON.stringify into a ::jsonb cast; engine-parity safe, no new engine
+ * method). Best-effort per row: a stamp failure never kills the phase (the
+ * render-time stamp still covers the file).
  */
 async function stampDreamProvenance(
   engine: BrainEngine,
-  refs: Array<{ slug: string; source_id: string; raw_source?: string }>,
+  refs: DreamPageRef[],
   cycleDate: string,
   signal?: AbortSignal,
 ): Promise<void> {
   if (refs.length === 0) return;
   const { executeRawJsonb } = await import('../sql-query.ts');
-  for (const { slug, source_id, raw_source } of refs) {
+  for (const { slug, source_id, raw_source, raw_source_hash } of refs) {
     // #4077: per-row abort check — the per-row try below is only for stamp
     // failures and must not swallow the cancellation unwind.
     throwIfAborted(signal, '[dream] synthesize provenance');
+    // #1978 raw-source persistence: record the transcript the synthesis was
+    // derived from — path, basename and content digest — so `gbrain doctor`
+    // (raw_provenance check) can verify the trace and a reader can still find
+    // the evidence after the corpus file moves.
+    const { defaults, forced } = generatedRecordStamp({
+      slug,
+      sourceId: source_id,
+      cycleDate,
+      rawSourcePath: raw_source,
+      rawSourceHash: raw_source_hash,
+    });
     try {
       await executeRawJsonb(
         engine,
         `UPDATE pages
-            SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $3::jsonb
+            SET frontmatter = $3::jsonb || COALESCE(frontmatter, '{}'::jsonb) || $4::jsonb
           WHERE slug = $1 AND source_id = $2`,
         [slug, source_id],
-        // #1978 raw-source persistence: record the transcript path the
-        // synthesis was derived from, so `gbrain doctor` (raw_provenance
-        // check) can verify every generated page carries a raw trace.
-        [{
-          dream_generated: true,
-          dream_cycle_date: cycleDate,
-          ...(raw_source ? { raw_source } : {}),
-        }],
+        [defaults, forced],
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -2864,12 +3250,12 @@ async function stampDreamProvenance(
 async function reverseWriteRefs(
   engine: BrainEngine,
   brainDir: string,
-  refs: Array<{ slug: string; source_id: string }>,
+  refs: DreamPageRef[],
   nativeSourceId = 'default',
   signal?: AbortSignal,
 ): Promise<number> {
   let count = 0;
-  for (const { slug, source_id } of refs) {
+  for (const { slug, source_id, raw_source, raw_source_hash } of refs) {
     throwIfAborted(signal, '[dream] synthesize reverse-write');
     // v0.32.8 F6: validate source_id is filesystem-safe before any join().
     validateSourceId(source_id);
@@ -2880,7 +3266,14 @@ async function reverseWriteRefs(
     // getPage/getTags must not reach this ref's file write.
     throwIfAborted(signal, '[dream] synthesize reverse-write');
     try {
-      const md = renderPageToMarkdown(page, tags);
+      // The DB row is already stamped, so this context is belt-and-braces — it
+      // also covers a row that lost its stamp to a put_page write-through.
+      const md = renderPageToMarkdown(page, tags, {
+        slug,
+        sourceId: source_id,
+        rawSourcePath: raw_source,
+        rawSourceHash: raw_source_hash,
+      });
       // v0.32.8 F6: foreign-source pages land at brainDir/.sources/<id>/<slug>.md
       // so same-slug-different-source pages don't collide. Pages belonging to
       // the cycle's own source (#1586: brainDir IS that source's checkout —
@@ -2901,25 +3294,45 @@ async function reverseWriteRefs(
 }
 
 /**
- * Render a Page to markdown, stamping the dream-output identity marker into
- * frontmatter. This stamp is the explicit identity surface checked by
- * `isDreamOutput` in transcript-discovery.ts. Stamping at render time covers
- * every reverse-write path (subagent reflections + originals + summary) with
- * one funnel; the prior content-pattern guard could miss real output because
+ * Render a Page to markdown, stamping the FULL generated-record contract into
+ * frontmatter. `dream_generated` remains the explicit identity surface checked
+ * by `isDreamOutput` in transcript-discovery.ts. Stamping at render time covers
+ * every reverse-write path (subagent reflections + originals + summary) with one
+ * funnel; the prior content-pattern guard could miss real output because
  * `serializeMarkdown` does not embed the page slug in the body.
+ *
+ * The stamp used to be two keys, which is why generated pages outranked
+ * canonical records: a retrieval policy that demotes replaceable output keys on
+ * `generated` / `canonical`, and neither was ever written. See
+ * `generatedRecordStamp` for the full rationale and merge order.
  */
-export function renderPageToMarkdown(page: Page, tags: string[]): string {
-  // v0.38 DRY: the dream-output identity stamp (dream_generated +
-  // dream_cycle_date) is the ONLY thing that differs from the v0.38
-  // put_page write-through renderer. Both call the shared
-  // serializePageToMarkdown helper in markdown.ts; this wrapper passes
-  // the dream-specific overrides. Future markdown-shape changes happen
-  // in one place.
-  return serializePageToMarkdown(page, tags, {
-    frontmatterOverrides: {
-      dream_generated: true,
-      dream_cycle_date: today(),
-    },
+export function renderPageToMarkdown(
+  page: Page,
+  tags: string[],
+  ctx: GeneratedRecordContext = {},
+): string {
+  // v0.38 DRY: the generated-record stamp is the ONLY thing that differs from
+  // the v0.38 put_page write-through renderer. Both call the shared
+  // serializePageToMarkdown helper in markdown.ts; this wrapper passes the
+  // dream-specific frontmatter. Future markdown-shape changes happen in one
+  // place. `applyGeneratedStamp` folds the page's own frontmatter in at the
+  // right precedence, so passing the result as overrides is exact.
+  const title = page.title ?? '';
+  // The markdown FILE is what `brain validate` reads and what a retrieval
+  // wrapper resolves a hit's lifecycle from, so a proposal's `type` is pinned
+  // here rather than trusted from the model. `note` keeps a candidate task out
+  // of any `type: task` enumeration — it is a note ABOUT a possible task, and
+  // nothing should be able to mistake the two.
+  const withH1 = {
+    ...page,
+    ...(isProposalSlug(ctx.slug) ? { type: 'note' as PageType } : {}),
+    compiled_truth: ensureBodyH1(page.compiled_truth ?? '', title),
+  };
+  return serializePageToMarkdown(withH1, tags, {
+    frontmatterOverrides: applyGeneratedStamp(
+      (page.frontmatter ?? {}) as Record<string, unknown>,
+      ctx,
+    ),
   });
 }
 
@@ -2955,19 +3368,28 @@ async function writeSummaryPage(
   }
 
   const body = lines.join('\n');
-  // Stamp the dream-output identity marker into the summary's frontmatter.
+  // Stamp the full generated-record contract into the summary's frontmatter.
   // parseMarkdown below round-trips it into the DB-stored frontmatter, so the
-  // marker survives any later reverse-render of the summary page.
-  const fullMarkdown = serializeMarkdown(
-    {
-      dream_generated: true,
-      dream_cycle_date: summaryDate,
-      // #1978: deterministic index page — no source document of its own;
-      // raw traces live on the listed pages. Explicit exemption keeps the
-      // doctor raw_provenance check quiet.
+  // stamp survives any later reverse-render of the summary page. The summary is
+  // generated output like any other page and must be demoted like one — it is an
+  // index of replaceable pages, never an authority.
+  const { defaults, forced } = generatedRecordStamp({
+    sourceId,
+    cycleDate: summaryDate,
+    // #1978: deterministic index page — no source document of its own; raw
+    // traces live on the listed pages. Explicit exemption keeps the doctor
+    // raw_provenance check quiet.
+    derivedFrom: `gbrain:dream-cycle/${summaryDate}`,
+    sourceRefs: writtenSlugs.length > 0
+      ? writtenSlugs.map(slug => `${sourceId}:${slug}`)
+      : [`gbrain:dream-cycle/${summaryDate}`],
+    extraForced: {
       raw_trace_exempt: true,
       raw_trace_exempt_reason: 'deterministic dream-cycle index; raw traces live on listed pages',
-    } as Record<string, unknown>,
+    },
+  });
+  const fullMarkdown = serializeMarkdown(
+    { ...defaults, ...forced } as Record<string, unknown>,
     body,
     '',
     { type: 'note' as string, title: `Dream cycle ${summaryDate}`, tags: ['dream-cycle'] },

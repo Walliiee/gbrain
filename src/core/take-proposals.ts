@@ -144,8 +144,16 @@ async function loadProposal(
 
 export interface ProposalActionTarget {
   engine: BrainEngine;
-  /** Brain repo root — accept writes the markdown fence (markdown-canonical). */
-  brainDir?: string;
+  /**
+   * HOST brain repo root — accept writes the markdown fence
+   * (markdown-canonical). Optional/null is survivable, NOT a refusal: #4473
+   * makes `addTakeToPage` fall back to the proposal's OWN source `local_path`
+   * and raise 'mirror_unavailable' only when neither resolves. Guarding it
+   * here instead made `takes propose --accept` dead on every multi-source
+   * brain (where the legacy `sync.repo_path` key is unset) even when the
+   * proposal's source had a working tree standing right there.
+   */
+  brainDir?: string | null;
   /** Source scope: a proposal outside this source reads as not_found. */
   sourceId?: string;
   /** Recorded in acted_by. Defaults to 'cli'. */
@@ -162,7 +170,11 @@ export interface ProposalActionTarget {
  * the pending check and both append the take to the .md — the loser's no-op
  * UPDATE reported success anyway. If the fence write fails after a
  * successful claim, the claim is rolled back (best-effort compensation) so
- * a retry can act on the row.
+ * a retry can act on the row. #4473: that compensation is also what covers
+ * the no-markdown-home refusal, which now fires INSIDE the fence write
+ * (addTakeToPage → resolveTakesFilePath) rather than in a pre-CAS guard —
+ * the row goes back to 'pending', so a genuinely repo-less brain still
+ * reports the failure and still leaves the proposal actionable.
  */
 export async function acceptProposal(
   target: ProposalActionTarget,
@@ -170,12 +182,6 @@ export async function acceptProposal(
 ): Promise<{ proposal: TakeProposalRow; rowNum: number }> {
   const { engine } = target;
   const proposal = await loadProposal(engine, id, target.sourceId);
-  if (!target.brainDir) {
-    throw new TakeProposalError(
-      'not_found',
-      'Accept requires a brain directory (takes are markdown-canonical). Pass --dir or configure sync.repo_path.',
-    );
-  }
   // Claim-first CAS: exactly one caller wins the pending row.
   const claimed = await engine.executeRaw<{ id: number }>(
     `UPDATE take_proposals
@@ -196,7 +202,10 @@ export async function acceptProposal(
       {
         engine,
         slug: proposal.page_slug,
-        brainDir: target.brainDir,
+        // #4473: a null host repo is carried through, not refused — the write
+        // lands in the proposal source's own local_path when it has one, and
+        // the catch below releases the claim when it genuinely cannot.
+        brainDir: target.brainDir ?? null,
         // The row's OWN source, never the caller's — the scoped load above
         // already proved they agree when a caller scope was provided.
         sourceId: proposal.source_id,

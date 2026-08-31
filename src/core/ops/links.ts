@@ -10,9 +10,11 @@
 import type { Operation } from './contract.ts';
 import {
   enforceClientSlugFence,
+  graphTraversalScopeOpts,
   linkReadScopeOpts,
   reclassifyMutationTimePageMiss,
   requireWritablePage,
+  resolveLinkEndpointSource,
   sourceScopeOpts,
 } from './context.ts';
 import { PageMissingError } from '../engine-errors.ts';
@@ -73,6 +75,8 @@ const add_link: Operation = {
     link_type: { type: 'string', description: 'Link type (e.g., invested_in, works_at)' },
     context: { type: 'string', description: 'Context for the link' },
     link_source: { type: 'string', description: "Provenance tag (kebab-case, e.g. 'citation-graph'). Defaults to 'manual'. Reconciliation-managed built-ins (markdown/frontmatter/mentions/wikilink-resolved) are rejected." },
+    from_source_id: { type: 'string', description: "Source the `from` page lives in. Defaults to your own source scope. Set this and/or to_source_id to write a CROSS-SOURCE edge, e.g. a person page in 'adaptig' pointing at a decision in 'shared'." },
+    to_source_id: { type: 'string', description: 'Source the `to` page lives in. Defaults to your own source scope. See from_source_id.' },
   },
   mutating: true,
   scope: 'write',
@@ -92,15 +96,22 @@ const add_link: Operation = {
         `use 'manual' (the default) or a custom kebab tag like 'citation-graph'`,
       );
     }
-    // v0.31.8 (D7): single ctx.sourceId scopes both endpoints + origin. Cross-
-    // source link creation is out of scope for this wave; use the engine API
-    // directly for that edge case.
-    const linkOpts = ctx.sourceId
-      ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId, originSourceId: ctx.sourceId }
+    // XSRC (fork patch, 2026-08-22): endpoints resolve INDEPENDENTLY so a
+    // cross-source edge is writable through the normal surface (both engines
+    // have source-qualified the two endpoints separately since v0.18; only this
+    // op layer collapsed them onto ctx.sourceId). Omitting both params
+    // reproduces the pre-fix behavior exactly. `originSourceId` follows the FROM
+    // endpoint: the origin page is the page whose content produced the edge, and
+    // for a hand-created edge that is the from page's source.
+    const fromSourceId = resolveLinkEndpointSource(ctx, p.from_source_id, 'from_source_id', 'add_link');
+    const toSourceId = resolveLinkEndpointSource(ctx, p.to_source_id, 'to_source_id', 'add_link');
+    const linkOpts = fromSourceId || toSourceId
+      ? { fromSourceId, toSourceId, originSourceId: fromSourceId }
       : undefined;
-    // #4109: per-endpoint source-boundary diagnostics before the mutation.
-    await requireWritablePage(ctx, p.from as string, 'add_link', 'from');
-    await requireWritablePage(ctx, p.to as string, 'add_link', 'to');
+    // #4109: per-endpoint source-boundary diagnostics before the mutation —
+    // each endpoint against the source IT resolved to, not the ambient one.
+    await requireWritablePage(ctx, p.from as string, 'add_link', 'from', fromSourceId);
+    await requireWritablePage(ctx, p.to as string, 'add_link', 'to', toSourceId);
     try {
       await ctx.engine.addLink( // gbrain-allow-direct-insert: add_link MCP op is the explicit canonical surface for manual link creation; auto-link reconciliation runs separately via auto_link post-hook
         p.from as string, p.to as string,
@@ -110,9 +121,11 @@ const add_link: Operation = {
       );
     } catch (error) {
       // An endpoint hard-deleted between preflight and mutation: reclassify
-      // the typed engine miss instead of surfacing it as internal_error.
+      // the typed engine miss instead of surfacing it as internal_error. The
+      // engine reports WHICH source it resolved that endpoint in, which is the
+      // endpoint's own resolved source once the two can differ.
       if (error instanceof PageMissingError) {
-        return reclassifyMutationTimePageMiss(ctx, error.slug, 'add_link', error.endpoint);
+        return reclassifyMutationTimePageMiss(ctx, error.slug, 'add_link', error.endpoint, error.sourceId);
       }
       throw error;
     }
@@ -129,14 +142,22 @@ const remove_link: Operation = {
     to: { type: 'string', required: true, description: 'Slug of the page the link points to.' },
     link_type: { type: 'string', description: 'Only remove edges of this link type (omit = all types)' },
     link_source: { type: 'string', description: 'Only remove edges of this provenance (e.g. citation-graph); omit = any provenance' },
+    from_source_id: { type: 'string', description: 'Source the `from` page lives in. Defaults to your own source scope. Needed to remove a cross-source edge written with add_link.' },
+    to_source_id: { type: 'string', description: 'Source the `to` page lives in. Defaults to your own source scope.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
     enforceClientSlugFence(ctx, p.from as string, 'remove_link');
     if (ctx.dryRun) return { dry_run: true, action: 'remove_link', from: p.from, to: p.to };
-    const linkOpts = ctx.sourceId
-      ? { fromSourceId: ctx.sourceId, toSourceId: ctx.sourceId }
+    // XSRC (fork patch, 2026-08-22): mirror add_link's independent endpoint
+    // resolution — an edge the op layer can create must be one the op layer can
+    // delete. No preflight here: a zero-match delete is already reported
+    // honestly by the `removed` count below (#4527).
+    const fromSourceId = resolveLinkEndpointSource(ctx, p.from_source_id, 'from_source_id', 'remove_link');
+    const toSourceId = resolveLinkEndpointSource(ctx, p.to_source_id, 'to_source_id', 'remove_link');
+    const linkOpts = fromSourceId || toSourceId
+      ? { fromSourceId, toSourceId }
       : undefined;
     // #4527: report how many edges actually died — an unconditional
     // `{ status: 'ok' }` made a zero-match delete (typo'd slug, wrong
@@ -250,7 +271,15 @@ const traverse_graph: Operation = {
     // walks stay within the auth'd client's accessible sources. Pre-fix,
     // traverseGraph / traversePaths happily followed edges into pages from
     // foreign sources, leaking topology + page metadata via the graph op.
-    const scope = sourceScopeOpts(ctx);
+    // XSRC (fork patch, 2026-08-22): graphTraversalScopeOpts, not
+    // sourceScopeOpts. The #861 seal stays intact — a grant still governs and an
+    // explicit --source binding still stays scalar; only an UNQUALIFIED scope
+    // widens, to the same federated floor `search` and `get_page` already use.
+    // Without it a cross-source edge is dropped at the seed/step/SELECT joins
+    // and is invisible through the graph API even to the machine owner. The
+    // #4352 private-visibility probes below deliberately share this scope, so
+    // the private gate is evaluated over exactly the walked set.
+    const scope = graphTraversalScopeOpts(ctx);
     // #4352 remediation: graph output must not enumerate private slugs to an
     // untrusted caller. A private START page reads exactly like a missing one
     // ([]); private nodes/edges elsewhere in the walk are stripped post-hoc

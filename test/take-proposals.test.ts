@@ -20,7 +20,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -33,6 +33,7 @@ import {
 } from '../src/core/take-proposals.ts';
 import { runTakes } from '../src/commands/takes.ts';
 import { parseTakesFence } from '../src/core/takes-fence.ts';
+import { TakesWriteError } from '../src/core/takes-write.ts';
 
 let engine: PGLiteEngine;
 let repo: string;
@@ -236,6 +237,59 @@ describe('acceptProposal', () => {
       expect((err as TakeProposalError).code).toBe('not_found');
     }
   });
+
+  test('#4473 no brainDir but the proposal source HAS a local_path → promotes into THAT tree', async () => {
+    // The multi-source reality: `sync.repo_path` is the legacy pre-v0.18
+    // single-source key and is unset, so the CLI/caller hands down a null
+    // host dir. acceptProposal used to refuse that outright BEFORE the CAS,
+    // which made `takes propose --accept` dead on every such brain even
+    // though the proposal's own source had a working tree.
+    const sourceRoot = mkdtempSync(join(tmpdir(), 'gbrain-take-proposals-src-'));
+    await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [sourceRoot]);
+    try {
+      const id = await insertProposal({
+        slug: 'companies/acme-example', claim: 'per-source: promoted with no host repo',
+      });
+      const { rowNum } = await acceptProposal(
+        { engine, brainDir: null, sourceId: 'default', actedBy: 'people/tester' },
+        id,
+      );
+      expect(rowNum).toBeGreaterThan(0);
+      // Landed in the SOURCE's tree, not the host repo.
+      const onDisk = join(sourceRoot, 'companies/acme-example.md');
+      expect(existsSync(onDisk)).toBe(true);
+      expect(parseTakesFence(readFileSync(onDisk, 'utf-8')).takes.some(
+        (t) => t.claim === 'per-source: promoted with no host repo',
+      )).toBe(true);
+      const row = await proposalRow(id);
+      expect(row.status).toBe('accepted');
+      expect(row.promoted_row_num).toBe(rowNum);
+    } finally {
+      await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+      rmSync(sourceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('#4473 no brainDir AND no source local_path → mirror_unavailable, and the CAS claim is ROLLED BACK', async () => {
+    // The other arm. The refusal now fires INSIDE the fence write, i.e. AFTER
+    // the claim-first CAS — so the compensation path (#4480) is what keeps the
+    // row actionable. Without it the proposal would strand as 'accepted' with
+    // no promoted take on a genuinely repo-less brain.
+    const id = await insertProposal({
+      slug: 'companies/widget-co', claim: 'no home: must stay pending',
+    });
+    try {
+      await acceptProposal({ engine, brainDir: null, sourceId: 'default' }, id);
+      throw new Error('expected acceptProposal to refuse with mirror_unavailable');
+    } catch (err) {
+      expect(err).toBeInstanceOf(TakesWriteError);
+      expect((err as TakesWriteError).code).toBe('mirror_unavailable');
+    }
+    const row = await proposalRow(id);
+    expect(row.status).toBe('pending');
+    expect(row.promoted_row_num).toBeNull();
+    expect(row.acted_at).toBeNull();
+  });
 });
 
 describe('rejectProposal', () => {
@@ -400,6 +454,33 @@ describe('CLI dispatcher (#2411 no-fallthrough)', () => {
     const out = await captureStdout(() => runTakes(engine, ['propose', '--accept', String(id)]));
     expect(out).toContain(`Accepted proposal #${id}`);
     expect((await proposalRow(id)).status).toBe('accepted');
+  });
+
+  test('#4473 `takes propose --accept` works with sync.repo_path UNSET when the source has a local_path', async () => {
+    // Mike's exact configuration. The CLI used to call a `requireBrainDir`
+    // helper here that printed "No brain directory configured. Pass --dir
+    // <path> or run `gbrain init` first." and exited 1 — reintroducing the
+    // refusal on precisely the brains the per-source fallback exists for.
+    const sourceRoot = mkdtempSync(join(tmpdir(), 'gbrain-take-proposals-cli-src-'));
+    await engine.unsetConfig('sync.repo_path');
+    await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [sourceRoot]);
+    try {
+      const id = await insertProposal({
+        slug: 'companies/widget-co', claim: 'cli: accept with no sync.repo_path',
+      });
+      const out = await captureStdout(() => runTakes(engine, ['propose', '--accept', String(id)]));
+      expect(out).toContain(`Accepted proposal #${id}`);
+      expect((await proposalRow(id)).status).toBe('accepted');
+      const onDisk = join(sourceRoot, 'companies/widget-co.md');
+      expect(existsSync(onDisk)).toBe(true);
+      expect(parseTakesFence(readFileSync(onDisk, 'utf-8')).takes.some(
+        (t) => t.claim === 'cli: accept with no sync.repo_path',
+      )).toBe(true);
+    } finally {
+      await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+      await engine.setConfig('sync.repo_path', repo);
+      rmSync(sourceRoot, { recursive: true, force: true });
+    }
   });
 
   test('`takes propose --reject <id>` rejects', async () => {

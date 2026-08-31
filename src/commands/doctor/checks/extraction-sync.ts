@@ -848,14 +848,32 @@ export async function checkSyncFreshness(
     // doctorReportRemote never shells out to git on a DB-supplied local_path.
     // #3880: archived sources don't participate in freshness health (v34
     // legacy fallback).
+    //
+    // LOCAL PATCH (not upstream at v0.47.8.0): `FEDERATED_ONLY` matches
+    // core/sources-ops.ts isFederated(), which is a strict `=== true` — a
+    // source is federated only when it says so explicitly. Without this
+    // filter the check reported retired, deliberately-unfederated sources as
+    // "brain search is stale!", which is false: an isolated source is
+    // unreachable from cross-source search, so its sync age cannot make
+    // search stale. That produced a permanent hard FAIL which in turn masked
+    // genuine staleness on live sources. Note the empty-set branch below
+    // already claimed "No federated sources to sync" — the intent was always
+    // federated-only; the WHERE clause simply never implemented it.
+    //
+    // Spelled `config->'federated' = 'true'::jsonb` (not a `::boolean` cast
+    // of `->>`): it is the exact jsonb-side twin of `=== true`, and it cannot
+    // raise an invalid-input-syntax error on a source whose config carries a
+    // non-boolean `federated` value — which would turn the whole check into
+    // "Could not check sync freshness" instead of filtering one bad row.
+    const FEDERATED_ONLY = `AND config->'federated' = 'true'::jsonb`;
     let sources: FreshnessSourceRow[];
     try {
       sources = await engine.executeRaw<FreshnessSourceRow>(
-        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
+        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE ${FEDERATED_ONLY}`,
       );
     } catch {
       sources = await engine.executeRaw<FreshnessSourceRow>(
-        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL`,
+        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL ${FEDERATED_ONLY}`,
       );
     }
 

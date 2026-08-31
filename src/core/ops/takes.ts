@@ -280,9 +280,9 @@ const think: Operation = {
 // refine, resolve, or supersede a take. Backed by the same md-canonical
 // write-through core as the CLI (src/core/takes-write.ts): fence-derived row
 // numbers, markdown written first, the DB mirrored with the reconcile
-// primitive — and the markdown write is REQUIRED (no sync.repo_path on the
-// host → 'unavailable' with detail takes_mirror_unavailable), because a
-// DB-only row would be clobbered by the next md→DB reconcile.
+// primitive — and the markdown write is REQUIRED (no markdown home for the
+// page's source → 'unavailable' with detail takes_mirror_unavailable),
+// because a DB-only row would be clobbered by the next md→DB reconcile.
 //
 // Trust model (ungated by design — the put_page precedent: writes are
 // consented via scope + the holder fence; publish gates cover owner-content
@@ -314,18 +314,23 @@ function takesWriteAllowList(ctx: OperationContext): readonly string[] | null {
   return ctx.remote !== false ? (ctx.takesHoldersAllowList ?? ['world']) : null;
 }
 
-async function opBrainDir(ctx: OperationContext): Promise<string> {
-  const dir = await resolveTakesRepoDir(ctx.engine);
-  if (!dir) {
-    const err = new OperationError(
-      'unavailable',
-      'Takes are markdown-canonical and this brain has no writable markdown repo configured.',
-      'Configure sync.repo_path on the brain host, then retry.',
-    );
-    err.detail = 'takes_mirror_unavailable';
-    throw err;
-  }
-  return dir;
+/**
+ * HOST repo dir for a takes WRITE, or null when the host has none.
+ *
+ * Deliberately does NOT refuse on null. `resolveTakesRepoDir` reads only the
+ * legacy pre-v0.18 `sync.repo_path` key, which a multi-source brain never sets
+ * (sync.ts, write-through.ts, the conversation parser and the archive crawler
+ * all read it, so setting it to unblock takes would repoint four unrelated
+ * subsystems at one tree) — refusing here made ALL FOUR takes_* write verbs
+ * dead with takes_mirror_unavailable on every such brain, while the CLI
+ * escaped through `--dir`. The mutates carry the null down to
+ * resolveTakesFilePath, which lands the write in the page's OWN source
+ * `local_path` (#4473) and raises the identical 'mirror_unavailable' refusal —
+ * mapped back to this envelope by mapTakesWriteError — only when the source
+ * has no working tree either.
+ */
+async function opBrainDir(ctx: OperationContext): Promise<string | null> {
+  return resolveTakesRepoDir(ctx.engine);
 }
 
 function mapTakesWriteError(err: unknown): never {
@@ -345,7 +350,8 @@ function mapTakesWriteError(err: unknown): never {
       }
       case 'mirror_unavailable': {
         const e = new OperationError('unavailable', err.message,
-          'Configure sync.repo_path on the brain host, then retry.');
+          "Give the page's source a working tree (`gbrain sources add <id> --path <dir>`), " +
+          'or configure sync.repo_path on the brain host, then retry.');
         e.detail = 'takes_mirror_unavailable';
         throw e;
       }
