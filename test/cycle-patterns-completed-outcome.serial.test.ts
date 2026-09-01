@@ -13,6 +13,15 @@ mock.module('../src/core/cycle/synthesize.ts', () => ({
   loadAllowedSlugPrefixes: async () => ['wiki/personal/patterns/*'],
   loadOutputRoot: async () => 'wiki',
   runSubagentsInline: async () => undefined,
+  // Same whole-module rule as the wait-for-completion mock below: patterns.ts
+  // imports five names from synthesize.ts, so all five must be here or the file
+  // dies at load with a SyntaxError. The v0.47.8.0 port added these two
+  // (patterns.ts:642,651) and this mock was not updated, which took the serial
+  // patterns coverage out silently while the narrow gates stayed green.
+  applyGeneratedStamp: (
+    existing: Record<string, unknown> | null | undefined,
+  ): Record<string, unknown> => existing ?? {},
+  ensureBodyH1: (body: string) => body,
 }));
 
 mock.module('../src/core/minions/wait-for-completion.ts', () => ({
