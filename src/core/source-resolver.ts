@@ -112,6 +112,42 @@ function readDotfileWalk(startDir: string): string | null {
  * resolution-chain entry points can't drift on this tier (mirrors how
  * `pickSoleNonDefaultSource` is already shared for tier 5.5).
  */
+/**
+ * Local patch (2026-09-02, Mike's brain): "bounded by the SLOWEST single
+ * source" is still unbounded when one source never returns. On 2026-09-02
+ * an `open()` under one registered local_path (~/Documents/Codex) blocked
+ * in the kernel for ~3.4 h — no error, no ENOENT, so the `catch` fallback
+ * in `realpathOrResolveAsync` could never fire — and every federated
+ * `query`/`search`, `config list` and `doctor` hung behind this tier while
+ * `--source <id>` (tier 1) kept working. Each realpath now races a
+ * deadline; on expiry it falls back to the same lexical `resolve()` the
+ * catch path uses, so one wedged path degrades ONE prefix match instead of
+ * stalling the whole brain. The realpath promise is left to settle on its
+ * own (never awaited again) so a wedged call cannot pin the process.
+ */
+let registeredPathRealpathDeadlineMs = 2000;
+/** Test hook: shorten the deadline so a never-settling realpath is cheap to prove. */
+export function setRegisteredPathRealpathDeadlineForTests(ms: number): void {
+  registeredPathRealpathDeadlineMs = ms;
+}
+function realpathOrResolveBounded(p: string): Promise<string> {
+  return new Promise<string>((settle) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+      settle(resolve(p));
+    }, registeredPathRealpathDeadlineMs);
+    (timer as { unref?: () => void }).unref?.();
+    realpathOrResolveAsync(p).then(
+      (value) => { if (!done) { done = true; clearTimeout(timer); settle(value); } },
+      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+      () => { if (!done) { done = true; clearTimeout(timer); settle(resolve(p)); } },
+    );
+  });
+}
+
 async function resolveRegisteredPathMatch(
   engine: BrainEngine,
   cwd: string,
@@ -119,8 +155,8 @@ async function resolveRegisteredPathMatch(
   const registered = await listRegisteredLocalPathSources(engine);
   if (registered.length === 0) return null;
   const [cwdResolved, resolvedPaths] = await Promise.all([
-    realpathOrResolveAsync(cwd),
-    Promise.all(registered.map(r => realpathOrResolveAsync(r.local_path))),
+    realpathOrResolveBounded(cwd),
+    Promise.all(registered.map(r => realpathOrResolveBounded(r.local_path))),
   ]);
   // #3880: ACTIVE sources win the prefix match — an archived (deeper)
   // registration must not shadow an active parent source. When cwd lands

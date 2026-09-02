@@ -100,6 +100,38 @@ describe('resolveSourceWithTier — tier 4 realpath resolution is parallel, not 
     }
   });
 
+  test('a registered path whose realpath NEVER settles cannot stall the tier (local patch, 2026-09-02)', async () => {
+    // Mike's brain, 2026-09-02: an open() under one registered local_path
+    // blocked in the kernel for ~3.4 h, and every federated query hung
+    // behind tier 4. The bounded realpath must fall back to the lexical
+    // path for THAT source and let the others resolve normally.
+    const { setRegisteredPathRealpathDeadlineForTests } = await import('../src/core/source-resolver.ts');
+    const paths = [
+      { id: 'wedged', local_path: '/stuck/codex' },
+      { id: 'healthy', local_path: '/work/gstack' },
+    ];
+    const engine = makeStub(paths);
+    const spy = spyOn(pathConfine, 'realpathOrResolveAsync').mockImplementation((p: string) => {
+      if (p.startsWith('/stuck/')) return new Promise<string>(() => { /* never settles */ });
+      return Promise.resolve(p);
+    });
+    setRegisteredPathRealpathDeadlineForTests(50);
+    try {
+      const started = Date.now();
+      const result = await resolveSourceWithTier(engine, null, '/work/gstack/src');
+      expect(result.source_id).toBe('healthy');
+      expect(result.tier).toBe('local_path');
+      expect(Date.now() - started).toBeLessThan(1500);
+      // The wedged path still participates via its lexical fallback: a cwd
+      // inside it matches by prefix once the deadline fires.
+      const wedged = await resolveSourceWithTier(engine, null, '/stuck/codex/2026-07-30');
+      expect(wedged.source_id).toBe('wedged');
+    } finally {
+      setRegisteredPathRealpathDeadlineForTests(2000);
+      spy.mockRestore();
+    }
+  });
+
   test('control: same scenario without the spy still resolves correctly (regression guard)', async () => {
     const paths = [
       { id: 'gstack', local_path: '/work/gstack' },
