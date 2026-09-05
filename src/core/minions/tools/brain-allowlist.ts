@@ -305,6 +305,21 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
           deferEmbeds: opts.deferEmbeds,
         });
         const params = (input && typeof input === 'object') ? input as Record<string, unknown> : {};
+        // 2026-09-05 (local patch): name a missing required parameter instead
+        // of letting the handler crash on it. Dream patterns job 797 called
+        // brain_search eight times with input {} and got back
+        // "undefined is not an object (evaluating 'query.trim')" each time,
+        // an error the model cannot act on. The schema already says what is
+        // required; say it back.
+        const required = Array.isArray((schema as { required?: unknown }).required)
+          ? (schema as { required: unknown[] }).required.filter((k): k is string => typeof k === 'string')
+          : [];
+        const missing = required.filter(k => params[k] === undefined || params[k] === null);
+        if (missing.length > 0) {
+          throw new Error(
+            `${toolName}: missing required parameter(s) ${missing.join(', ')} -- call again with them set`,
+          );
+        }
         return op.handler(opCtx, params);
       },
     };
