@@ -248,11 +248,15 @@ cd ~/adaptig-AI-brain
 gbrain link 10-company/people/person-casper-guldager \
             decisions/2026-08-18-ship-the-dashboard \
             --to-source-id shared \
-            --link_type wants --link_source citation-graph
+            --link-type mentions --link-source citation-graph
 
 # Same flags on the way back out
-gbrain unlink <from> <to> --to-source-id shared --link_source citation-graph
+gbrain unlink <from> <to> --to-source-id shared --link-source citation-graph
 ```
+
+The verb must be one the active schema pack declares — since 0.48.1.0
+(#4655) an undeclared `--link-type` is rejected with the pack's vocabulary
+in the error, so check `gbrain schema explain` before inventing one.
 
 `--from-source-id` exists for the mirror case. Over MCP the same two
 params are `from_source_id` / `to_source_id`. A remote caller may only
