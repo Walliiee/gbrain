@@ -3457,11 +3457,12 @@ async function writeSummaryPage(
   //
   // #4337: the summary is per-date, so `dream_cycle_date` and its immutable
   // mirror `dream_created_cycle_date` are both simply the summary's own date
-  // (generatedRecordStamp emits both from `cycleDate`). `source_refs` carries
-  // the same deterministic sorted sample as the body's link list — the complete
+  // (generatedRecordStamp emits both from `cycleDate`). `source_refs` names the
+  // children only while the body's list is complete (<= SUMMARY_LINK_SAMPLE_LIMIT,
+  // sorted for determinism); above the cap it is the cycle ref alone — the full
   // child set is recoverable through the provenance query the body names, and
-  // an all-slug list would re-create the oversized-file problem the wikilink
-  // cap exists to close.
+  // even a 20-slug sample of max-length slugs breaks the 8 KB file bound the
+  // wikilink cap exists to hold.
   const { defaults, forced } = generatedRecordStamp({
     sourceId,
     cycleDate: summaryDate,
@@ -3469,8 +3470,8 @@ async function writeSummaryPage(
     // traces live on the listed pages. Explicit exemption keeps the doctor
     // raw_provenance check quiet.
     derivedFrom: `gbrain:dream-cycle/${summaryDate}`,
-    sourceRefs: writtenSlugs.length > 0
-      ? [...writtenSlugs].sort().slice(0, SUMMARY_LINK_SAMPLE_LIMIT).map(slug => `${sourceId}:${slug}`)
+    sourceRefs: writtenSlugs.length > 0 && writtenSlugs.length <= SUMMARY_LINK_SAMPLE_LIMIT
+      ? [...writtenSlugs].sort().map(slug => `${sourceId}:${slug}`)
       : [`gbrain:dream-cycle/${summaryDate}`],
     extraForced: {
       raw_trace_exempt: true,
