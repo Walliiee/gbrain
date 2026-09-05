@@ -179,7 +179,7 @@ Two details that are easy to miss:
   `gbrain sync --include-gitignored` — it forces a full filesystem walk so
   periodic syncs see ignored/untracked syncable content the git-object walk
   skips (`gbrain import <dir> --include-gitignored` is the one-shot import
-  equivalent). Doctor's `multi_source_drift` advice names this case (#4490):
+  equivalent). Doctor's `multi_source_drift` advice names this case:
   a slug stuck at `default` whose file is untracked won't be recreated by a
   plain re-sync, so reach for the flag (or commit the file) before any
   delete step.
@@ -224,6 +224,17 @@ cd ~/.gstack && gbrain put plans/multi-repo ...
 Reads span federated sources by default. Writes require a resolved
 source (explicit, inferred, or default). The resolver never picks a
 source silently when ambiguous — it errors with a clear fix.
+
+Unscoped writes are also guarded against landing in the wrong place. On a
+brain with at least one other source and more pages outside `default` than
+in it, an unscoped
+`gbrain sync` refuses (pass `--source <id>` to redirect it), `gbrain import`
+warns, and MCP stdio prints a once-per-process advisory when a write actually
+resolves to the default tier. `gbrain sync --dry-run` previews the run and
+prints the same routing guidance instead of refusing;
+`GBRAIN_ALLOW_DEFAULT_WRITE=1` is the escape hatch when `default` really is
+the intended target. **Say to your agent:** *"Show me what a sync would do
+without writing anything"* — your agent runs `gbrain sync --dry-run`.
 
 ## Cross-source links
 

@@ -71,6 +71,7 @@ import {
   DREAM_PROPOSAL_PREFIX,
   type ManifestContext,
 } from './link-manifest.ts';
+import { resolveCycleDate, utcDate } from './cycle-date.ts';
 import { throwIfAborted } from '../abort-check.ts';
 
 // Re-exports: the drain was peeled to inline-drain.ts (dream-wave C7), the
@@ -344,6 +345,8 @@ export interface SynthesizePhaseOpts {
   date?: string;
   from?: string;
   to?: string;
+  /** #4348: clock seam for deterministic cycle-date bucketing (tests). */
+  now?: () => Date;
   /** #4168 sibling: absolute wall-clock deadline (epoch ms) of the enclosing
    *  minion job. When set, child-subagent timeout_ms/wait are clamped via the
    *  clampSubagentBudgets template so a child submitted late in the cycle
@@ -415,6 +418,12 @@ async function runPhaseSynthesizeInner(
   try {
     throwIfAborted(opts.signal, '[dream] synthesize');
     const config = await loadSynthConfig(engine);
+    // #4348: the calendar day that owns this run — explicit --date >
+    // cycle.timezone config > host IANA timezone > UTC. Sampled ONCE at
+    // phase start so a run that crosses midnight stays in one bucket.
+    // Pre-fix this was UTC toISOString().slice(0,10), so a run after local
+    // midnight but before UTC midnight rewrote the previous day's summary.
+    const summaryDate = await resolveCycleDate(engine, { explicitDate: opts.date, now: opts.now });
 
     // #4168 sibling: clamp the child-subagent budgets to the REAL remaining
     // job time (patterns.ts clampSubagentBudgets template). Pre-fix,
@@ -1103,8 +1112,6 @@ async function runPhaseSynthesizeInner(
         process.stderr.write(`[dream] quote verify pass failed open: ${e instanceof Error ? e.message : String(e)}\n`);
       }
     }
-
-    const summaryDate = opts.date ?? today();
 
     // #2569: persist the dream-output identity marker into the DB frontmatter
     // of every child-written page BEFORE reverse-rendering, so generated pages
@@ -1838,12 +1845,15 @@ export function makeJudgeClient(verdictModel: string): JudgeClient | null {
         messages,
         maxTokens: params.max_tokens,
         // DeepSeek v4 thinks by default and bills reasoning as OUTPUT tokens
-        // against max_tokens (recipe thinking_by_default, #4172). The judge
-        // wants only the small JSON verdict, so pin thinking off per-call —
-        // the openai-compatible adapter spreads providerOptions[recipe.id]
-        // into the wire body, where `thinking` is DeepSeek's documented knob.
+        // against max_tokens (recipe thinking_by_default, #4172) — same for
+        // OpenRouter's DeepSeek hosts (#4758). The judge wants only the small
+        // JSON verdict, so pin thinking off per-call — the openai-compatible
+        // adapter spreads providerOptions[recipe.id] into the wire body,
+        // where `thinking` is DeepSeek's documented knob.
         ...(v.parsed.providerId === 'deepseek'
-          ? { providerOptions: { deepseek: { thinking: { type: 'disabled' } } } }
+          || (v.parsed.providerId === 'openrouter'
+            && v.parsed.modelId.trim().toLowerCase().startsWith('deepseek/'))
+          ? { providerOptions: { [v.parsed.providerId]: { thinking: { type: 'disabled' } } } }
           : {}),
         // #4077: a cancelled cycle tears down the in-flight judge call too.
         abortSignal: options?.signal,
@@ -2677,7 +2687,9 @@ function buildSynthesisPrompt(
   reflectionsPrefix = `${outputRoot}/personal/reflections`,
   originalsPrefix = `${outputRoot}/originals/ideas`,
 ): string {
-  const dateHint = t.inferredDate ?? today();
+  // #4348: UTC projection retained here on purpose — this is a slug-name
+  // hint for undated sources, not calendar provenance.
+  const dateHint = t.inferredDate ?? utcDate();
   const baseSlugSegment = sanitizeForSlug(t.basename) || `session-${dateHint}`;
   const isChunked = chunkTotal > 1;
   const hashSuffix = isChunked
@@ -3003,7 +3015,10 @@ export interface GeneratedRecordContext {
   slug?: string;
   /** gbrain source the page belongs to. Maps to the record `scope`. */
   sourceId?: string;
-  /** Cycle date, `YYYY-MM-DD`. Defaults to today. */
+  /**
+   * Cycle date, `YYYY-MM-DD`. Defaults to the UTC date. In `applyGeneratedStamp`
+   * a row's own stamped date wins over it (#4337).
+   */
   cycleDate?: string;
   /** Absolute path of the transcript this page was synthesized from. */
   rawSourcePath?: string;
@@ -3063,7 +3078,7 @@ function addDays(isoDate: string, days: number): string {
 export function generatedRecordStamp(
   ctx: GeneratedRecordContext = {},
 ): { defaults: Record<string, unknown>; forced: Record<string, unknown> } {
-  const cycleDate = ctx.cycleDate ?? today();
+  const cycleDate = ctx.cycleDate ?? utcDate();
   const scope = ctx.sourceId && RECORD_SCOPES.has(ctx.sourceId) ? ctx.sourceId : 'shared';
   const rawRef = ctx.rawSourcePath ? rawSourceRef(ctx.rawSourcePath, ctx.rawSourceHash) : undefined;
   const derivedFrom = ctx.derivedFrom ?? rawRef ?? `gbrain:dream-cycle/${cycleDate}`;
@@ -3081,6 +3096,7 @@ export function generatedRecordStamp(
       // that gets re-ingested as a transcript.
       dream_generated: true,
       dream_cycle_date: cycleDate,
+      dream_created_cycle_date: cycleDate,
       scope,
       status: 'active',
       owner: GENERATED_OWNER,
@@ -3101,6 +3117,11 @@ export function generatedRecordStamp(
       updated_at: cycleDate,
       dream_generated: true,
       dream_cycle_date: cycleDate,
+      // #4337: immutable mirror of the first cycle date. Both keys carry
+      // `cycleDate` here; the DB stamp (stampDreamProvenance) and the render
+      // stamp (applyGeneratedStamp) resolve `cycleDate` from the row's own
+      // first date before this run's, so a rerun never moves either key.
+      dream_created_cycle_date: cycleDate,
       // Review queue: FORCED, never defaulted. `status` normally merges under the
       // page's own frontmatter so a subagent's judgment survives — but a proposal
       // that calls itself `active` is a proposal that has quietly promoted itself,
@@ -3164,21 +3185,33 @@ export function ensureBodyH1(body: string, title: string): string {
 /**
  * Apply the stamp to an existing frontmatter object: defaults under, forced over.
  *
- * When the caller does not name a cycle date, the row's OWN `dream_cycle_date`
- * is the authority — `stampDreamProvenance` writes the DB row before any
- * reverse-render, so a `--date 2026-08-22` backfill must not re-render as today.
- * Falling through to `today()` only when the row carries no stamp at all keeps a
- * row that lost its stamp to a put_page write-through renderable.
+ * The row's OWN first cycle date is the authority (#4337): `dream_created_cycle_date`
+ * wins, then the legacy `dream_cycle_date`, and '' reads as unstamped — the
+ * render-side twin of the SQL NULLIF arm in `stampDreamProvenance`, which writes
+ * the DB row before any reverse-render. Only an unstamped row takes the caller's
+ * date, and only a caller with no date of its own falls through to `utcDate()`,
+ * so a `--date 2026-08-22` backfill never re-renders as today and a maintenance
+ * rerun never moves a page off its first cycle. A row that lost its stamp to a
+ * put_page write-through stays renderable.
  */
 export function applyGeneratedStamp(
   existing: Record<string, unknown> | null | undefined,
   ctx: GeneratedRecordContext = {},
 ): Record<string, unknown> {
   const fm = existing ?? {};
-  const cycleDate = ctx.cycleDate
-    ?? (typeof fm.dream_cycle_date === 'string' ? fm.dream_cycle_date : undefined);
+  const cycleDate = firstCycleDate(fm.dream_created_cycle_date, fm.dream_cycle_date)
+    ?? ctx.cycleDate
+    ?? utcDate();
   const { defaults, forced } = generatedRecordStamp({ ...ctx, cycleDate });
   return { ...defaults, ...fm, ...forced };
+}
+
+/** First candidate that is a non-empty date string; '' is unstamped (#4337). */
+function firstCycleDate(...candidates: unknown[]): string | undefined {
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim() !== '') return c;
+  }
+  return undefined;
 }
 
 // ── Dream-provenance DB stamp (#2569) ────────────────────────────────
@@ -3201,10 +3234,18 @@ export function applyGeneratedStamp(
  * survive where the contract allows them, and the orchestrator's guarantees
  * (never canonical, always generated, always provenanced) win outright.
  *
- * Plain UPDATE through executeRawJsonb (raw objects bound to `$N::jsonb` —
- * never JSON.stringify into a ::jsonb cast; engine-parity safe, no new engine
- * method). Best-effort per row: a stamp failure never kills the phase (the
- * render-time stamp still covers the file).
+ * #4337: reruns preserve the FIRST dream cycle date. `dream_cycle_date`
+ * stays the stable back-compat query key and `dream_created_cycle_date`
+ * is its explicit immutable mirror — an existing value of either (created
+ * mirror wins; '' reads as absent) beats this run's cycleDate, so a
+ * re-synthesis pass can't rewrite a page's provenance to the maintenance
+ * run's date. That pin is appended LAST, over `forced`, because `forced`
+ * carries this run's date for a first-time stamp.
+ *
+ * Plain UPDATE through executeRawJsonb (raw objects bound to `$4::jsonb` and
+ * `$5::jsonb` — never JSON.stringify into a ::jsonb cast; engine-parity safe,
+ * no new engine method). Best-effort per row: a stamp failure never kills the
+ * phase (the render-time stamp still covers the file).
  */
 async function stampDreamProvenance(
   engine: BrainEngine,
@@ -3233,9 +3274,17 @@ async function stampDreamProvenance(
       await executeRawJsonb(
         engine,
         `UPDATE pages
-            SET frontmatter = $3::jsonb || COALESCE(frontmatter, '{}'::jsonb) || $4::jsonb
+            SET frontmatter = $4::jsonb
+                              || COALESCE(frontmatter, '{}'::jsonb)
+                              || $5::jsonb
+                              || jsonb_build_object(
+                                   'dream_cycle_date',
+                                   COALESCE(NULLIF(frontmatter->>'dream_created_cycle_date', ''), NULLIF(frontmatter->>'dream_cycle_date', ''), $3),
+                                   'dream_created_cycle_date',
+                                   COALESCE(NULLIF(frontmatter->>'dream_created_cycle_date', ''), NULLIF(frontmatter->>'dream_cycle_date', ''), $3)
+                                 )
           WHERE slug = $1 AND source_id = $2`,
-        [slug, source_id],
+        [slug, source_id, cycleDate],
         [defaults, forced],
       );
     } catch (e) {
@@ -3317,6 +3366,13 @@ export function renderPageToMarkdown(
   // dream-specific frontmatter. Future markdown-shape changes happen in one
   // place. `applyGeneratedStamp` folds the page's own frontmatter in at the
   // right precedence, so passing the result as overrides is exact.
+  //
+  // #4337: preserve the DB-stamped first cycle date (stampDreamProvenance
+  // runs before the reverse-write). `applyGeneratedStamp` reads the row's
+  // `dream_created_cycle_date` / `dream_cycle_date` ahead of any
+  // caller-supplied date and falls back to utcDate() only for a legacy,
+  // never-stamped page — the pre-fix today() default rewrote every
+  // rerendered page's provenance to the maintenance run's date.
   const title = page.title ?? '';
   // The markdown FILE is what `brain validate` reads and what a retrieval
   // wrapper resolves a hit's lifecycle from, so a proposal's `type` is pinned
@@ -3337,6 +3393,14 @@ export function renderPageToMarkdown(
 }
 
 // ── Summary index page ───────────────────────────────────────────────
+
+/**
+ * #4337: cap the summary's wikilink list. An unbounded list turned the
+ * summary into a graph hub (thousands of edges on a large cycle) and an
+ * oversized file, even though every child already carries queryable
+ * provenance (`dream_generated` + `dream_cycle_date` frontmatter).
+ */
+const SUMMARY_LINK_SAMPLE_LIMIT = 20;
 
 async function writeSummaryPage(
   engine: BrainEngine,
@@ -3359,12 +3423,29 @@ async function writeSummaryPage(
   lines.push(`**Pages written:** ${writtenSlugs.length}.`);
   lines.push('');
   if (writtenSlugs.length > 0) {
-    lines.push('## Pages');
-    lines.push('');
-    for (const s of writtenSlugs) {
-      lines.push(`- [[${s}]]`);
+    // #4337: deterministic, lexicographically sorted sample — small cycles
+    // stay fully linked; large cycles list exactly SUMMARY_LINK_SAMPLE_LIMIT
+    // links while keeping exact totals above. The full child set stays
+    // recoverable via per-page provenance frontmatter (pointer below).
+    const sampledSlugs = [...writtenSlugs].sort().slice(0, SUMMARY_LINK_SAMPLE_LIMIT);
+    lines.push(
+      writtenSlugs.length > SUMMARY_LINK_SAMPLE_LIMIT
+        ? `## Page sample (${sampledSlugs.length} of ${writtenSlugs.length})`
+        : '## Pages',
+      '',
+      ...sampledSlugs.map(slug => `- [[${slug}]]`),
+      '',
+    );
+    if (writtenSlugs.length > SUMMARY_LINK_SAMPLE_LIMIT) {
+      lines.push(
+        '## Full output provenance',
+        '',
+        `The complete ${writtenSlugs.length}-page set is recoverable in this source by querying page frontmatter for ` +
+          `\`dream_generated: true\` and \`dream_cycle_date: ${summaryDate}\`, excluding \`${summarySlug}\`. ` +
+          'Every child page carries those provenance fields; this summary intentionally links only the deterministic sample above.',
+        '',
+      );
     }
-    lines.push('');
   }
 
   const body = lines.join('\n');
@@ -3373,6 +3454,14 @@ async function writeSummaryPage(
   // stamp survives any later reverse-render of the summary page. The summary is
   // generated output like any other page and must be demoted like one — it is an
   // index of replaceable pages, never an authority.
+  //
+  // #4337: the summary is per-date, so `dream_cycle_date` and its immutable
+  // mirror `dream_created_cycle_date` are both simply the summary's own date
+  // (generatedRecordStamp emits both from `cycleDate`). `source_refs` carries
+  // the same deterministic sorted sample as the body's link list — the complete
+  // child set is recoverable through the provenance query the body names, and
+  // an all-slug list would re-create the oversized-file problem the wikilink
+  // cap exists to close.
   const { defaults, forced } = generatedRecordStamp({
     sourceId,
     cycleDate: summaryDate,
@@ -3381,7 +3470,7 @@ async function writeSummaryPage(
     // raw_provenance check quiet.
     derivedFrom: `gbrain:dream-cycle/${summaryDate}`,
     sourceRefs: writtenSlugs.length > 0
-      ? writtenSlugs.map(slug => `${sourceId}:${slug}`)
+      ? [...writtenSlugs].sort().slice(0, SUMMARY_LINK_SAMPLE_LIMIT).map(slug => `${sourceId}:${slug}`)
       : [`gbrain:dream-cycle/${summaryDate}`],
     extraForced: {
       raw_trace_exempt: true,
@@ -3458,10 +3547,6 @@ function loadAdHocTranscript(
   const { readSingleTranscript } = require('./transcript-discovery.ts') as typeof import('./transcript-discovery.ts');
   const t = readSingleTranscript(filePath, { minChars, excludePatterns, bypassGuard });
   return t ? [t] : [];
-}
-
-function today(): string {
-  return new Date().toISOString().slice(0, 10);
 }
 
 function ok(summary: string, details: Record<string, unknown> = {}): PhaseResult {

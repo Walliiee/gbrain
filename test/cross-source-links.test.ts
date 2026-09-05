@@ -25,6 +25,12 @@
  * PER-ENDPOINT: each endpoint is checked against the source it resolved to, so
  * a legitimate cross-source edge is not rejected before the engine sees it,
  * while a wrong endpoint source still produces #4109's exact envelope.
+ *
+ * 2026-09-05 (v0.48.2.0 merge): #4655 write-vocabulary enforcement rejects an
+ * EXPLICIT link_type the active pack does not declare, and the PGLite test
+ * engine resolves the built-in `gbrain-base` pack. Every edge below therefore
+ * uses a distinct verb from that pack's declared vocabulary — the verb is only
+ * an edge label here; nothing in these tests depends on its meaning.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -107,8 +113,8 @@ afterAll(async () => { await engine.disconnect(); }, 30_000);
 describe('GAP 1 — cross-source edges are writable through add_link', () => {
   test('pre-fix shape: same-source defaults still work when both params omitted', async () => {
     await engine.putPage('people/other', { type: 'note', title: 'o', compiled_truth: 'o', frontmatter: {} }, { sourceId: 'alpha' });
-    await addLink.handler(ctxOf(), { from: 'people/casper', to: 'people/other', link_type: 'knows' });
-    const rows = await edgesOfType('knows');
+    await addLink.handler(ctxOf(), { from: 'people/casper', to: 'people/other', link_type: 'related_to' });
+    const rows = await edgesOfType('related_to');
     expect(rows.length).toBe(1);
     expect(rows[0].fs).toBe('alpha');
     expect(rows[0].ts).toBe('alpha');
@@ -117,9 +123,9 @@ describe('GAP 1 — cross-source edges are writable through add_link', () => {
   test('alpha -> beta edge is created when to_source_id names the far source', async () => {
     await addLink.handler(ctxOf(), {
       from: 'people/casper', to: 'decisions/dashboard',
-      link_type: 'wants', context: 'cross-source', to_source_id: 'beta',
+      link_type: 'mentions', context: 'cross-source', to_source_id: 'beta',
     });
-    const rows = await edgesOfType('wants');
+    const rows = await edgesOfType('mentions');
     expect(rows.length).toBe(1);
     expect(`${rows[0].fs}:${rows[0].fslug}`).toBe('alpha:people/casper');
     expect(`${rows[0].ts}:${rows[0].tslug}`).toBe('beta:decisions/dashboard');
@@ -127,21 +133,21 @@ describe('GAP 1 — cross-source edges are writable through add_link', () => {
 
   test('without to_source_id the same call still fails — the default is unchanged', async () => {
     await expect(
-      addLink.handler(ctxOf(), { from: 'people/casper', to: 'decisions/dashboard', link_type: 'regress' }),
+      addLink.handler(ctxOf(), { from: 'people/casper', to: 'decisions/dashboard', link_type: 'discussed_in' }),
     ).rejects.toThrow(/not found/);
   });
 
   test('remove_link deletes what add_link created, cross-source', async () => {
     await addLink.handler(ctxOf(), {
-      from: 'people/casper', to: 'decisions/dashboard', link_type: 'temp', to_source_id: 'beta',
+      from: 'people/casper', to: 'decisions/dashboard', link_type: 'works_at', to_source_id: 'beta',
     });
     // #4527: the removal count is the proof the far endpoint was targeted —
     // a scalar-scoped delete would report 0 here.
     const result = await removeLink.handler(ctxOf(), {
-      from: 'people/casper', to: 'decisions/dashboard', link_type: 'temp', to_source_id: 'beta',
+      from: 'people/casper', to: 'decisions/dashboard', link_type: 'works_at', to_source_id: 'beta',
     });
     expect(result).toMatchObject({ status: 'ok', removed: 1 });
-    expect(await edgesOfType('temp')).toEqual([]);
+    expect(await edgesOfType('works_at')).toEqual([]);
   });
 });
 
@@ -150,9 +156,9 @@ describe('GAP 1 — the #4109 preflight follows the resolved endpoint source', (
     // Pre-port, requireWritablePage always used ctx.sourceId, so this legitimate
     // edge died at the preflight with permission_denied before the engine ran.
     await addLink.handler(ctxOf(), {
-      from: 'people/casper', to: 'decisions/dashboard', link_type: 'preflight_ok', to_source_id: 'beta',
+      from: 'people/casper', to: 'decisions/dashboard', link_type: 'advises', to_source_id: 'beta',
     });
-    expect((await edgesOfType('preflight_ok')).length).toBe(1);
+    expect((await edgesOfType('advises')).length).toBe(1);
   });
 
   test('a WRONG endpoint source still produces the #4109 boundary envelope', async () => {
@@ -160,10 +166,10 @@ describe('GAP 1 — the #4109 preflight follows the resolved endpoint source', (
     // for this caller's write source, so #4109's page_not_found stands.
     await expect(
       addLink.handler(ctxOf(), {
-        from: 'people/casper', to: 'decisions/dashboard', link_type: 'wrong_src', to_source_id: 'parked',
+        from: 'people/casper', to: 'decisions/dashboard', link_type: 'attended', to_source_id: 'parked',
       }),
     ).rejects.toThrow(/add_link to page "decisions\/dashboard" was not found in writable source "parked"/);
-    expect(await edgesOfType('wrong_src')).toEqual([]);
+    expect(await edgesOfType('attended')).toEqual([]);
   });
 });
 
@@ -218,7 +224,7 @@ describe('GAP 2 — cross-source edges are traversable', () => {
     expect(floor).toContain('beta');
     const ctx = ctxOf({ localFederatedSourceIds: floor });
     const paths = await traverse.handler(ctx, { slug: 'people/casper', depth: 1, direction: 'out' }) as Path[];
-    const hit = paths.find((p) => p.to_slug === 'decisions/dashboard' && p.link_type === 'wants');
+    const hit = paths.find((p) => p.to_slug === 'decisions/dashboard' && p.link_type === 'mentions');
     expect(hit).toBeDefined();
   });
 
@@ -253,7 +259,7 @@ describe('GAP 2 — parked and retired sources stay unreachable', () => {
   test('an unfederated anchor keeps scalar scope and cannot hop out', async () => {
     expect(await localFederatedSourceIds(engine, 'parked', 'local_path')).toBeUndefined();
     await addLink.handler(ctxOf({ sourceId: 'parked' }), {
-      from: 'notes/parked-note', to: 'people/casper', link_type: 'leak_probe', to_source_id: 'alpha',
+      from: 'notes/parked-note', to: 'people/casper', link_type: 'founded', to_source_id: 'alpha',
     });
     const ctx = ctxOf({ sourceId: 'parked' }); // no floor — localFederatedSourceIds undefined
     const paths = await traverse.handler(ctx, { slug: 'notes/parked-note', depth: 1, direction: 'out' }) as Path[];
@@ -262,7 +268,7 @@ describe('GAP 2 — parked and retired sources stay unreachable', () => {
 
   test('an edge INTO a parked source is not traversable from the federated floor', async () => {
     await addLink.handler(ctxOf(), {
-      from: 'people/casper', to: 'notes/parked-note', link_type: 'into_parked', to_source_id: 'parked',
+      from: 'people/casper', to: 'notes/parked-note', link_type: 'invested_in', to_source_id: 'parked',
     });
     const floor = await localFederatedSourceIds(engine, 'alpha', 'local_path');
     const paths = await traverse.handler(ctxOf({ localFederatedSourceIds: floor }), {
@@ -273,7 +279,7 @@ describe('GAP 2 — parked and retired sources stay unreachable', () => {
 
   test('an edge INTO a retired (archived) source is not traversable either', async () => {
     await addLink.handler(ctxOf(), {
-      from: 'people/casper', to: 'notes/retired-note', link_type: 'into_retired', to_source_id: 'retired',
+      from: 'people/casper', to: 'notes/retired-note', link_type: 'led_round', to_source_id: 'retired',
     });
     const floor = await localFederatedSourceIds(engine, 'alpha', 'local_path');
     const paths = await traverse.handler(ctxOf({ localFederatedSourceIds: floor }), {

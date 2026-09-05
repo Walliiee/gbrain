@@ -1,3 +1,4 @@
+import { isZeroEntropyModel } from '../core/ai/defaults.ts';
 import { execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
 import { basename, join, dirname, resolve } from 'path';
@@ -529,6 +530,15 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
           // Banner is cosmetic; never block the upgrade.
         }
 
+        // Ambient-writeback consent ask (WP8): one-shot for EXISTING installs
+        // upgrading into the feature. Personal brains only; double-gated on
+        // its own sentinel + the setting being unset; [AGENT]-relayed;
+        // never auto-enables; its own try/catch lives inside.
+        {
+          const { runWritebackNudge } = await import('../core/onboard/writeback-nudge.ts');
+          await runWritebackNudge(engine, { context: 'post-upgrade' });
+        }
+
         // Waiting-TTL pre-notice (one-shot, warn-before-act). The worker
         // gates its first sweep behind the SAME flag via runWaitingTtlTick
         // (notice → grace window → sweep) because daemon restarts never run
@@ -583,8 +593,8 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
             const knobs = resolveSearchMode(await loadSearchModeConfig(engine));
             if (knobs.reranker_enabled) rerankerModel = knobs.reranker_model;
           } catch { /* no reranker-exposure claim */ }
-          const onZeEmbedding = effectiveModel.startsWith('zeroentropyai:');
-          const onZeReranker = !!rerankerModel?.startsWith('zeroentropyai:');
+          const onZeEmbedding = isZeroEntropyModel(effectiveModel);
+          const onZeReranker = isZeroEntropyModel(rerankerModel);
           if (shown !== 'true' && (onZeEmbedding || onZeReranker)) {
             // Paste-ready --dim from the ACTUAL column width (config can
             // drift): keeping the current width avoids a needless dimension
