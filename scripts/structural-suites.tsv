@@ -88,6 +88,7 @@ test/cycle-patterns-deadline-budget.test.ts	deadline plumbing wiring (structural
 test/cycle-patterns.test.ts	patterns phase wiring	9	readFileSync
 test/cycle-patterns.test.ts	patterns scope filter	7	readFileSync
 test/cycle-phase-deadline-drift.test.ts	propose_takes deadline < job timeout (#4168)	4	readFileSync
+test/cycle-synthesize-generated-stamp.test.ts	#4337 coexistence — the stamp must not rewrite a page\'s first cycle date	6	readFileSync
 test/cycle/cycle-lock-ttl.test.ts	cycle lock TTL (T2 regression pin)	1	readFileSync
 test/destructive-guard.test.ts	FK-RESTRICT lifecycle (clientsReferencingSource + purge skip)	9	readFileSync
 test/destructive-guard.test.ts	assessDestructiveImpact	5	readFileSync

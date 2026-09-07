@@ -65,12 +65,29 @@ export interface LinkManifestResult {
 const collapse = (s: string): string => s.replace(/\s+/g, ' ').trim();
 
 /**
+ * Review-queue prefix for the dream cycle's candidate tasks and candidate
+ * corrections. Defined HERE rather than in synthesize.ts because three modules
+ * need it — the prompt/stamp (synthesize.ts), the oneshot slug fence
+ * (minions/handlers/subagent-oneshot.ts) and the self-consumption guard below —
+ * and both of the others already import this module, so this is the only shared
+ * node that introduces no import cycle. The synthesize phase appends
+ * `${DREAM_PROPOSAL_PREFIX}*` to its own allow-list at run time (see the
+ * NO_ALLOWLIST check there); `skills/_brain-filing-rules.json` documents the
+ * lane but deliberately does not carry the glob.
+ */
+export const DREAM_PROPOSAL_PREFIX = 'dream-cycle-proposals/';
+
+/**
  * Dream-output prefixes are excluded so synthesis never wikilinks its own
  * prior output into a feedback loop (same self-consumption guard as
  * transcript discovery).
  */
 function isDreamOutputSlug(slug: string, outputRoot: string): boolean {
   return slug.startsWith('dream-cycle-summaries/')
+    // A proposal is an unreviewed claim. Offering one as a wikilink target would
+    // let tonight's synthesis cite last night's unverified guess and launder it
+    // into something that looks corroborated.
+    || slug.startsWith(DREAM_PROPOSAL_PREFIX)
     || slug.startsWith(`${outputRoot}/personal/reflections/`)
     || slug.startsWith(`${outputRoot}/personal/patterns/`)
     || slug.startsWith(`${outputRoot}/originals/`);
