@@ -5,7 +5,12 @@
  * Verified against a live local rollout 2026-08-14 (see SPEC_TARGET).
  *
  * TURN SELECTION IS STRUCTURAL, not heuristic: the human's typed text is
- * recorded as `event_msg` payload.type='user_message' (payload.message);
+ * recorded as `event_msg` payload.type='user_message' (payload.message).
+ * Codex CLI 0.150+ threads record it INSTEAD as `event_msg`
+ * payload.type='item_completed' with payload.item.type='UserMessage' and the
+ * text in payload.item.content[].text (observed live: 0.150.1 and 0.153.4,
+ * 2026-09-07/08; such rollouts carry no `user_message` event at all, so every
+ * user turn of the session was dropped until 2026-09-09 -- local keeper);
  * `response_item` rows with role user/developer are INJECTED context
  * (app-context, plugin lists, instruction preambles) and are skipped
  * wholesale. Assistant text comes from `response_item` payload.type='message'
@@ -39,13 +44,16 @@ export const CODEX_SPEC_TARGET: HostSpecTarget = {
   verifiedAt: '2026-08-14',
   references: [
     'local ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl (codex CLI, live sample 2026-08-14)',
+    'local ~/.codex/sessions/2026/09/08/rollout-*.jsonl (codex CLI 0.153.4 thread shape, live sample 2026-09-08)',
     'test/fixtures/transcripts/codex-rollout.jsonl',
   ],
   note:
     'One JSON object per line: {timestamp: ISO, type, payload}. type ' +
     "'session_meta' header carries payload.{session_id, cwd, timestamp, " +
     "cli_version}. User turns: type 'event_msg' with payload.type " +
-    "'user_message' (payload.message = typed text). Assistant turns: type " +
+    "'user_message' (payload.message = typed text), or -- Codex 0.150+ threads -- " +
+    "type 'event_msg' with payload.type 'item_completed' and payload.item.{type:" +
+    "'UserMessage', content:[{type:'text', text}]}. Assistant turns: type " +
     "'response_item' with payload.{type:'message', role:'assistant', " +
     "content:[{type:'output_text', text}]}. response_item rows with role " +
     'user/developer are injected context and are skipped. reasoning, ' +
@@ -115,6 +123,15 @@ export function mapCodexLine(entry: unknown): CodexLineResult {
   if (e.type === 'compacted') return { kind: 'boundary' };
   if (e.type === 'event_msg' && payload.type === 'user_message') {
     const text = typeof payload.message === 'string' ? payload.message.trim() : '';
+    return text ? { kind: 'user', message: { role: 'user', timestamp: lineTs, text } } : { kind: 'skip' };
+  }
+  if (e.type === 'event_msg' && payload.type === 'item_completed') {
+    // Codex CLI 0.150+ thread shape: the typed prompt arrives as a completed
+    // UserMessage item. A rollout uses this shape OR user_message, never both
+    // in the live samples; the parse loop still drops an exact repeat.
+    const item = (typeof payload.item === 'object' && payload.item !== null ? payload.item : {}) as Record<string, unknown>;
+    if (item.type !== 'UserMessage') return { kind: 'skip' };
+    const text = textFromBlocks(item.content, 'text');
     return text ? { kind: 'user', message: { role: 'user', timestamp: lineTs, text } } : { kind: 'skip' };
   }
   if (e.type === 'response_item' && payload.type === 'message' && payload.role === 'assistant') {
@@ -225,6 +242,10 @@ export const codexAdapter: TranscriptAdapter = {
         continue;
       }
       if (mapped.kind === 'user' || mapped.kind === 'assistant') {
+        // A rollout that records one typed prompt as BOTH a user_message event
+        // and a completed UserMessage item would otherwise import it twice.
+        const prev = messages[messages.length - 1];
+        if (mapped.kind === 'user' && prev && prev.role === 'user' && prev.text === mapped.message.text) continue;
         messages.push(mapped.message);
         continue;
       }
@@ -254,7 +275,7 @@ export const codexAdapter: TranscriptAdapter = {
       truncated,
       sessions,
       zeroSessionsReason:
-        sessions === 0 ? 'no user_message events or assistant message items in rollout' : undefined,
+        sessions === 0 ? 'no user_message/UserMessage events or assistant message items in rollout' : undefined,
     };
   },
 };

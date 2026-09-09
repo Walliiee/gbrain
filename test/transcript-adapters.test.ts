@@ -385,6 +385,36 @@ describe('codexAdapter', () => {
     expect(diag.skippedLines).toBe(1); // the malformed tail line
   });
 
+  // Local keeper 2026-09-09: Codex CLI 0.150+ threads (live 0.150.1 / 0.153.4,
+  // 2026-09-07/08) persist the typed prompt as a completed UserMessage item and
+  // write NO user_message event, so every user turn of such a session was dropped.
+  test('Codex 0.150+ thread shape: item_completed/UserMessage is a user turn; a repeat of the same prompt is not doubled', async () => {
+    const p = join(tdir(), 'thread-rollout.jsonl');
+    const rows = [
+      { type: 'session_meta', timestamp: '2026-09-08T11:08:37.000Z', payload: { session_id: '01a080b4-thread', cwd: '/w', cli_version: '0.153.4' } },
+      { type: 'event_msg', timestamp: '2026-09-08T11:08:41.000Z', payload: { type: 'item_completed', thread_id: '01a080b4-thread', turn_id: 't1', item: { type: 'UserMessage', id: 'u1', content: [{ type: 'text', text: 'Find the Thursday transcript and summarise it.' }] } } },
+      { type: 'event_msg', timestamp: '2026-09-08T11:08:41.100Z', payload: { type: 'item_completed', thread_id: '01a080b4-thread', turn_id: 't1', item: { type: 'CommandExecution', id: 'c1', command: 'ls' } } },
+      { type: 'response_item', timestamp: '2026-09-08T11:08:41.200Z', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'INJECTED-CONTEXT-ONLY-TEXT' }] } },
+      { type: 'response_item', timestamp: '2026-09-08T11:08:45.000Z', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Found it; here is the summary.' }] } },
+      // Both shapes for one prompt: not seen live, pinned so a future CLI that writes both cannot double the turn.
+      { type: 'event_msg', timestamp: '2026-09-08T11:09:00.000Z', payload: { type: 'user_message', message: 'And the action items?' } },
+      { type: 'event_msg', timestamp: '2026-09-08T11:09:00.050Z', payload: { type: 'item_completed', turn_id: 't2', item: { type: 'UserMessage', id: 'u2', content: [{ type: 'text', text: 'And the action items?' }] } } },
+      { type: 'response_item', timestamp: '2026-09-08T11:09:05.000Z', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Three action items.' }] } },
+    ];
+    writeFileSync(p, rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const { sessions, diag } = await drain(codexAdapter.parse(p));
+    expect(sessions).toHaveLength(1);
+    const s = sessions[0];
+    expect(s.meta.sessionId).toBe('01a080b4-thread');
+    expect(s.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'user', 'assistant']);
+    expect(s.messages[0].text).toBe('Find the Thursday transcript and summarise it.');
+    expect(s.messages[0].timestamp).toBe('2026-09-08T11:08:41.000Z');
+    expect(s.messages[2].text).toBe('And the action items?');
+    expect(s.messages.map((m) => m.text).join('\n')).not.toContain('INJECTED-CONTEXT-ONLY-TEXT');
+    expect(diag.sessions).toBe(1);
+    expect(diag.skippedLines).toBe(0);
+  });
+
   test('detect matches the rollout head line', () => {
     expect(codexAdapter.detect(CODEX_FIXTURE, readSample(CODEX_FIXTURE))).toBe(true);
     expect(codexAdapter.detect(FIXTURE, readSample(FIXTURE))).toBe(false);
