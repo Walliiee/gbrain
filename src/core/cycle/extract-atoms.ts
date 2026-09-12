@@ -739,7 +739,7 @@ export async function runPhaseExtractAtoms(
   // "Keep safe defaults" comment) still leaves extractModel on this default,
   // matching the pre-refactor fail-soft behavior exactly.
   let extractModel = resolveTierDefault('utility');
-  let budgetCap = DEFAULT_BUDGET_USD;
+  let budgetCap: number | undefined = DEFAULT_BUDGET_USD;
   // #4529/#4540: the per-item input/output caps were hardcoded (slice(0, 50_000) +
   // maxTokens: 4096). Operators on small-context or thinking models need to
   // shrink/grow both without a code change; defaults are unchanged.
@@ -750,8 +750,13 @@ export async function runPhaseExtractAtoms(
     extractModel = await resolveExtractAtomsModel(engine);
     const configuredBudget = await engine.getConfig('cycle.extract_atoms.budget_usd');
     if (configuredBudget) {
-      const n = Number(configuredBudget);
-      if (Number.isFinite(n) && n > 0) budgetCap = n;
+      const token = configuredBudget.trim().toLowerCase();
+      if (['off', 'unlimited', 'none'].includes(token)) {
+        budgetCap = undefined;
+      } else {
+        const n = Number(configuredBudget);
+        if (Number.isFinite(n) && n > 0) budgetCap = n;
+      }
     }
     // #4529: legacy input-cap key (its own floor of 500 chars, as landed).
     // Read FIRST so the newer #4540 max_input_chars key below wins when
@@ -883,7 +888,7 @@ export async function runPhaseExtractAtoms(
   await withBudgetTracker(budgetTracker, async () => {
   for (const item of work) {
     await maybeYield();
-    if (budgetExhausted || budgetTracker.totalSpent >= budgetCap) {
+    if (budgetExhausted || (budgetCap !== undefined && budgetTracker.totalSpent >= budgetCap)) {
       if (item.kind === 'transcript') transcriptsSkipped++;
       else pagesSkipped++;
       continue;
@@ -1208,7 +1213,7 @@ export async function runPhaseExtractAtoms(
       malformed_outputs: malformedOutputs,
       tombstoned_for_failures: tombstonedForFailures,
       estimated_spend_usd: estimatedSpendUsd,
-      budget_usd: budgetCap,
+      budget_usd: budgetCap ?? null,
       model: extractModel,
       budget_exhausted: budgetExhausted,
       source_id: sourceId,

@@ -29,7 +29,10 @@ import { describe, test, expect, beforeEach } from 'bun:test';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import {
+  buildJobParams,
   extractConversationFactsLockId,
+  extractConversationFactsOutputLockId,
+  parseArgs,
   PER_PAGE_LOCK_TTL_MINUTES,
   _resetLockBusyLogCacheForTest,
 } from '../src/commands/extract-conversation-facts.ts';
@@ -59,6 +62,30 @@ describe('extract-conversation-facts — exported helpers (T5)', () => {
     const a = extractConversationFactsLockId('dept-a', 'chat/team');
     const b = extractConversationFactsLockId('dept-b', 'chat/team');
     expect(a).not.toBe(b);
+  });
+
+  test('output lock id collides for different inputs sharing one output slug', () => {
+    expect(extractConversationFactsOutputLockId('shared', 'chat/team')).toBe(
+      'extract-conversation-facts-output:shared:chat/team',
+    );
+  });
+
+  test('foreground and background reject a missing visibility value identically', () => {
+    const args = ['--visibility', '--background'];
+    const foregroundError = parseArgs(args).error;
+    expect(foregroundError).toContain('visibility must be');
+    expect(() => buildJobParams(args)).toThrow(foregroundError);
+  });
+
+  test('--no-cost-cap round-trips through foreground and background parsing', () => {
+    expect(parseArgs(['--no-cost-cap']).noCostCap).toBe(true);
+    expect(buildJobParams(['--no-cost-cap'])).toMatchObject({ noCostCap: true });
+  });
+
+  test('--no-cost-cap refuses a simultaneous dollar cap', () => {
+    const args = ['--no-cost-cap', '--max-cost-usd', '5'];
+    expect(parseArgs(args).error).toContain('cannot be combined');
+    expect(() => buildJobParams(args)).toThrow('cannot be combined');
   });
 
   test('PER_PAGE_LOCK_TTL_MINUTES is short enough that holder-death recovers within ~2min', () => {

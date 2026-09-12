@@ -39,6 +39,17 @@ describe('--max-bytes CLI validation (gbrain#4149)', () => {
   test('accepts grok as a --format value', () => {
     expect((parseIngestArgs(['a.jsonl', '--format', 'grok']) as any).format).toBe('grok');
   });
+
+  test('transcripts facts bridge flags preserve output and visibility and reject garbage', () => {
+    const parsed = parseIngestArgs([
+      'a.jsonl', '--facts', '--facts-output-source-id', 'default', '--facts-visibility', 'world',
+    ]) as any;
+    expect(parsed.factsOutputSourceId).toBe('default');
+    expect(parsed.factsVisibility).toBe('world');
+    expect((parseIngestArgs(['a.jsonl', '--facts-visibility', 'public']) as any).error).toContain(
+      'world or private',
+    );
+  });
 });
 
 describe('cap threading to adapters (gbrain#4149)', () => {

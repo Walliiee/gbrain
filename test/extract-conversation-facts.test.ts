@@ -888,7 +888,7 @@ describe('runExtractConversationFactsCore', () => {
     const terminalRows = await engine.executeRaw<{ count: string | number }>(
       `SELECT COUNT(*) AS count FROM facts
         WHERE source = $1 AND source_session LIKE $2`,
-      [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/alice-example:page-%`],
+      [TERMINAL_AUDIT_SOURCE, `${TERMINAL_AUDIT_SOURCE}:conversations/imessage/alice-example:route=%:page-%`],
     );
     expect(Number(terminalRows[0]?.count ?? 0)).toBe(1);
   });
@@ -1011,7 +1011,7 @@ describe('runExtractConversationFactsCore', () => {
         WHERE source = $1 AND source_session LIKE $2`,
       [
         NON_EXTRACTABLE_AUDIT_SOURCE,
-        `${NON_EXTRACTABLE_AUDIT_SOURCE}:conversations/single-message:page-%`,
+        `${NON_EXTRACTABLE_AUDIT_SOURCE}:conversations/single-message:route=%:page-%`,
       ],
     );
     expect(Number(markers[0]?.count ?? 0)).toBe(1);

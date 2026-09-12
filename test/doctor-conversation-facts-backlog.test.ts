@@ -133,7 +133,7 @@ describe('conversation_facts_backlog durable outcomes', () => {
          )`,
         [
           TERMINAL_AUDIT_SOURCE,
-          `${TERMINAL_AUDIT_SOURCE}:meetings/sidecar:${token}`,
+          `${TERMINAL_AUDIT_SOURCE}:meetings/sidecar:route=default:private:${token}`,
           'meetings/sidecar',
         ],
       );

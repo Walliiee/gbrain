@@ -70,6 +70,10 @@ interface IngestCliOpts {
   source?: string;
   facts?: boolean;
   maxCostUsd?: number;
+  /** One-way bridge for the facts lane: source that receives the extracted rows. */
+  factsOutputSourceId?: string;
+  /** One-way bridge for the facts lane: visibility stamped on the extracted rows. */
+  factsVisibility?: 'world' | 'private';
   /** gbrain#4149: explicit per-format byte-cap override; undefined = adapter-native defaults. */
   maxBytes?: number;
   embed?: boolean;
@@ -162,6 +166,20 @@ export function parseIngestArgs(args: string[]): IngestCliOpts | { help: true } 
       opts.maxCostUsd = n;
       continue;
     }
+    if (a === '--facts-output-source-id') {
+      const v = args[++i];
+      if (!v || v.startsWith('-')) return { error: 'facts-output-source-id needs a source id' };
+      opts.factsOutputSourceId = v;
+      continue;
+    }
+    if (a === '--facts-visibility') {
+      const v = (args[++i] ?? '').trim().toLowerCase();
+      if (v !== 'world' && v !== 'private') {
+        return { error: `facts-visibility must be world or private (got '${v}')` };
+      }
+      opts.factsVisibility = v as 'world' | 'private';
+      continue;
+    }
     if (a === '--max-bytes') {
       // gbrain#4149: optional VALIDATED override for the per-format byte
       // caps (e.g. the Hermes store guard). Omission preserves each
@@ -209,6 +227,13 @@ skip). Embedding is OFF by default; run the embed backfill later or opt in.
   --embed           Embed pages at import (default: defer to embed backfill)
   --facts           Extract facts from imported pages (budget-capped)
   --max-cost-usd F  Facts budget cap (default 5)
+  --facts-output-source-id S
+                    One-way bridge: write the extracted fact rows into
+                    source S while the imported pages, checkpoints and audit
+                    rows stay in --source-id (default: same source)
+  --facts-visibility V
+                    world | private — visibility of the extracted fact rows
+                    (default: facts.default_visibility config, else private)
   --max-bytes N     Override the per-format file/store byte caps (e.g. 4gb
                     for a multi-GB hermes store). Omit to keep each
                     format's native safety default. Changing it starts a
@@ -514,6 +539,8 @@ async function runIngest(engine: BrainEngine, args: string[]): Promise<void> {
       slugs: [...new Set(result.slugsTouched)],
       maxCostUsd: parsed.maxCostUsd,
       quiet: parsed.quiet,
+      outputSourceId: parsed.factsOutputSourceId,
+      visibility: parsed.factsVisibility,
     });
   }
 

@@ -170,6 +170,85 @@ limit.
 It still uses delete-first replay, strict extraction outcomes, advisory locks,
 and snapshot verification. Force means "recompute" rather than "relax safety."
 
+## One-way extraction bridge (`--output-source-id`, `--visibility`)
+
+By default the extractor writes knowledge rows into the same source as the
+pages it read, with the engine's default visibility (`private`). On a
+multi-source brain where raw conversation pages live in a NON-federated
+source, that strands every extracted fact: federated recall never reads the
+input source and remote/MCP callers never see private rows.
+
+The bridge splits the two concerns. Only the extracted knowledge rows cross;
+everything that touches the raw page stays where the page is.
+
+| Stays in the INPUT source (`--source-id`) | Goes to the OUTPUT source (`--output-source-id`) |
+|---|---|
+| page reads and the parser snapshot | the extracted fact rows |
+| the per-page advisory lock and operation checkpoint | save-time entity resolution (aliases / pages of the output source) |
+| terminal + non-extractable audit rows (always `private`) | |
+| run receipt page and `extract_rollup_7d` row | |
+
+Row identity in the output source:
+
+- `source_markdown_slug` — the input page slug, unchanged.
+- `source` — `cli:conversation-facts-bridge:<input-source-id>` (never the
+  same-source `cli:extract-conversation-facts` prefix; see below).
+- `source_session` — `<source>:<slug>`; `context` starts `from <input>:<slug>`.
+- `visibility` — the resolved visibility (see ladder below).
+- `row_num` — appended after `MAX(row_num)` for (output source, slug), so a
+  same-slug page the output source already owns (fence rows, same-source
+  extracted rows) is never collided with. `insertFacts` uses
+  `ON CONFLICT DO NOTHING` on `(source_id, source_markdown_slug, row_num)`;
+  starting at 0 would drop rows silently. Any drop that still happens is
+  named on stderr (`row_num conflict`), never swallowed.
+
+Why the distinct `source` value: the delete-orphans-first replay wipes
+`source LIKE 'cli:extract-conversation-facts%'` for (source, slug). If bridged
+rows shared that prefix, a same-source replay of a same-slug page in the
+output source would delete them, and a bridged replay would delete the output
+page's own rows. The bridge tag matches neither, and it names the input source,
+so replay on either side touches only its own rows. It still starts with
+`cli:` so the fence-reconcile paths (`excludeSourcePrefixes: ['cli:']`) protect
+bridged rows exactly like same-source conversation rows. Bulk removal of
+bridged rows is therefore `DELETE FROM facts WHERE source LIKE
+'cli:conversation-facts-bridge:%'`, separate from the same-source sweep.
+
+Replay semantics are unchanged in shape and extended in scope: a bridged page
+claim deletes the pair's rows on BOTH sides first — the input source's
+command-owned rows (audit rows plus any legacy same-source knowledge rows the
+page carried before bridging) and the output source's rows tagged with this
+input source — then re-extracts. Completion authority is still the terminal
+row in the input source, so a rerun with the same route skips completed pages
+and `--force` replays them.
+
+Visibility ladder (`src/core/facts/visibility.ts`, shared with `extract_facts`):
+explicit `--visibility` > `facts.default_visibility` config > `private`. A
+brain that never set the config key keeps the historical `private` default.
+Audit rows are always private.
+
+Validation happens before any model spend: an output source that is not
+registered, is archived, or fails the source-id regex aborts the run.
+
+**Say to your agent:** *"Extract the facts from my transcripts source into
+my main brain so every agent can recall them — your agent runs
+`gbrain extract-conversation-facts --source-id transcripts --output-source-id default --visibility world`"*
+
+The same route rides every entry point:
+
+- CLI: `gbrain extract-conversation-facts --source-id <in> --output-source-id <out> --visibility world`
+- `--background`: the Minion envelope carries `outputSourceId` + `visibility`.
+- `gbrain transcripts ingest --facts --facts-output-source-id <out> --facts-visibility world`
+- autopilot: `cycle.conversation_facts_backfill.output_source_id` +
+  `cycle.conversation_facts_backfill.visibility` (unset = same-source / ladder).
+
+Entity resolution follows the rows: on a bridged route a fact's `entity_slug`
+canonicalizes against the OUTPUT source's pages and aliases (the resolver
+probes one source, and an input source of raw conversation pages holds no
+entity pages — probing it slugifies every name into a one-off label). A page
+that exists only in the input source is not consulted. Same-source runs are
+unchanged. Rows bridged before a page is edited are replaced wholesale on the
+next claim (delete-first), the same as same-source rows.
+
 ## Operator signals
 
 The result exposes separate counters:
@@ -217,6 +296,7 @@ again and receive a marker with a new token.
 
 ```bash
 bun test test/extract-conversation-facts.test.ts
+bun test test/extract-conversation-facts-bridge.test.ts
 bun test test/doctor-conversation-facts-backlog.test.ts
 bun x tsc --noEmit
 ```

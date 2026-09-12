@@ -64,7 +64,7 @@
  *   `--override-disabled` to force-run.
  */
 
-import type { BrainEngine, NewFact } from '../core/engine.ts';
+import type { BrainEngine, FactVisibility, NewFact } from '../core/engine.ts';
 import type { Page } from '../core/types.ts';
 import {
   extractFactsFromTurnWithOutcome,
@@ -101,6 +101,17 @@ import {
   mergeSaveTimeResolutionCounts,
   resolveExtractedEntitiesForSave,
 } from '../core/entities/resolve-on-save.ts';
+// One-way extraction bridge: input source (pages, locks, checkpoints, audit
+// rows) vs output source (the extracted knowledge rows) + row visibility.
+// Same-source/private when unset — see that module's docstring.
+import {
+  bridgedFactSource,
+  deleteBridgedOrphanFacts,
+  parseVisibilityToken,
+  peekRowNumStart,
+  resolveConversationFactsRoute,
+  type ConversationFactsRoute,
+} from '../core/facts/conversation-bridge.ts';
 
 // Re-exported verbatim so existing importers (this file's own helpers below
 // and this file's tests) keep working unchanged; doctor.ts, jobs.ts,
@@ -298,6 +309,8 @@ export interface ExtractConversationFactsCoreOpts {
    * creates a fresh tracker. Default DEFAULT_MAX_COST_USD.
    */
   maxCostUsd?: number;
+  /** Disable the cost gate entirely while retaining spend telemetry. */
+  noCostCap?: boolean;
   /**
    * Externally-managed BudgetTracker (Eng-v2 C5). If present, core
    * uses it as-is — no `withBudgetTracker` wrap. Cycle phase passes
@@ -328,6 +341,24 @@ export interface ExtractConversationFactsCoreOpts {
    * dedup → provenance all execute THIS production pipeline with zero LLM calls.
    */
   extractor?: (input: ExtractInput) => Promise<ExtractedFact[]>;
+  /**
+   * One-way extraction bridge: write the extracted KNOWLEDGE rows into this
+   * source instead of `sourceId`. Page reads, entity resolution, the per-page
+   * lock, checkpoints, receipts/rollups and the durable audit rows all stay
+   * in `sourceId`; only the fact rows cross. Bridged rows carry
+   * `source = cli:conversation-facts-bridge:<sourceId>` (never the same-source
+   * prefix) and start at MAX(row_num)+1 in the output source — see
+   * `src/core/facts/conversation-bridge.ts`. Must name a registered,
+   * non-archived source. Default: same as `sourceId` (unchanged behavior).
+   */
+  outputSourceId?: string;
+  /**
+   * Visibility stamped on the extracted knowledge rows. Unset resolves through
+   * the shared facts ladder (`facts.default_visibility` config, else
+   * `private`) — identical to the historical engine default on a brain that
+   * never set that key. Audit rows are always private; they are not knowledge.
+   */
+  visibility?: FactVisibility;
 }
 
 export interface ExtractConversationFactsResult {
@@ -632,6 +663,11 @@ export function extractConversationFactsLockId(sourceId: string, slug: string): 
   return `extract-conversation-facts:${sourceId}:${slug}`;
 }
 
+/** Serialize writers that target the same output-side unique-key namespace. */
+export function extractConversationFactsOutputLockId(outputSourceId: string, slug: string): string {
+  return `extract-conversation-facts-output:${outputSourceId}:${slug}`;
+}
+
 /**
  * Per-page lock TTL (D12). 2 minutes — `withRefreshingLock` refreshes
  * at 1/6 the TTL (`Math.max(15000, 120_000/6) = 20s`) so a long page
@@ -685,10 +721,15 @@ function logLockBusyRateLimited(sourceId: string, slug: string): void {
  *
  * Returns the number of rows deleted (surfaced in the result counter
  * for operator observability; non-zero means a prior run crashed).
+ *
+ * Bridged route: the input-source delete above still runs (it owns the
+ * audit rows and any legacy same-source rows for the page), PLUS the rows
+ * this exact (input source, page) pair previously bridged into the output
+ * source are removed — and only those (`deleteBridgedOrphanFacts`).
  */
 async function deleteOrphanFactsForPage(
   engine: BrainEngine,
-  sourceId: string,
+  route: ConversationFactsRoute,
   slug: string,
 ): Promise<number> {
   // A cleanup failure is authoritative: callers must not write a terminal or
@@ -702,10 +743,11 @@ async function deleteOrphanFactsForPage(
        RETURNING 1
      )
      SELECT COUNT(*)::text AS count FROM del`,
-    [sourceId, slug],
+    [route.sourceId, slug],
   );
   const n = parseInt(rows[0]?.count ?? '0', 10);
-  return Number.isFinite(n) ? n : 0;
+  const inputDeleted = Number.isFinite(n) ? n : 0;
+  return inputDeleted + (await deleteBridgedOrphanFacts(engine, route, slug));
 }
 
 // ---------------------------------------------------------------------------
@@ -716,6 +758,11 @@ interface ExtractCoreState {
   result: ExtractConversationFactsResult;
   engine: BrainEngine;
   sourceId: string;
+  /**
+   * Resolved input/output/visibility route for this run. `route.sourceId`
+   * === `sourceId`; `route.outputSourceId` is where knowledge rows land.
+   */
+  route: ConversationFactsRoute;
   dryRun: boolean;
   sleepMs: number;
   segmentLimit: number;
@@ -831,8 +878,17 @@ async function preparePageSnapshot(
   return { page, body, versionToken: snapshotVersionToken(page, body) };
 }
 
-function outcomeSession(source: string, slug: string, versionToken: string): string {
-  return `${source}:${slug}:${versionToken}`;
+function routeIdentity(route: ConversationFactsRoute): string {
+  return `${route.outputSourceId}:${route.visibility}`;
+}
+
+function outcomeSession(
+  source: string,
+  slug: string,
+  versionToken: string,
+  route: ConversationFactsRoute,
+): string {
+  return `${source}:${slug}:route=${routeIdentity(route)}:${versionToken}`;
 }
 
 /**
@@ -844,6 +900,7 @@ export async function findFreshExtractionOutcomes(
   engine: BrainEngine,
   sourceId: string,
   pages: readonly Page[],
+  route?: ConversationFactsRoute,
 ): Promise<Map<string, DurableExtractionOutcome>> {
   if (pages.length === 0) return new Map();
   const expected = new Map<string, string>();
@@ -880,7 +937,11 @@ export async function findFreshExtractionOutcomes(
   for (const row of rows) {
     if (outcomes.has(row.slug)) continue;
     const token = expected.get(row.slug);
-    if (!token || row.source_session !== outcomeSession(row.source, row.slug, token)) {
+    const routeBoundMatch = route
+      ? row.source_session === outcomeSession(row.source, row.slug, token ?? '', route)
+      : row.source_session?.startsWith(`${row.source}:${row.slug}:route=`) === true &&
+        row.source_session.endsWith(`:${token}`);
+    if (!token || !routeBoundMatch) {
       continue;
     }
     outcomes.set(
@@ -1013,7 +1074,7 @@ async function processPage(
       if (await snapshotIsCurrent(state.engine, state.sourceId, snapshot)) {
         const cleaned = await deleteOrphanFactsForPage(
           state.engine,
-          state.sourceId,
+          state.route,
           page.slug,
         );
         state.result.orphan_facts_cleaned += cleaned;
@@ -1028,6 +1089,7 @@ async function processPage(
           page.slug,
           rowNum,
           snapshot.versionToken,
+          state.route,
           messages.length === 0
             ? 'no conversation messages found'
             : 'fewer than two eligible messages',
@@ -1044,7 +1106,7 @@ async function processPage(
   // lock above the caller) guarantees no other worker is writing to
   // this page right now, so the DELETE+INSERT pair is safe.
   if (!state.dryRun) {
-    const cleaned = await deleteOrphanFactsForPage(state.engine, state.sourceId, page.slug);
+    const cleaned = await deleteOrphanFactsForPage(state.engine, state.route, page.slug);
     if (cleaned > 0) {
       state.result.orphan_facts_cleaned += cleaned;
       process.stderr.write(
@@ -1053,23 +1115,32 @@ async function processPage(
     }
   }
 
-  // Page-global row_num: after delete-orphans-first the table has no
-  // rows for this (sourceId, slug), so we always start from 0. Peek
-  // is kept as a defensive fallback for dry-run + non-deleting paths.
-  let rowNum = state.dryRun
-    ? await peekRowNumStart(state.engine, state.sourceId, page.slug)
+  // Page-global row_num: after delete-orphans-first the input source has no
+  // command-owned rows for this (sourceId, slug), so the same-source path
+  // starts from 0 (peek is the dry-run fallback). A BRIDGED page instead
+  // appends after whatever the output source already holds for the slug
+  // (fence rows / same-source rows of a same-slug output page) — the unique
+  // index is (source_id, source_markdown_slug, row_num) with ON CONFLICT DO
+  // NOTHING, so starting at 0 there would drop rows silently.
+  const { route } = state;
+  let rowNum = state.dryRun || route.bridged
+    ? await peekRowNumStart(state.engine, route.outputSourceId, page.slug)
     : 0;
   let newestEnd: string | null = null;
   let segmentsThisPage = 0;
   let pageInsertedTotal = 0;
   const pageResolution = emptySaveTimeResolutionCounts();
+  // Provenance stamp on every knowledge row: the same-source prefix, or the
+  // bridge prefix carrying the INPUT source id so a row in the output source
+  // still names the source its page lives in.
+  const factSource = route.bridged ? bridgedFactSource(route.sourceId) : PER_SEGMENT_SOURCE_PREFIX;
 
   for (const seg of segments) {
     if (state.segmentLimit > 0 && segmentsThisPage >= state.segmentLimit) break;
     if (state.signal?.aborted) throw new Error('aborted');
 
     const text = renderSegmentForExtraction(page.title || page.slug, seg);
-    const sessionId = `${PER_SEGMENT_SOURCE_PREFIX}:${page.slug}`;
+    const sessionId = `${factSource}:${page.slug}`;
 
     // BrainBench (decision 15) may inject a deterministic extractor; when it
     // does, use it (returns facts directly — the hermetic gold path). The
@@ -1081,7 +1152,7 @@ async function processPage(
       extracted = await state.extractor({
         turnText: text,
         sessionId,
-        source: PER_SEGMENT_SOURCE_PREFIX,
+        source: factSource,
         engine: state.engine,
         abortSignal: state.signal,
       });
@@ -1089,7 +1160,7 @@ async function processPage(
       const extraction = await extractFactsFromTurnWithOutcome({
         turnText: text,
         sessionId,
-        source: PER_SEGMENT_SOURCE_PREFIX,
+        source: factSource,
         engine: state.engine,
         abortSignal: state.signal,
       });
@@ -1116,10 +1187,13 @@ async function processPage(
 
     // This bulk path bypasses writeSingleFact and writes through insertFacts.
     // Canonicalize every extractor-provided entity via the shipped resolver
-    // (alias_exact / prefix / fuzzy / slugify) while source scope is known.
+    // (alias_exact / prefix / fuzzy / slugify) in the ONE source the rows and
+    // their entity pages live in — the OUTPUT source on a bridged route (an
+    // input source of raw conversation pages slugifies every name into a
+    // one-off label); == sourceId when not bridged.
     const segmentResolution = await resolveExtractedEntitiesForSave(
       state.engine,
-      state.sourceId,
+      route.outputSourceId,
       extracted,
       (raw, message) => {
         process.stderr.write(
@@ -1144,8 +1218,11 @@ async function processPage(
         ...fact,
         row_num: rowNum + i,
         source_markdown_slug: page.slug,
-        source: PER_SEGMENT_SOURCE_PREFIX,
+        source: factSource,
         source_session: sessionId,
+        // Route-resolved visibility (explicit > facts.default_visibility >
+        // private). Set explicitly so the engine default never decides it.
+        visibility: route.visibility,
         // Preserve the conversation's valid time instead of defaulting every
         // extracted fact to extraction time. Epoch-anchored parses have no
         // trustworthy date, so they retain the existing now() fallback.
@@ -1153,9 +1230,25 @@ async function processPage(
           ? { valid_from: new Date(seg.startIso) }
           : {}),
         context:
-          fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
+          fact.context ??
+          `from ${route.bridged ? `${route.sourceId}:` : ''}${page.slug} segment ${seg.startIso}..${seg.endIso}`,
       }));
-      const ins = await state.engine.insertFacts(rows, { source_id: state.sourceId }); // gbrain-allow-direct-insert: canonical bulk extraction path for conversation pages — fences-as-system-of-record doesn't apply because conversations don't carry `## Facts` fences (the chat-log shape is the source-of-truth)
+      // Knowledge rows land in the OUTPUT source; everything else about this
+      // page (lock, checkpoint, audit rows) stays keyed to the input source.
+      const ins = await state.engine.insertFacts(rows, { source_id: route.outputSourceId }); // gbrain-allow-direct-insert: canonical bulk extraction path for conversation pages — fences-as-system-of-record doesn't apply because conversations don't carry `## Facts` fences (the chat-log shape is the source-of-truth)
+      if (ins.inserted < rows.length) {
+        // ON CONFLICT DO NOTHING on (source_id, source_markdown_slug, row_num)
+        // dropped rows — another writer owns those row_nums in the output
+        // source. Never silent: name it so the operator can see the collision.
+        process.stderr.write(
+          `[extract-conversation-facts] ${page.slug}: ${rows.length - ins.inserted} of ${rows.length} fact(s) ` +
+          `not inserted into ${route.outputSourceId} (row_num conflict on an existing row)\n`,
+        );
+        throw new Error(
+          `${page.slug}: partial fact insert (${ins.inserted}/${rows.length}) into ` +
+          `${route.outputSourceId}; refusing terminal/checkpoint so replay can clean and retry`,
+        );
+      }
       pageInsertedTotal += ins.inserted;
       state.result.facts_inserted += ins.inserted;
       rowNum += extracted.length;
@@ -1183,13 +1276,16 @@ async function processPage(
   ) {
     // A terminal insert is part of the page transaction contract. Propagate
     // failure so bulk accounting, CLI exit status, cycle status, and rollups all
-    // report the page as unfinished.
+    // report the page as unfinished. The audit row ALWAYS lives in the input
+    // source; on a bridged route `rowNum` counted in output-source space, so
+    // the input-side slot is peeked independently.
     await writeTerminalAuditRow(
       state.engine,
       state.sourceId,
       page.slug,
-      rowNum,
+      route.bridged ? await peekRowNumStart(state.engine, state.sourceId, page.slug) : rowNum,
       snapshot.versionToken,
+      route,
     );
     rowNum++;
   } else if (!state.dryRun && fullyProcessed && newestEnd !== null) {
@@ -1223,13 +1319,15 @@ async function writeTerminalAuditRow(
   slug: string,
   rowNum: number,
   versionToken: string,
+  route: ConversationFactsRoute,
 ): Promise<void> {
   const fact: NewFact & { row_num: number; source_markdown_slug: string } = {
     fact: 'EXTRACTION_COMPLETE',
     kind: 'fact',
     entity_slug: null,
     source: TERMINAL_AUDIT_SOURCE,
-    source_session: outcomeSession(TERMINAL_AUDIT_SOURCE, slug, versionToken),
+    source_session: outcomeSession(TERMINAL_AUDIT_SOURCE, slug, versionToken, route),
+    visibility: route.visibility,
     confidence: 1.0,
     notability: 'low',
     row_num: rowNum,
@@ -1254,6 +1352,7 @@ async function writeNonExtractableAuditRow(
   slug: string,
   rowNum: number,
   versionToken: string,
+  route: ConversationFactsRoute,
   reason: string,
 ): Promise<void> {
   const fact: NewFact & { row_num: number; source_markdown_slug: string } = {
@@ -1265,7 +1364,9 @@ async function writeNonExtractableAuditRow(
       NON_EXTRACTABLE_AUDIT_SOURCE,
       slug,
       versionToken,
+      route,
     ),
+    visibility: route.visibility,
     confidence: 1.0,
     notability: 'low',
     context: `scanned, not extractable: ${reason}`,
@@ -1331,6 +1432,20 @@ export async function runExtractConversationFactsCore(
   const sleepMs = opts.sleepMs ?? DEFAULT_INTER_CALL_SLEEP_MS;
   const segmentLimit = opts.segmentLimit ?? 0;
 
+  // Input/output/visibility route. Validated up front (unknown or archived
+  // output source throws) so a misrouted run fails before any model spend.
+  const route = await resolveConversationFactsRoute(engine, {
+    sourceId,
+    outputSourceId: opts.outputSourceId,
+    visibility: opts.visibility,
+  });
+  if (route.bridged || opts.visibility !== undefined) {
+    process.stderr.write(
+      `[extract-conversation-facts] ${sourceId}: knowledge rows → source ${route.outputSourceId} ` +
+      `(visibility=${route.visibility}); pages, checkpoints and audit rows stay in ${sourceId}\n`,
+    );
+  }
+
   // v0.41.15.0 (D9): resolve effective worker count via the PGLite-clamp
   // wrapper. Embedded engines silently become serial; the explicit
   // override + auto-concurrency rules from sync-concurrency.ts apply on
@@ -1361,6 +1476,7 @@ export async function runExtractConversationFactsCore(
     result,
     engine,
     sourceId,
+    route,
     dryRun,
     sleepMs,
     segmentLimit,
@@ -1412,7 +1528,7 @@ export async function runExtractConversationFactsCore(
             // Close the race between batch selection and lock acquisition.
             if (!opts.force) {
               const outcome = (
-                await findFreshExtractionOutcomes(engine, sourceId, [currentPage])
+                await findFreshExtractionOutcomes(engine, sourceId, [currentPage], route)
               ).get(currentPage.slug);
               if (outcome) {
                 recordDurableOutcomeSkip(state, outcome);
@@ -1425,7 +1541,13 @@ export async function runExtractConversationFactsCore(
             // delete-orphans-first makes that replay deterministic.
             state.cpMap.delete(cpMapKey(sourceId, currentPage.slug));
             const snapshot = await preparePageSnapshot(engine, currentPage);
-            return processPage(state, snapshot, opts.sinceIso);
+            if (!route.bridged) return processPage(state, snapshot, opts.sinceIso);
+            return withRefreshingLock(
+              engine,
+              extractConversationFactsOutputLockId(route.outputSourceId, page.slug),
+              () => processPage(state, snapshot, opts.sinceIso),
+              { ttlMinutes: PER_PAGE_LOCK_TTL_MINUTES },
+            );
           },
           { ttlMinutes: PER_PAGE_LOCK_TTL_MINUTES },
         ).then(() => undefined);
@@ -1507,6 +1629,7 @@ export async function runExtractConversationFactsCore(
               engine,
               sourceId,
               claimable,
+              route,
             );
             claimable = claimable.filter((page) => {
               const outcome = fresh.get(page.slug);
@@ -1580,7 +1703,7 @@ export async function runExtractConversationFactsCore(
       await body();
     } else {
       const tracker = new BudgetTracker({
-        maxCostUsd: opts.maxCostUsd ?? DEFAULT_MAX_COST_USD,
+        maxCostUsd: opts.noCostCap ? undefined : (opts.maxCostUsd ?? DEFAULT_MAX_COST_USD),
         label: `extract-conversation-facts:${sourceId}`,
         pricingOverrides: await loadPricingOverrides(engine),
       });
@@ -1600,7 +1723,7 @@ export async function runExtractConversationFactsCore(
       // Fall through to receipt+rollup write so the partial run is
       // still observable in extract_health doctor + extracts/ pages.
       // ...but not under --dry-run: a preview must not persist cache state.
-      if (!dryRun) await writeRunReceiptAndRollup(engine, sourceId, result, /* halted */ true);
+      if (!dryRun) await writeRunReceiptAndRollup(engine, sourceId, result, /* halted */ true, route);
       // Return partial result — caller (CLI / Minion) decides how to
       // surface. NOT a thrown failure.
       return result;
@@ -1634,6 +1757,7 @@ export async function runExtractConversationFactsCore(
       sourceId,
       result,
       /* halted */ result.budget_exhausted === true,
+      route,
     );
   }
 
@@ -1655,6 +1779,7 @@ async function writeRunReceiptAndRollup(
   sourceId: string,
   result: ExtractConversationFactsResult,
   halted: boolean,
+  route?: ConversationFactsRoute,
 ): Promise<void> {
   const now = new Date().toISOString();
   // run_id: stable-ish identifier for this run. Includes day so multiple
@@ -1676,6 +1801,9 @@ async function writeRunReceiptAndRollup(
         summary:
           `Extracted ${result.facts_inserted} facts from ` +
           `${result.pages_processed}/${result.pages_considered} eligible pages` +
+          (route?.bridged
+            ? ` into source ${route.outputSourceId} (visibility ${route.visibility})`
+            : '') +
           (result.pages_failed > 0
             ? `; ${result.pages_failed} page(s) failed and remain unfinished.`
             : '.'),
@@ -1709,31 +1837,9 @@ async function writeRunReceiptAndRollup(
   });
 }
 
-/**
- * Look up the max row_num already in facts for this (source_id, slug),
- * so the page-global accumulator continues from the right place on resume.
- */
-async function peekRowNumStart(
-  engine: BrainEngine,
-  sourceId: string,
-  slug: string,
-): Promise<number> {
-  try {
-    const rows = await engine.executeRaw<{ max_row: number | null }>(
-      `SELECT COALESCE(MAX(row_num), -1) AS max_row
-         FROM facts
-        WHERE source_id = $1 AND source_markdown_slug = $2`,
-      [sourceId, slug],
-    );
-    const maxRow = rows[0]?.max_row ?? -1;
-    return Number(maxRow) + 1;
-  } catch {
-    // Pre-migration brains may not have source_markdown_slug populated.
-    // Fall back to 0; insertFacts will fail with a clearer error if
-    // there's a real collision.
-    return 0;
-  }
-}
+// peekRowNumStart (max row_num for a (source_id, slug) pair) now lives in
+// ../core/facts/conversation-bridge.ts, shared by the same-source dry-run
+// fallback and the bridged append path.
 
 // ---------------------------------------------------------------------------
 // CLI parsing + handler.
@@ -1750,15 +1856,20 @@ interface ParsedArgs {
   sleepMs?: number;
   segmentLimit?: number;
   maxCostUsd?: number;
+  noCostCap?: boolean;
   overrideDisabled?: boolean;
   /** v0.41.15.0 (D9): in-process parallel workers per source. */
   workers?: number;
+  /** One-way bridge: source that receives the extracted knowledge rows. */
+  outputSourceId?: string;
+  /** Visibility stamped on the extracted knowledge rows. */
+  visibility?: FactVisibility;
   yes?: boolean;
   help?: boolean;
   error?: string;
 }
 
-function parseArgs(args: string[]): ParsedArgs {
+export function parseArgs(args: string[]): ParsedArgs {
   const out: ParsedArgs = {};
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -1767,8 +1878,32 @@ function parseArgs(args: string[]): ParsedArgs {
     if (a === '--force') { out.force = true; continue; }
     if (a === '--yes' || a === '-y') { out.yes = true; continue; }
     if (a === '--override-disabled') { out.overrideDisabled = true; continue; }
+    if (a === '--no-cost-cap') { out.noCostCap = true; continue; }
     if (a === '--slug') { out.slug = args[++i]; continue; }
     if (a === '--source-id') { out.sourceId = args[++i]; continue; }
+    if (a === '--output-source-id') {
+      const v = args[++i];
+      if (!v || v.startsWith('--')) {
+        out.error = '--output-source-id needs a source id';
+        return out;
+      }
+      out.outputSourceId = v;
+      continue;
+    }
+    if (a === '--visibility') {
+      try {
+        const v = parseVisibilityToken(args[++i]);
+        if (v === undefined) {
+          out.error = '--visibility needs a value: world | private';
+          return out;
+        }
+        out.visibility = v;
+      } catch (e) {
+        out.error = (e as Error).message;
+        return out;
+      }
+      continue;
+    }
     if (a === '--since') { out.sinceIso = args[++i]; continue; }
     if (a === '--types') {
       const v = args[++i] ?? '';
@@ -1821,6 +1956,9 @@ function parseArgs(args: string[]): ParsedArgs {
       out.error = `Invalid --since: ${out.sinceIso}`;
     }
   }
+  if (out.noCostCap && out.maxCostUsd !== undefined) {
+    out.error = '--no-cost-cap cannot be combined with --max-cost-usd';
+  }
   return out;
 }
 
@@ -1835,6 +1973,20 @@ chunk-level embedding loses on long conversations.
 
 Options:
   --source-id <id>       Source to operate on (default: 'default').
+  --output-source-id <id>
+                         One-way bridge: write the extracted KNOWLEDGE rows into
+                         this source instead of --source-id. Page reads, entity
+                         resolution, locks, checkpoints, receipts and the durable
+                         audit rows stay in --source-id; only the fact rows cross.
+                         Bridged rows carry source=cli:conversation-facts-bridge:<in>
+                         and append after existing row_nums in the output source.
+                         Must be a registered, non-archived source.
+                         Default: same as --source-id (unchanged behavior).
+  --visibility <v>       world | private — visibility stamped on the extracted
+                         knowledge rows. world = readable by remote/MCP callers.
+                         Default: facts.default_visibility config, else private.
+                         Audit rows stay in the input source and use the same
+                         resolved visibility.
   --types <list>         Comma-separated subset of: ${ALLOWED_TYPES.join(', ')}.
                          Default: reads cycle.conversation_facts_backfill.types config
                          (falls back to the full allowlist).
@@ -1846,7 +1998,9 @@ Options:
   --sleep <ms>           Delay between extractor calls (default ${DEFAULT_INTER_CALL_SLEEP_MS}).
   --segment-limit <N>    Max segments per page (0 = unlimited).
   --max-cost-usd <FLOAT> Cost cap for this run (default ${DEFAULT_MAX_COST_USD}).
-                         NOTE: under --workers N, the cap can be exceeded by up to
+  --no-cost-cap          Disable the dollar gate; spend is still measured and reported.
+                         Cannot be combined with --max-cost-usd.
+                         NOTE: under --workers N, a configured cap can be exceeded by up to
                          N × per-page-cost because per-worker reserve() calls aren't
                          serialized. At workers=20 × ~$0.02/page that's ~$0.40 over.
                          Pin --workers 1 if you need exact-ceiling compliance.
@@ -1865,13 +2019,21 @@ sources from gbrain sources list. Per-source budget cap defaults to
 --max-cost-usd; the brain-wide cap when running via the autopilot cycle
 phase is cycle.conversation_facts_backfill.max_total_cost_usd.
 
+Bridge example (raw conversation pages isolated in a non-federated source,
+extracted knowledge usable brain-wide):
+  gbrain extract-conversation-facts --source-id transcripts \\
+    --output-source-id default --visibility world --yes
+Re-running is idempotent: pages with a fresh terminal outcome in the input
+source are skipped; --force replays a page (delete-first on BOTH sides).
+
 Resumability: per-page completion is durable via a terminal audit row
 in the facts table (source='${TERMINAL_AUDIT_SOURCE}'). gbrain doctor's
 conversation_facts_backlog check counts pages without this row.
 `;
 
-function buildJobParams(args: string[]): Record<string, unknown> {
+export function buildJobParams(args: string[]): Record<string, unknown> {
   const parsed = parseArgs(args);
+  if (parsed.error) throw new Error(parsed.error);
   return {
     sourceId: parsed.sourceId,
     types: parsed.types,
@@ -1883,12 +2045,16 @@ function buildJobParams(args: string[]): Record<string, unknown> {
     sleepMs: parsed.sleepMs,
     segmentLimit: parsed.segmentLimit,
     maxCostUsd: parsed.maxCostUsd,
+    noCostCap: parsed.noCostCap,
     overrideDisabled: parsed.overrideDisabled,
     // v0.41.15.0 (D9): thread workers through the Minion job envelope
     // so `gbrain extract-conversation-facts --background --workers 20`
     // round-trips. The handler in src/commands/jobs.ts reads
     // job.data.workers and passes to runExtractConversationFactsCore.
     workers: parsed.workers,
+    // Bridge route rides the same envelope (handler reads both keys).
+    outputSourceId: parsed.outputSourceId,
+    visibility: parsed.visibility,
   };
 }
 
@@ -1978,8 +2144,11 @@ export async function runExtractConversationFacts(
         sleepMs: parsed.sleepMs,
         segmentLimit: parsed.segmentLimit,
         maxCostUsd: parsed.maxCostUsd,
+        noCostCap: parsed.noCostCap,
         overrideDisabled: parsed.overrideDisabled,
         workers: parsed.workers,
+        outputSourceId: parsed.outputSourceId,
+        visibility: parsed.visibility,
       });
 
       aggregate.pages_considered += perSource.pages_considered;

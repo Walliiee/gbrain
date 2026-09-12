@@ -37,9 +37,20 @@
  *   cycle.conversation_facts_backfill.max_walltime_min     (20)
  *   cycle.conversation_facts_backfill.max_total_walltime_min (30)
  *   cycle.conversation_facts_backfill.types                (all of ALLOWED_TYPES — src/core/facts/conversation-types.ts)
+ *   cycle.conversation_facts_backfill.input_source_id      (required when bridge routing is configured)
+ *   cycle.conversation_facts_backfill.output_source_id     (unset → same source as the pages)
+ *   cycle.conversation_facts_backfill.visibility           (unset → facts.default_visibility, else private)
  *
  * `.types` is the single source of truth for "enabled types" — the CLI
  * default reads from the same key (Eng-v2 A2).
+ *
+ * `.output_source_id` / `.visibility` are the one-way extraction bridge
+ * (src/core/facts/conversation-bridge.ts) for the autopilot path: every
+ * source this phase walks bridges its knowledge rows into the named output
+ * source with the named visibility (a source equal to the output source is
+ * simply not bridged). Unset keeps the historical same-source/private
+ * behavior; an invalid or unknown output source fails that source's run
+ * before any model spend and is recorded per-source like any other error.
  */
 
 import type { BrainEngine } from '../engine.ts';
@@ -59,6 +70,8 @@ import {
 // binding extract-conversation-facts.ts re-exports) so this phase is part of
 // the drift-guarded set in test/conversation-facts-type-allowlist-drift.test.ts.
 import { ALLOWED_TYPES, type AllowedType } from '../facts/conversation-types.ts';
+import { parseVisibilityToken } from '../facts/conversation-bridge.ts';
+import type { FactVisibility } from '../engine.ts';
 
 /** Per-phase wrapper opts. */
 export interface ConversationFactsBackfillPhaseOpts {
@@ -99,11 +112,17 @@ interface ResolvedConfig {
    * opt-in via this config key. PGLite engines clamp to 1 regardless.
    */
   workers: number;
+  /** Restricts bridge visibility/routing to exactly one raw input source. */
+  inputSourceId?: string;
+  /** One-way bridge: output source for knowledge rows (undefined = same source). */
+  outputSourceId?: string;
+  /** One-way bridge: row visibility (undefined = shared facts ladder). */
+  visibility?: FactVisibility;
 }
 
 async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
   const get = (k: string) => engine.getConfig(`${CFG_PREFIX}.${k}`);
-  const [enabled, maxCost, maxTotalCost, maxWall, maxTotalWall, typesRaw, workersRaw] =
+  const [enabled, maxCost, maxTotalCost, maxWall, maxTotalWall, typesRaw, workersRaw, inputRaw, outputRaw, visibilityRaw] =
     await Promise.all([
       get('enabled'),
       get('max_cost_usd'),
@@ -112,6 +131,9 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
       get('max_total_walltime_min'),
       get('types'),
       get('workers'),
+      get('input_source_id'),
+      get('output_source_id'),
+      get('visibility'),
     ]);
 
   // Truthy-string parse mirrors isFactsExtractionEnabled.
@@ -152,6 +174,21 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
     return n;
   })();
 
+  // Bridge route. The output source id is passed through verbatim — the core
+  // validates it (regex + registered + not archived) per source run so a bad
+  // value surfaces as that source's error instead of being silently dropped
+  // here. A garbage visibility token is also left to the core to reject.
+  const inputTrimmed = inputRaw == null ? '' : inputRaw.trim();
+  const inputSourceId = inputTrimmed !== '' ? inputTrimmed : undefined;
+  const outputTrimmed = outputRaw == null ? '' : outputRaw.trim();
+  const outputSourceId = outputTrimmed !== '' ? outputTrimmed : undefined;
+  let visibility: FactVisibility | undefined;
+  try {
+    visibility = parseVisibilityToken(visibilityRaw);
+  } catch {
+    visibility = (visibilityRaw ?? undefined) as FactVisibility | undefined;
+  }
+
   return {
     enabled: enabledFlag,
     maxCostUsd: parseFloatOrDefault(maxCost, 1.0),
@@ -160,6 +197,9 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
     maxTotalWalltimeMin: parseFloatOrDefault(maxTotalWall, 30),
     types,
     workers: parsedWorkers,
+    inputSourceId,
+    outputSourceId,
+    visibility,
   };
 }
 
@@ -169,6 +209,16 @@ export async function runPhaseConversationFactsBackfill(
 ): Promise<ConversationFactsBackfillPhaseResult> {
   const cfg = await loadCfg(engine);
   const pricingOverrides = await loadPricingOverrides(engine);
+
+  if ((cfg.outputSourceId || cfg.visibility) && !cfg.inputSourceId) {
+    return {
+      phase: 'conversation_facts_backfill',
+      status: 'fail',
+      duration_ms: 0,
+      summary: 'bridge routing requires cycle.conversation_facts_backfill.input_source_id',
+      details: { error: 'bridge_input_source_required' },
+    };
+  }
 
   if (!cfg.enabled) {
     if (!opts.once) {
@@ -194,7 +244,19 @@ export async function runPhaseConversationFactsBackfill(
   const maxTotalWalltimeMs = cfg.maxTotalWalltimeMin * 60_000;
   const maxWalltimeMs = cfg.maxWalltimeMin * 60_000;
 
-  const sources = await listSources(engine);
+  const allSources = await listSources(engine);
+  const sources = cfg.inputSourceId
+    ? allSources.filter((source) => source.id === cfg.inputSourceId)
+    : allSources;
+  if (cfg.inputSourceId && sources.length === 0) {
+    return {
+      phase: 'conversation_facts_backfill',
+      status: 'fail',
+      duration_ms: Date.now() - startedAt,
+      summary: `configured input source ${cfg.inputSourceId} is not registered`,
+      details: { error: 'bridge_input_source_not_found', input_source_id: cfg.inputSourceId },
+    };
+  }
   if (sources.length === 0) {
     return {
       phase: 'conversation_facts_backfill',
@@ -303,6 +365,10 @@ export async function runPhaseConversationFactsBackfill(
             // per-source worker count. Default 1 — opt-in concurrency
             // for cycle paths.
             workers: cfg.workers,
+            // One-way bridge (config-driven for autopilot). A source equal
+            // to the output source is simply not bridged.
+            outputSourceId: cfg.outputSourceId,
+            visibility: cfg.visibility,
           }, controller.signal),
         );
         perSourceResults[src.id] = result;
@@ -429,6 +495,10 @@ export async function runPhaseConversationFactsBackfill(
       max_walltime_min: cfg.maxWalltimeMin,
       max_total_cost_usd: cfg.maxTotalCostUsd,
       max_total_walltime_min: cfg.maxTotalWalltimeMin,
+      // Bridge route in effect (null = same-source / ladder default).
+      input_source_id: cfg.inputSourceId ?? null,
+      output_source_id: cfg.outputSourceId ?? null,
+      visibility: cfg.visibility ?? null,
       per_source: perSourceResults,
     },
   };

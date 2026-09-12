@@ -2306,11 +2306,19 @@ export async function registerBuiltinHandlers(
       sleepMs: typeof job.data.sleepMs === 'number' ? job.data.sleepMs : undefined,
       segmentLimit: typeof job.data.segmentLimit === 'number' ? job.data.segmentLimit : undefined,
       maxCostUsd: typeof job.data.maxCostUsd === 'number' ? job.data.maxCostUsd : undefined,
+      noCostCap: job.data.noCostCap === true,
       overrideDisabled: !!job.data.overrideDisabled,
       // v0.41.15.0 (D9): round-trip --workers via job.data.workers so
       // `gbrain extract-conversation-facts --background --workers 20`
       // works end-to-end.
       workers: typeof job.data.workers === 'number' ? job.data.workers : undefined,
+      // One-way bridge route (output source + row visibility). The core
+      // validates both; an unknown output source fails the job before spend.
+      outputSourceId: typeof job.data.outputSourceId === 'string' ? job.data.outputSourceId : undefined,
+      visibility:
+        job.data.visibility === 'world' ? 'world'
+          : job.data.visibility === 'private' ? 'private'
+          : undefined,
     });
     return result;
   });

@@ -15,7 +15,7 @@
  * pre-check is the sweep pattern).
  */
 
-import type { BrainEngine } from '../engine.ts';
+import type { BrainEngine, FactVisibility } from '../engine.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
 import { BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
 import { withBudgetTracker } from '../ai/gateway.ts';
@@ -32,7 +32,16 @@ export interface IngestFactsResult {
 
 export async function runIngestFacts(
   engine: BrainEngine,
-  opts: { sourceId: string; slugs: string[]; maxCostUsd?: number; quiet?: boolean },
+  opts: {
+    sourceId: string;
+    slugs: string[];
+    maxCostUsd?: number;
+    quiet?: boolean;
+    /** One-way bridge: source that receives the extracted knowledge rows. */
+    outputSourceId?: string;
+    /** One-way bridge: visibility stamped on the extracted knowledge rows. */
+    visibility?: FactVisibility;
+  },
 ): Promise<IngestFactsResult> {
   if (!(await isFactsExtractionEnabled(engine))) {
     if (!opts.quiet) {
@@ -54,6 +63,8 @@ export async function runIngestFacts(
       sourceId: opts.sourceId,
       slugs: opts.slugs,
       budgetTracker: tracker,
+      outputSourceId: opts.outputSourceId,
+      visibility: opts.visibility,
     }),
   );
   return { pages: opts.slugs.length, spentUsd: tracker.totalSpent };

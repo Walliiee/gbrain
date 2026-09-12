@@ -187,6 +187,24 @@ describe('extract_atoms progress wiring (T4)', () => {
     expect(result.details.budget_usd).toBe(0.12);
   });
 
+  test('DB config can disable the extract_atoms dollar gate', async () => {
+    await engine.setConfig('models.dream.extract_atoms', 'anthropic:claude-haiku-4-5-20251001');
+    await engine.setConfig('cycle.extract_atoms.budget_usd', 'off');
+    const validAtomJson = JSON.stringify([
+      { title: 'A', atom_type: 'insight', body: 'body a' },
+    ]);
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default',
+      _transcripts: [
+        { filePath: '/tmp/t1.txt', content: 'transcript 1 body', contentHash: 'h1'.repeat(8) },
+      ],
+      _pages: [],
+      _chat: stubChat(validAtomJson),
+    });
+    expect(result.details.budget_usd).toBeNull();
+    expect(result.details.budget_exhausted).toBe(false);
+  });
+
   test('no progress wiring required — opts.progress is optional', async () => {
     // Sanity: phase works without a reporter.
     const result = await runPhaseExtractAtoms(engine, {
