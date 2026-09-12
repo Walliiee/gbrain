@@ -556,6 +556,8 @@ async function runPipelineBodyInner(
     abortSignal,
     model: ctx.model,
     notabilityAdmission,
+    // Bounded live-anchor list from the source the rows are written to.
+    anchorSourceId: ctx.sourceId,
   });
 
   if (!outcome.ok) {

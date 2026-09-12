@@ -29,6 +29,11 @@ import { resolveModel } from '../model-config.ts';
 import { normalizeModelId } from '../model-id.ts';
 import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
 import { normalizeMetricLabel } from './extract-from-fence.ts';
+import {
+  loadAnchorInventory,
+  renderAnchorInventoryBlock,
+  type AnchorInventory,
+} from './anchor-inventory.ts';
 
 /**
  * v0.31 (D15): kill-switch for fact extraction.
@@ -183,6 +188,15 @@ export interface ExtractInput {
   sessionId?: string | null;
   /** Existing canonical entity slugs the agent already resolved (D4 hint). */
   entityHints?: string[];
+  /**
+   * Source whose LIVE anchor pages are offered to the model as a bounded
+   * closed list (see anchor-inventory.ts). Pass the source the rows are
+   * WRITTEN to — on a bridged transcript run that is the output source.
+   * Omit to keep the unchanged base prompt. Requires `engine`.
+   */
+  anchorSourceId?: string;
+  /** Pre-loaded inventory; wins over `anchorSourceId`. Test/bench seam. */
+  anchorInventory?: AnchorInventory;
   /** Source identifier for provenance — e.g. 'mcp:put_page' or 'mcp:extract_facts'. */
   source: string;
   /**
@@ -421,13 +435,25 @@ export async function extractFactsFromTurnWithOutcome(
   // because those reuse `extractorSystem`. Read AFTER the availability gate —
   // a chat_unavailable early return must not pay config round-trips (#4298
   // resolved the model/gate ordering; these reads sit behind it).
-  const [promptAppendix, junkFilterOn] = await Promise.all([
+  // Anchor inventory (2026-09-12): a bounded, source-local list of live
+  // anchor pages composes AFTER the appendix and rides every retry the same
+  // way. Loaded here — behind the availability gate — so a chat_unavailable
+  // return never pays the query. Empty inventory renders '' and leaves the
+  // prompt byte-identical to the pre-change shape.
+  const [promptAppendix, junkFilterOn, anchorInventory] = await Promise.all([
     getFactsExtractionPromptAppendix(input.engine),
     isJunkFilterEnabled(input.engine),
+    input.anchorInventory
+      ? Promise.resolve(input.anchorInventory)
+      : input.anchorSourceId && input.engine
+        ? loadAnchorInventory(input.engine, input.anchorSourceId)
+        : Promise.resolve(null),
   ]);
-  const extractorSystem = promptAppendix
-    ? `${buildExtractorSystem(admitsLow)}\n\n${promptAppendix}`
-    : buildExtractorSystem(admitsLow);
+  const extractorSystem = [
+    buildExtractorSystem(admitsLow),
+    promptAppendix,
+    renderAnchorInventoryBlock(anchorInventory),
+  ].filter(Boolean).join('\n\n');
   const userContent = `<turn>\n${cleaned}\n</turn>\n\nExtract up to ${cap} facts.${
     input.entityHints && input.entityHints.length
       ? ` Known entity slugs the user already mentioned: ${input.entityHints.slice(0, ENTITY_HINTS_CAP).join(', ')}.`

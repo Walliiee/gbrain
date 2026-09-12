@@ -1147,6 +1147,9 @@ async function processPage(
     // DEFAULT production path is master's fail-hard-with-reason contract: a
     // per-segment extraction failure aborts the page rather than silently
     // dropping facts.
+    // The anchor inventory is scoped to the OUTPUT source — where the rows
+    // and their entity pages live — the same boundary as the save-time
+    // resolver below.
     let extracted: ExtractedFact[];
     if (state.extractor) {
       extracted = await state.extractor({
@@ -1155,6 +1158,7 @@ async function processPage(
         source: factSource,
         engine: state.engine,
         abortSignal: state.signal,
+        anchorSourceId: route.outputSourceId,
       });
     } else {
       const extraction = await extractFactsFromTurnWithOutcome({
@@ -1163,6 +1167,7 @@ async function processPage(
         source: factSource,
         engine: state.engine,
         abortSignal: state.signal,
+        anchorSourceId: route.outputSourceId,
       });
       if (!extraction.ok) {
         // #3669 — rethrow BudgetExhausted UNWRAPPED. Wrapping it in a plain

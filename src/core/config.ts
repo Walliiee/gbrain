@@ -1391,6 +1391,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // #3852: kill-switch for the deterministic junk gate on extracted fact text
   // (plan narration / provider error strings / meta-chatter). Default on.
   'facts.extraction_junk_filter',
+  // 2026-09-12: kill-switch for the bounded source-local anchor inventory
+  // appended to the facts extractor prompt (src/core/facts/anchor-inventory.ts).
+  // Default on; `false` restores the pre-change prompt without a redeploy.
+  'facts.extraction_anchor_inventory',
   // [ENG-8] Brain-level default visibility for facts writes when the caller
   // didn't specify one: 'private' (default) | 'world'. Resolved by
   // src/core/facts/visibility.ts; explicit caller values always win.
