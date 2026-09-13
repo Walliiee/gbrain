@@ -341,7 +341,12 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
 export type PhaseStatus = 'ok' | 'warn' | 'fail' | 'skipped';
 
 export interface PhaseError {
-  /** Error class for machine branching — e.g., 'DatabaseConnection', 'Timeout', 'LLMError', 'FilesystemError', 'InternalError'. */
+  /**
+   * Error class for machine branching — e.g., 'DatabaseConnection', 'Timeout',
+   * 'LLMError', 'FilesystemError', 'InternalError'. 'Halted' means the phase
+   * refused to run behind a guard (nothing threw); every other class is a
+   * phase that ran and errored.
+   */
   class: string;
   /** System error code or short identifier, e.g., 'ECONNREFUSED', 'ETIMEDOUT', 'UNKNOWN'. */
   code: string;
@@ -1476,20 +1481,28 @@ async function runPhaseExtractFacts(
     });
 
     // Empty-fence guard: pre-v51 legacy rows pending the v0_32_2 backfill.
-    // Surface as 'warn' so doctor + the cycle report can see it; don't fail
-    // the cycle because the workaround is well-defined (run apply-migrations).
+    // The phase did NOT run. That is a dead phase, not a warning: 'warn'
+    // rendered as `!`, which the nightly wrapper's dead-phase detector
+    // (`✗` only) never saw, so extract_facts sat halted on two sources for
+    // a night behind a "DONE: N source(s) cycled OK". 'fail' with
+    // error.class 'Halted' keeps halt distinct from an errored phase (those
+    // carry makeErrorFromException classes) while rendering as `✗`. Cycle
+    // status is 'partial' either way, so this fails the cycle no harder.
     if (result.guardTriggered) {
+      // A bare `apply-migrations --yes` no-ops once the v0.32.2 ledger
+      // entry is complete; the retry marker is what re-runs Phase B.
+      const hint = `gbrain apply-migrations --force-retry 0.32.2 && gbrain apply-migrations --yes --source ${sourceId}`;
       return {
         phase: 'extract_facts',
-        status: 'warn',
+        status: 'fail',
         duration_ms: 0,
-        summary: `extract_facts skipped: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill`,
-        details: {
-          legacyRowsPending: result.legacyRowsPending,
-          // A bare `apply-migrations --yes` no-ops once the v0.32.2 ledger
-          // entry is complete; the retry marker is what re-runs Phase B.
-          hint: 'gbrain apply-migrations --force-retry 0.32.2 && gbrain apply-migrations --yes',
-          warnings: result.warnings,
+        summary: `extract_facts halted: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill`,
+        details: { halted: true, legacyRowsPending: result.legacyRowsPending, hint, warnings: result.warnings },
+        error: {
+          class: 'Halted',
+          code: 'FENCE_BACKFILL_PENDING',
+          message: `phase did not run: ${result.legacyRowsPending} legacy v0.31 fact rows in source "${sourceId}" await the v0.32.2 fence backfill`,
+          hint,
         },
       };
     }
