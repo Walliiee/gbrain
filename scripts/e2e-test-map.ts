@@ -15,6 +15,13 @@
 // No brace expansion, no ?, no [ ].
 
 export const E2E_TEST_MAP: Record<string, string[]> = {
+  // Legacy-fact stamp mode (2026-09-13): the writer's transaction / array
+  // params / RETURNING / unique-index behaviour is engine-specific, so any
+  // change to the writer, its caller, or the reconcile it feeds runs the
+  // Postgres parity suite (self-skips without DATABASE_URL).
+  "src/core/facts/fence-write.ts": ["test/e2e/facts-legacy-repair-postgres.test.ts"],
+  "src/core/facts/fence-legacy.ts": ["test/e2e/facts-legacy-repair-postgres.test.ts"],
+  "src/core/cycle/extract-facts.ts": ["test/e2e/facts-legacy-repair-postgres.test.ts"],
   // OpenRouter subagent-loop families: the family allowlist + recipe feed the
   // key-gated live DeepSeek replay (self-skips without OPENROUTER_API_KEY).
   "src/core/ai/openrouter-families.ts": ["test/e2e/openrouter-deepseek-subagent-replay.live.test.ts"],

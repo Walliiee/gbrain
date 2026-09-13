@@ -631,7 +631,7 @@ function legacyIsoDate(v: Date | string | null | undefined): string | undefined 
 }
 
 function legacyKey(claim: string, source: string | null | undefined): string {
-  return `${claim} ${source ?? ''}`;
+  return `${claim}\u0000${source ?? ''}`;
 }
 
 /** Every assignment present in `body`'s fence with the expected claim. */
