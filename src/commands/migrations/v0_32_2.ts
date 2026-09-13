@@ -28,6 +28,16 @@
  * fence onto). They're skipped with a warning; the operator decides
  * whether to hand-curate or delete them. Their row_num stays NULL
  * forever; they live in the legacy keyspace permanently.
+ *
+ * Source scoping (`--source <id>`, 2026-09-13): phases B and C confine
+ * themselves to ONE source — its legacy rows, its working tree, its
+ * pages. Before this the legacy-row walk was brain-wide and the
+ * dirty-tree refusal covered every source that held a row, so draining
+ * one source's backlog meant committing every repo clean at the same
+ * moment. A scoped run that leaves fenceable rows in OTHER sources
+ * finishes `partial` (the migration is not brain-wide complete); the
+ * ledger's "complete wins" rule means this never regresses an already-
+ * complete brain. No `--source` = brain-wide, unchanged.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
@@ -121,6 +131,19 @@ interface SourceLookup {
   local_path: string | null;
 }
 
+/** Fenceable legacy rows a scoped run left in some OTHER source. */
+interface PendingElsewhere {
+  source_id: string;
+  n: number;
+}
+
+/**
+ * Phase B's result. `pending_elsewhere` is populated only on a scoped run
+ * (`opts.sourceId`); the orchestrator reads it and strips it before the
+ * result reaches the ledger, so the persisted phase shape is unchanged.
+ */
+type FencePhaseResult = OrchestratorPhaseResult & { pending_elsewhere?: PendingElsewhere[] };
+
 interface PhaseBOutcome {
   scanned: number;
   fenced: number;
@@ -153,23 +176,32 @@ function isLocalPathDirty(localPath: string): boolean {
 async function phaseBFenceFacts(
   engine: BrainEngine | null,
   opts: OrchestratorOpts,
-): Promise<OrchestratorPhaseResult> {
+): Promise<FencePhaseResult> {
+  // `--source <id>`: every legacy-row query below carries this predicate so
+  // a scoped run never reads, writes, or git-checks another source.
+  const scope = opts.sourceId;
+  const scopeSql = scope ? ' AND source_id = $1' : '';
+  const scopeParams = scope ? [scope] : [];
+
   if (opts.dryRun) {
     // Dry-run: report what WOULD happen without touching FS or DB.
     if (!engine) return { name: 'fence_facts', status: 'skipped', detail: 'no_brain_configured' };
     try {
       const counts = await engine.executeRaw<{ n: string }>(
-        `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL`,
+        `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL${scopeSql}`,
+        scopeParams,
       );
       const total = parseInt(counts[0]?.n ?? '0', 10);
       const noEntity = await engine.executeRaw<{ n: string }>(
-        `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND entity_slug IS NULL`,
+        `SELECT COUNT(*) AS n FROM facts WHERE row_num IS NULL AND entity_slug IS NULL${scopeSql}`,
+        scopeParams,
       );
       const noEntityCount = parseInt(noEntity[0]?.n ?? '0', 10);
       return {
         name: 'fence_facts',
         status: 'skipped',
-        detail: `dry-run: would fence ${total - noEntityCount} rows; ${noEntityCount} unfenceable (NULL entity_slug)`,
+        detail: `dry-run: would fence ${total - noEntityCount} rows; ${noEntityCount} unfenceable (NULL entity_slug)` +
+          (scope ? ` [scope=${scope}]` : ''),
       };
     } catch (e) {
       return { name: 'fence_facts', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
@@ -187,6 +219,15 @@ async function phaseBFenceFacts(
     );
     const localPathById = new Map<string, string | null>();
     for (const s of sources) localPathById.set(s.id, s.local_path);
+    // A scoped run against a source this brain doesn't know is an operator
+    // typo, not an empty backlog — fail loudly rather than report scanned=0.
+    if (scope && !localPathById.has(scope)) {
+      return {
+        name: 'fence_facts',
+        status: 'failed',
+        detail: `unknown source "${scope}". Run \`gbrain sources list\` for registered ids.`,
+      };
+    }
 
     // Walk legacy rows in (source_id, entity_slug) groups for per-page
     // atomic writes.
@@ -194,8 +235,9 @@ async function phaseBFenceFacts(
       `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
               context, valid_from, valid_until, source, confidence
          FROM facts
-        WHERE row_num IS NULL
+        WHERE row_num IS NULL${scopeSql}
         ORDER BY source_id, entity_slug, id`,
+      scopeParams,
     );
 
     const outcome: PhaseBOutcome = {
@@ -338,10 +380,37 @@ async function phaseBFenceFacts(
       }
     }
 
+    // Scoped run: name what a brain-wide run would still touch elsewhere
+    // (same fenceability rule as the walk above: legacy row, entity_slug
+    // set, source has a local_path). The orchestrator turns a non-empty
+    // list into `partial`, so the ledger cannot claim brain-wide completion
+    // off a one-source drain.
+    const pendingElsewhere: PendingElsewhere[] = [];
+    if (scope) {
+      const rows = await engine.executeRaw<{ source_id: string; n: string }>(
+        `SELECT f.source_id, COUNT(*) AS n
+           FROM facts f
+           JOIN sources s ON s.id = f.source_id
+          WHERE f.row_num IS NULL
+            AND f.entity_slug IS NOT NULL
+            AND s.local_path IS NOT NULL
+            AND f.source_id <> $1
+          GROUP BY f.source_id
+          ORDER BY f.source_id`,
+        [scope],
+      );
+      for (const r of rows) pendingElsewhere.push({ source_id: r.source_id, n: parseInt(r.n, 10) });
+    }
+
     const detail = `scanned=${outcome.scanned} fenced=${outcome.fenced} ` +
       `pages=${outcome.pages_touched} skipped_no_entity=${outcome.skipped_no_entity} ` +
       `skipped_no_local_path=${outcome.skipped_no_local_path}` +
-      (outcome.failed_pages.length > 0 ? ` failed=${outcome.failed_pages.length}` : '');
+      (outcome.failed_pages.length > 0 ? ` failed=${outcome.failed_pages.length}` : '') +
+      (scope ? ` [scope=${scope}` +
+        (pendingElsewhere.length > 0
+          ? `; still pending elsewhere: ${pendingElsewhere.map(p => `${p.source_id}=${p.n}`).join(' ')}`
+          : '') +
+        ']' : '');
 
     if (outcome.failed_pages.length > 0) {
       return {
@@ -350,7 +419,7 @@ async function phaseBFenceFacts(
         detail: `${detail} :: ${outcome.failed_pages.slice(0, 3).join(' | ')}${outcome.failed_pages.length > 3 ? '...' : ''}`,
       };
     }
-    return { name: 'fence_facts', status: 'complete', detail };
+    return { name: 'fence_facts', status: 'complete', detail, pending_elsewhere: pendingElsewhere };
   } catch (e) {
     return { name: 'fence_facts', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
   }
@@ -378,12 +447,16 @@ async function phaseCVerify(
     // (chat-log shape is the source of truth). Same cli: exclusion as
     // extract_facts reconciliation. Counting them here fails every brain
     // that ran extract-conversation-facts.
+    // `--source`: verify only the scoped source's pages. Drift in another
+    // repo is not this run's business (it is the exact cross-repo coupling
+    // the flag exists to remove).
     const groups = await engine.executeRaw<{ source_id: string; source_markdown_slug: string; n: string }>(
       `SELECT source_id, source_markdown_slug, COUNT(*) AS n
          FROM facts
         WHERE row_num IS NOT NULL
-          AND COALESCE(source, '') NOT LIKE 'cli:%'
+          AND COALESCE(source, '') NOT LIKE 'cli:%'${opts.sourceId ? ' AND source_id = $1' : ''}
         GROUP BY source_id, source_markdown_slug`,
+      opts.sourceId ? [opts.sourceId] : [],
     );
 
     const mismatches: string[] = [];
@@ -426,6 +499,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   console.log('');
   console.log('=== v0.32.2 — facts join the system-of-record invariant ===');
   if (opts.dryRun) console.log('  (dry-run; no side effects)');
+  if (opts.sourceId) console.log(`  (scoped to source "${opts.sourceId}"; other sources untouched)`);
   console.log('');
 
   const engine = await getEngine();
@@ -435,15 +509,29 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   phases.push(a);
   if (a.status === 'failed') return finalizeResult(phases, 'failed', engine);
 
-  const b = await phaseBFenceFacts(engine, opts);
+  const { pending_elsewhere: pendingElsewhere = [], ...b } = await phaseBFenceFacts(engine, opts);
   phases.push(b);
   if (b.status === 'failed') return finalizeResult(phases, 'failed', engine);
 
   const c = await phaseCVerify(engine, opts);
   phases.push(c);
 
+  // A scoped run that fenced its source cleanly is still not the whole
+  // migration while other sources hold fenceable rows: report `partial` so
+  // the ledger never records brain-wide completion off a one-source drain.
+  // (On a brain whose ledger already says complete, "complete wins" — the
+  // next run still needs the --force-retry marker, exactly as before.)
+  if (pendingElsewhere.length > 0) {
+    console.log(
+      `  fence backfill scoped to "${opts.sourceId}" is done; fenceable legacy rows remain in: ` +
+      pendingElsewhere.map(p => `${p.source_id} (${p.n})`).join(', ') +
+      `. Drain them with \`gbrain apply-migrations --force-retry 0.32.2\` then ` +
+      `\`gbrain apply-migrations --yes --source <id>\` per source (only that tree must be clean), ` +
+      `or \`--yes\` alone for every source at once.`,
+    );
+  }
   const overallStatus: 'complete' | 'partial' | 'failed' =
-    c.status === 'failed' ? 'partial' : 'complete';
+    c.status === 'failed' || pendingElsewhere.length > 0 ? 'partial' : 'complete';
 
   return finalizeResult(phases, overallStatus, engine);
 }

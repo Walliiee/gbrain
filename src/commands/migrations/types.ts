@@ -32,6 +32,14 @@ export interface OrchestratorOpts {
   hostDir?: string;
   /** Skip autopilot install (Phase F). */
   noAutopilotInstall: boolean;
+  /**
+   * `--source <id>`: confine a data migration to ONE source. Honoured by
+   * orchestrators whose phases walk per-source repos (v0.32.2 fence
+   * backfill: legacy-row query + dirty-tree check + verify all scope to
+   * this source); ignored by brain-wide orchestrators. Absent = brain-wide,
+   * exactly the pre-flag behaviour.
+   */
+  sourceId?: string;
 }
 
 export interface OrchestratorPhaseResult {

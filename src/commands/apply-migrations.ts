@@ -46,6 +46,13 @@ interface ApplyMigrationsArgs {
   skipVerify?: boolean;
   /** #4364: exit 1 when the DB pre-flight probe fails instead of proceeding filesystem-only. */
   requireDb: boolean;
+  /**
+   * `--source <id>`: confine source-scoped data migrations (v0.32.2 fence
+   * backfill) to one source. Brain-wide when absent. Was silently ignored
+   * before 2026-09-13, which turned a one-source drain into a
+   * commit-every-repo-at-once problem.
+   */
+  sourceId?: string;
   help: boolean;
 }
 
@@ -58,6 +65,11 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
   const mode = val('--mode') as ApplyMigrationsArgs['mode'];
   if (mode && !['always', 'pain_triggered', 'off'].includes(mode)) {
     console.error(`Invalid --mode "${mode}". Allowed: always, pain_triggered, off.`);
+    process.exit(2);
+  }
+  const sourceId = val('--source');
+  if (has('--source') && (sourceId === undefined || sourceId.startsWith('-') || sourceId.trim() === '')) {
+    console.error('--source requires a source id (e.g. --source shared).');
     process.exit(2);
   }
   return {
@@ -75,6 +87,7 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
     forceAll: has('--force-all') || has('--force'),
     skipVerify: has('--skip-verify'),
     requireDb: has('--require-db'),
+    sourceId,
     help: has('--help') || has('-h'),
   };
 }
@@ -113,6 +126,13 @@ Flags:
                                          (default scope: \$HOME/.claude + \$HOME/.openclaw).
   --no-autopilot-install                 Skip the Phase F autopilot install step.
   --non-interactive                      Equivalent to --yes; never prompt.
+  --source <id>                          Confine source-scoped data migrations to
+                                         one source. v0.32.2 fence backfill: only
+                                         that source's legacy rows are fenced, only
+                                         its working tree must be clean, and the
+                                         run reports PARTIAL while other sources
+                                         still hold fenceable rows. Brain-wide
+                                         orchestrators ignore it. Default: all.
 
 Exit codes:
   0  Success (including "nothing to do").
@@ -297,6 +317,7 @@ function orchestratorOptsFrom(cli: ApplyMigrationsArgs): OrchestratorOpts {
     dryRun: cli.dryRun,
     hostDir: cli.hostDir,
     noAutopilotInstall: cli.noAutopilotInstall,
+    sourceId: cli.sourceId,
   };
 }
 
@@ -570,6 +591,7 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
 /** Exported for unit tests only. Do not use from production code. */
 export const __testing = {
   parseArgs,
+  orchestratorOptsFrom,
   buildPlan,
   indexCompleted,
   statusForVersion,

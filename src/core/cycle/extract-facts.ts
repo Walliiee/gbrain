@@ -359,7 +359,8 @@ export async function runExtractFacts(
       `extract_facts: ${legacyCount} legacy v0.31 fact rows in source "${sourceId}" ` +
       `(entity page present, not yet fenced) pending fence backfill. Re-run the v0.32.2 ` +
       `fence backfill: \`gbrain apply-migrations --force-retry 0.32.2\` then ` +
-      `\`gbrain apply-migrations --yes\`. Or drain individual rows via \`forget_fact\`.`,
+      `\`gbrain apply-migrations --yes --source ${sourceId}\` (only this source's tree ` +
+      `must be clean). Or drain individual rows via \`forget_fact\`.`,
     );
     // #3683: book the halt BEFORE the early return. The end-of-run rollup
     // write below is unreachable from this path, so pre-fix a guard-triggered
