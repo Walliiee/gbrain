@@ -10,6 +10,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } fr
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
@@ -21,7 +22,6 @@ import { parseFactsFence } from '../src/core/facts-fence.ts';
 let engine: PGLiteEngine;
 let brainDir: string;
 let home: string;
-let journalDir: string;
 
 const SRC = 'wiki';
 const ALICE_BODY = '---\ntype: person\ntitle: Alice\n---\n\n# Alice\n\nA person.\n';
@@ -40,9 +40,12 @@ beforeEach(async () => {
   await resetPgliteState(engine);
   brainDir = mkdtempSync(join(tmpdir(), 'gbrain-xf-drain-'));
   home = mkdtempSync(join(tmpdir(), 'gbrain-xf-drain-home-'));
-  journalDir = join(home, 'journal');
   mkdirSync(join(brainDir, 'people'), { recursive: true });
   writeFileSync(join(brainDir, 'people/alice.md'), ALICE_BODY, 'utf-8');
+  // The stamp mode refuses files without a committed preimage: a git repo
+  // with the page committed is the real shape of every live source.
+  git('init', '-q'); git('config', 'user.email', 't@example.com'); git('config', 'user.name', 't');
+  git('config', 'commit.gpgsign', 'false'); git('add', '-A'); git('commit', '-q', '-m', 'seed');
   await engine.executeRaw(
     `INSERT INTO sources (id, name, local_path) VALUES ($1, $1, $2)
      ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path`,
@@ -59,6 +62,10 @@ afterEach(() => {
   rmSync(brainDir, { recursive: true, force: true });
   rmSync(home, { recursive: true, force: true });
 });
+
+function git(...args: string[]): string {
+  return execFileSync('git', ['-C', brainDir, ...args], { encoding: 'utf-8' });
+}
 
 async function seed(fact: string): Promise<void> {
   await engine.executeRaw(
@@ -83,7 +90,7 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
     await seed('Prefers async');
 
     const r = await withEnv({ GBRAIN_HOME: home }, () =>
-      runExtractFacts(engine, { sourceId: SRC, brainDir, repairJournalDir: journalDir }));
+      runExtractFacts(engine, { sourceId: SRC, brainDir }));
 
     expect(r.guardTriggered).toBe(false);
     expect(r.legacyRowsPending).toBe(0);
@@ -103,7 +110,7 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
 
     // A second run: guard does not arm, nothing to repair, reconcile is a no-op.
     const r2 = await withEnv({ GBRAIN_HOME: home }, () =>
-      runExtractFacts(engine, { sourceId: SRC, brainDir, repairJournalDir: journalDir }));
+      runExtractFacts(engine, { sourceId: SRC, brainDir }));
     expect(r2.guardTriggered).toBe(false);
     expect(r2.legacyRowsRepaired).toBe(0);
     expect(r2.legacyRepair).toBeUndefined();
@@ -119,7 +126,7 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
     await seed('Founded Acme');
 
     const r = await withEnv({ GBRAIN_HOME: home }, () =>
-      runExtractFacts(engine, { sourceId: SRC, brainDir, repairJournalDir: journalDir }));
+      runExtractFacts(engine, { sourceId: SRC, brainDir }));
 
     expect(r.guardTriggered).toBe(true);
     expect(r.legacyRowsPending).toBe(1);
@@ -131,31 +138,30 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
     expect((await activeRows())[0]!.row_num).toBeNull();
   });
 
-  test('GBRAIN_FACT_REPAIR=off restores the pure halt: nothing written, no journal', async () => {
+  test('GBRAIN_FACT_REPAIR=off restores the pure halt: nothing written', async () => {
     await seed('Founded Acme');
     const r = await withEnv({ GBRAIN_HOME: home, GBRAIN_FACT_REPAIR: 'off' }, () =>
-      runExtractFacts(engine, { sourceId: SRC, brainDir, repairJournalDir: journalDir }));
+      runExtractFacts(engine, { sourceId: SRC, brainDir }));
     expect(r.guardTriggered).toBe(true);
     expect(r.legacyRepair).toBeUndefined();
     expect(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8')).toBe(ALICE_BODY);
-    expect(existsSync(journalDir)).toBe(false);
     expect((await activeRows())[0]!.row_num).toBeNull();
   });
 
-  test('dry-run never repairs: guard reports, file/DB/journal untouched', async () => {
+  test('dry-run never repairs: guard reports, file/DB untouched', async () => {
     await seed('Founded Acme');
     const r = await withEnv({ GBRAIN_HOME: home }, () =>
-      runExtractFacts(engine, { sourceId: SRC, brainDir, dryRun: true, repairJournalDir: journalDir }));
+      runExtractFacts(engine, { sourceId: SRC, brainDir, dryRun: true }));
     expect(r.guardTriggered).toBe(true);
     expect(r.legacyRepair).toBeUndefined();
     expect(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8')).toBe(ALICE_BODY);
-    expect(existsSync(journalDir)).toBe(false);
+    expect((await activeRows())[0]!.row_num).toBeNull();
   });
 
   test('no brainDir (no disk access) → no repair, halt as before', async () => {
     await seed('Founded Acme');
     const r = await withEnv({ GBRAIN_HOME: home }, () =>
-      runExtractFacts(engine, { sourceId: SRC, repairJournalDir: journalDir }));
+      runExtractFacts(engine, { sourceId: SRC }));
     expect(r.guardTriggered).toBe(true);
     expect(r.legacyRepair).toBeUndefined();
     expect(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8')).toBe(ALICE_BODY);
@@ -164,7 +170,7 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
   test('repairLegacy: false opts out explicitly even with disk access', async () => {
     await seed('Founded Acme');
     const r = await withEnv({ GBRAIN_HOME: home }, () =>
-      runExtractFacts(engine, { sourceId: SRC, brainDir, repairLegacy: false, repairJournalDir: journalDir }));
+      runExtractFacts(engine, { sourceId: SRC, brainDir, repairLegacy: false }));
     expect(r.guardTriggered).toBe(true);
     expect(r.legacyRepair).toBeUndefined();
   });
@@ -173,7 +179,7 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
     await seed('Founded Acme');
     const r = await withEnv({ GBRAIN_HOME: home }, () =>
       runExtractFacts(engine, {
-        sourceId: SRC, brainDir, repairJournalDir: journalDir,
+        sourceId: SRC, brainDir,
         repairHooks: { beforeStamp: () => { throw new Error('injected'); } },
       }));
     expect(r.guardTriggered).toBe(true);
@@ -184,9 +190,15 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
     expect((await activeRows())[0]!.row_num).toBeNull();
     expect(r.factsDeleted).toBe(0);
 
-    // Next run finishes the job.
+    // The file now carries our uncommitted fence: refused, named, until it is
+    // committed (the owner's morning commit); then the next run finishes.
+    const r1b = await withEnv({ GBRAIN_HOME: home }, () =>
+      runExtractFacts(engine, { sourceId: SRC, brainDir }));
+    expect(r1b.guardTriggered).toBe(true);
+    expect(r1b.legacyRepair?.skippedByReason.file_uncommitted).toBe(1);
+    git('commit', '-q', '-am', 'morning commit');
     const r2 = await withEnv({ GBRAIN_HOME: home }, () =>
-      runExtractFacts(engine, { sourceId: SRC, brainDir, repairJournalDir: journalDir }));
+      runExtractFacts(engine, { sourceId: SRC, brainDir }));
     expect(r2.guardTriggered).toBe(false);
     expect(r2.legacyRowsRepaired).toBe(1);
     expect((await activeRows()).map(x => x.fact)).toEqual(['Founded Acme']);

@@ -76,7 +76,7 @@ import {
   repairLegacyRowsForSource,
   isFactRepairDisabled,
   type RepairLegacyRowsSummary,
-  type FenceLegacyHooks,
+  type LegacyStampHooks,
 } from '../facts/fence-legacy.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
@@ -267,16 +267,15 @@ export interface ExtractFactsOpts {
   signal?: AbortSignal;
   /**
    * 2026-09-13: self-draining guard. When the guard counts legacy rows and
-   * this run has disk access (`brainDir` set) and is not a dry-run, fence
-   * them in place page by page (src/core/facts/fence-legacy.ts) and re-count
-   * before deciding to halt. Defaults to `brainDir !== undefined`; pass
-   * `false` to keep the pure halt. `GBRAIN_FACT_REPAIR=off` also disables it.
+   * this run has disk access (`brainDir` set) and is not a dry-run, stamp
+   * them onto their pages through the native fence writer
+   * (fence-write.ts `stampLegacyFactsToFence`) and re-count before deciding
+   * to halt. Defaults to `brainDir !== undefined`; pass `false` to keep the
+   * pure halt. `GBRAIN_FACT_REPAIR=off` also disables it.
    */
   repairLegacy?: boolean;
-  /** Journal + preimage root for the repair. Default `<GBRAIN_HOME>/.gbrain/fact-repair`. */
-  repairJournalDir?: string;
-  /** Test-only failure-injection seams for the repair. */
-  repairHooks?: FenceLegacyHooks;
+  /** Test-only crash seams for the repair. */
+  repairHooks?: LegacyStampHooks;
   /** Override the shared page-lock directory for deterministic tests. */
   pageLockRoot?: string;
 }
@@ -470,14 +469,14 @@ export async function runExtractFacts(
   // same phase; anything left halts exactly as before, with the refusals
   // named. Runs only with disk access and never on a dry-run; the
   // `GBRAIN_FACT_REPAIR=off` kill switch restores the pure halt without
-  // a deploy. Design + crash-safety argument: src/core/facts/fence-legacy.ts.
+  // a deploy. Safety properties live in the writer's stamp mode
+  // (fence-write.ts); the caller is src/core/facts/fence-legacy.ts.
   const repairEnabled = (opts.repairLegacy ?? opts.brainDir !== undefined) && !isFactRepairDisabled();
   if (legacyCount > 0 && repairEnabled && !opts.dryRun) {
     try {
       const repair = await repairLegacyRowsForSource(engine, {
         sourceId,
         signal: opts.signal,
-        journalDir: opts.repairJournalDir,
         hooks: opts.repairHooks,
       });
       result.legacyRepair = repair;

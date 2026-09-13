@@ -35,7 +35,8 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync, unlinkSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, relative } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility, FactKind } from '../engine.ts';
@@ -552,4 +553,264 @@ export async function lookupSourceLocalPath(
   );
   if (rows.length === 0) return null;
   return rows[0].local_path;
+}
+
+// ── Stamp EXISTING legacy rows onto the fence (2026-09-13) ─────────────────
+//
+// `writeFactsToFence` above inserts NEW rows. The v0.32.2 guard in
+// extract-facts.ts halts a source while `row_num IS NULL` rows whose entity
+// page is live remain, and the only native drain was the manual, whole-tree-
+// refusing Phase B of the migration. This sibling reuses the writer's own
+// steps — target resolution, page lock, per-FILE git state, `.tmp` + parse +
+// rename, the #4872 body mirror, path-limited commit — and replaces the one
+// step that differs: an `UPDATE … WHERE row_num IS NULL` per existing id in
+// place of `insertFacts`. What it deliberately does NOT do: stub-create a
+// page (a live DB page with no file is drift for the operator), append into a
+// file that has uncommitted changes (there would be no committed preimage;
+// git HEAD is the rollback), or assign one row_num to two ids.
+//
+// Crash contract, keyed on `row_num IS NULL`: a crash before the rename leaves
+// file and DB untouched; a crash after the rename leaves the file dirty, so the
+// next run REFUSES it (`file_uncommitted`) until the file is committed, after
+// which de-dupe against the on-disk fence re-uses the existing row_nums and
+// only the stamp remains. Nothing is ever fence-owned before the DB body
+// verifiably carries its fence (checked inside the stamp transaction).
+
+/** One `row_num IS NULL` fact row, as read from the facts table. */
+export interface LegacyStampRow {
+  id: string;
+  fact: string;
+  kind: FactKind;
+  visibility: FactVisibility;
+  notability: NewFact['notability'];
+  context: string | null;
+  valid_from: Date | string;
+  valid_until: Date | string | null;
+  source: string | null;
+  confidence: number;
+}
+
+export type LegacyStampSkipReason =
+  | 'write_through_disabled'   // sync.write_through=off: the file is not canonical here
+  | 'target_unresolvable'      // resolvePageWriteTarget refused
+  | 'file_missing'             // live DB page, no file — never stub-created here
+  | 'symlink'                  // target or temp path is a symlink / pre-exists
+  | 'file_uncommitted'         // uncommitted changes on THIS file (self-dirt): no committed preimage
+  | 'foreign_dirty'            // unmerged/rename/unattributable git state, or not a git repo
+  | 'fence_parse_failed'       // existing or rendered fence does not parse
+  | 'duplicate_legacy_rows'    // two ids share (fact, source): one row_num cannot own both
+  | 'concurrent_edit'          // file changed between read and rename
+  | 'verify_failed'            // DB body did not carry every assigned row at stamp time
+  | 'fence_row_owned'          // an assigned row_num already belongs to another fact id
+  | 'lock_busy'
+  | 'error';
+
+export interface LegacyStampResult {
+  slug: string;
+  status: 'stamped' | 'skipped';
+  reason?: LegacyStampSkipReason;
+  detail?: string;
+  /** Rows stamped (row_num + source_markdown_slug) by this call. */
+  stamped: number;
+  /** Rows appended to the fence file (0 when the fence already carried them). */
+  appended: number;
+  committed: boolean;
+}
+
+/** Test-only crash seams; each runs immediately before the named transition. */
+export interface LegacyStampHooks {
+  beforeRename?: (slug: string) => void | Promise<void>;
+  beforeMirror?: (slug: string) => void | Promise<void>;
+  beforeStamp?: (slug: string) => void | Promise<void>;
+}
+
+function legacyIsoDate(v: Date | string | null | undefined): string | undefined {
+  if (v == null) return undefined;
+  const d = v instanceof Date ? v : new Date(v);
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
+}
+
+function legacyKey(claim: string, source: string | null | undefined): string {
+  return `${claim} ${source ?? ''}`;
+}
+
+/** Every assignment present in `body`'s fence with the expected claim. */
+function fenceCarries(body: string, rows: LegacyStampRow[], assignments: Array<{ id: string; row_num: number }>): boolean {
+  const parsed = parseFactsFence(body);
+  if (parsed.warnings.length > 0) return false;
+  const claimByRowNum = new Map(parsed.facts.map(f => [f.rowNum, f.claim]));
+  const rowById = new Map(rows.map(r => [r.id, r]));
+  return assignments.every(a => claimByRowNum.get(a.row_num) === rowById.get(a.id)?.fact);
+}
+
+function skip(slug: string, reason: LegacyStampSkipReason, detail?: string): LegacyStampResult {
+  return { slug, status: 'skipped', reason, detail, stamped: 0, appended: 0, committed: false };
+}
+
+export async function stampLegacyFactsToFence(
+  engine: BrainEngine,
+  target: { sourceId: string; slug: string },
+  rows: LegacyStampRow[],
+  opts: { dryRun?: boolean; lockTimeoutMs?: number; hooks?: LegacyStampHooks } = {},
+): Promise<LegacyStampResult> {
+  const { sourceId, slug } = target;
+  if (rows.length === 0) return { slug, status: 'stamped', stamped: 0, appended: 0, committed: false };
+  if (await isWriteThroughDisabled(engine)) return skip(slug, 'write_through_disabled');
+
+  // Codex #3: one row_num cannot own two ids. Refuse the page rather than
+  // fabricate convergence; the operator drains one via forget_fact.
+  const seen = new Set<string>();
+  for (const r of rows) {
+    const k = legacyKey(r.fact, r.source);
+    if (seen.has(k)) return skip(slug, 'duplicate_legacy_rows', `(fact, source) repeated: ${r.fact.slice(0, 60)}`);
+    seen.add(k);
+  }
+
+  const resolved = await resolvePageWriteTarget(engine, slug, sourceId);
+  if (!resolved.ok) return skip(slug, 'target_unresolvable', resolved.skipped);
+  const { filePath, writeRoot } = resolved;
+
+  let locked = false;
+  try {
+    return await withPageLock(slug, async () => {
+      locked = true;
+      // Never follow a link, never stub-create. Checked inside the lock.
+      let st: ReturnType<typeof lstatSync>;
+      try { st = lstatSync(filePath); } catch { return skip(slug, 'file_missing', filePath); }
+      if (st.isSymbolicLink() || !st.isFile()) return skip(slug, 'symlink', filePath);
+
+      // Per-FILE git state (the writer's own rule). A committed preimage is
+      // the rollback, so any uncommitted change on this file refuses.
+      const gitState = gitPathState(writeRoot, filePath);
+      if (gitState === 'self_dirty') return skip(slug, 'file_uncommitted', filePath);
+      if (gitState !== 'clean') return skip(slug, 'foreign_dirty', `${gitState}: ${filePath}`);
+
+      const preBody = readFileSync(filePath, 'utf-8');
+      const pre = parseFactsFence(preBody);
+      if (pre.warnings.length > 0) return skip(slug, 'fence_parse_failed', pre.warnings.join('; '));
+
+      // De-dupe against the fence on disk (a prior crashed run may have
+      // appended already) and seed the counter from BOTH stores, exactly as
+      // writeFactsToFence does, so no issued row_num is reused.
+      const byKey = new Map<string, number>();
+      for (const f of pre.facts) {
+        const k = legacyKey(f.claim, f.source);
+        if (!byKey.has(k)) byKey.set(k, f.rowNum);
+      }
+      let dbMax = 0;
+      try {
+        const r = await engine.executeRaw<{ max_row_num: number | null }>(
+          `SELECT MAX(row_num) AS max_row_num FROM facts WHERE source_id = $1 AND source_markdown_slug = $2`,
+          [sourceId, slug],
+        );
+        dbMax = Number(r[0]?.max_row_num ?? 0);
+      } catch { dbMax = 0; }
+      const fileMax = pre.facts.length > 0 ? Math.max(...pre.facts.map(f => f.rowNum)) : 0;
+      let next = Math.max(fileMax, dbMax) + 1;
+
+      let body = preBody;
+      const assignments: Array<{ id: string; row_num: number }> = [];
+      let appended = 0;
+      for (const row of rows) {
+        const known = byKey.get(legacyKey(row.fact, row.source));
+        if (known !== undefined) { assignments.push({ id: row.id, row_num: known }); continue; }
+        const { body: updated, rowNum } = upsertFactRow(body, {
+          rowNum:     next++,
+          claim:      row.fact,
+          kind:       row.kind,
+          confidence: row.confidence,
+          visibility: row.visibility,
+          notability: row.notability ?? 'medium',
+          validFrom:  legacyIsoDate(row.valid_from) ?? '',
+          validUntil: legacyIsoDate(row.valid_until),
+          source:     row.source ?? undefined,
+          context:    row.context ?? undefined,
+        });
+        body = updated;
+        assignments.push({ id: row.id, row_num: rowNum });
+        appended += 1;
+      }
+      if (opts.dryRun) {
+        return { slug, status: 'stamped', stamped: 0, appended, committed: false, detail: `dry-run: would stamp ${assignments.length}, append ${appended}` };
+      }
+
+      if (appended > 0) {
+        // Unique temp name (the writePageThrough convention) and refuse
+        // anything already sitting at it — a pre-planted link cannot be
+        // followed (Codex #4). `wx` creates exclusively, never through a link.
+        const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
+        let tmpPreexists = true;
+        try { lstatSync(tmpPath); } catch { tmpPreexists = false; }
+        if (tmpPreexists) return skip(slug, 'symlink', `temp path pre-exists: ${tmpPath}`);
+        writeFileSync(tmpPath, body, { encoding: 'utf-8', flag: 'wx' });
+        const tmpBody = readFileSync(tmpPath, 'utf-8');
+        if (!fenceCarries(tmpBody, rows, assignments)) {
+          recordWriteFailure(slug, sourceId, parseFactsFence(tmpBody).warnings, filePath);
+          return skip(slug, 'fence_parse_failed', 'rendered fence failed re-parse; .tmp quarantined');
+        }
+        await opts.hooks?.beforeRename?.(slug);
+        // The file must still be what we read: an edit that landed between
+        // read and rename is refused, never overwritten.
+        if (readFileSync(filePath, 'utf-8') !== preBody) {
+          try { unlinkSync(tmpPath); } catch { /* best-effort */ }
+          return skip(slug, 'concurrent_edit', filePath);
+        }
+        renameSync(tmpPath, filePath);
+      }
+
+      // #4872 mirror, but REQUIRED here: a row must not become fence-owned
+      // while the DB body still lacks its fence.
+      await opts.hooks?.beforeMirror?.(slug);
+      const reparsed = parseMarkdown(body, `${slug}.md`);
+      const existing = await engine.getPage(slug, { sourceId });
+      if (!existing) return skip(slug, 'verify_failed', 'page row missing');
+      await engine.refreshPageBody(slug, sourceId,
+        sanitizeText(reparsed.compiled_truth), sanitizeText(reparsed.timeline),
+        existing.content_hash || contentHash(existing));
+
+      // Stamp inside one transaction with a last read of the DB body, so a
+      // fence-less save between mirror and stamp cannot slip through
+      // (Codex #2), and an assigned row_num already owned by another id
+      // refuses instead of tripping idx_facts_fence_key.
+      await opts.hooks?.beforeStamp?.(slug);
+      const ids = assignments.map(a => a.id);
+      const nums = assignments.map(a => a.row_num);
+      const outcome = await engine.transaction(async (tx) => {
+        const page = await tx.getPage(slug, { sourceId });
+        if (!page || !fenceCarries(page.compiled_truth ?? '', rows, assignments)) {
+          return { reason: 'verify_failed' as const, stamped: 0, detail: 'DB body does not carry every assigned row' };
+        }
+        const owned = await tx.executeRaw<{ id: string; row_num: number }>(
+          `SELECT id::text AS id, row_num FROM facts
+            WHERE source_id = $1 AND source_markdown_slug = $2
+              AND row_num = ANY($3::int[]) AND NOT (id::text = ANY($4::text[]))`,
+          [sourceId, slug, nums, ids],
+        );
+        if (owned.length > 0) {
+          return { reason: 'fence_row_owned' as const, stamped: 0, detail: owned.map(o => `#${o.row_num} is id ${o.id}`).join(' ') };
+        }
+        let stamped = 0;
+        for (const a of assignments) {
+          const r = await tx.executeRaw<{ id: string }>(
+            `UPDATE facts SET row_num = $1, source_markdown_slug = $2
+              WHERE id = $3 AND source_id = $4 AND row_num IS NULL RETURNING id::text AS id`,
+            [a.row_num, slug, a.id, sourceId],
+          );
+          stamped += r.length;
+        }
+        return { reason: null, stamped, detail: undefined };
+      });
+      if (outcome.reason) return skip(slug, outcome.reason, outcome.detail);
+
+      let committed = false;
+      if (appended > 0 && isDurabilityHardened(writeRoot)) {
+        await commitFactFenceFile(writeRoot, filePath, slug, sourceId, 'clean');
+        committed = gitPathState(writeRoot, filePath) === 'clean';
+      }
+      return { slug, status: 'stamped', stamped: outcome.stamped, appended, committed };
+    }, { timeoutMs: opts.lockTimeoutMs ?? 5_000 });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return skip(slug, locked ? 'error' : 'lock_busy', msg);
+  }
 }
