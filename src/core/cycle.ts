@@ -1496,8 +1496,16 @@ async function runPhaseExtractFacts(
         phase: 'extract_facts',
         status: 'fail',
         duration_ms: 0,
-        summary: `extract_facts halted: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill`,
-        details: { halted: true, legacyRowsPending: result.legacyRowsPending, hint, warnings: result.warnings },
+        summary: `extract_facts halted: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill` +
+          (result.legacyRepair ? ` (in-cycle repair stamped ${result.legacyRowsRepaired}, ${result.legacyRepair.pagesSkipped} page(s) refused)` : ''),
+        details: {
+          halted: true,
+          legacyRowsPending: result.legacyRowsPending,
+          legacy_rows_repaired: result.legacyRowsRepaired,
+          legacy_repair: result.legacyRepair,
+          hint,
+          warnings: result.warnings,
+        },
         error: {
           class: 'Halted',
           code: 'FENCE_BACKFILL_PENDING',
@@ -1511,6 +1519,10 @@ async function runPhaseExtractFacts(
     // fact-reconcile counts. We summarize the phantom counters in the
     // human-readable summary line when any non-zero phantom work happened
     // so the daily cycle report makes the cleanup visible.
+    // 2026-09-13: the self-draining guard fenced legacy rows in this run.
+    const repairSummary = result.legacyRowsRepaired > 0
+      ? `, ${result.legacyRowsRepaired} legacy fact(s) fenced in place`
+      : '';
     const phantomSummary = (result.phantomsRedirected
       || result.phantomsAmbiguous
       || result.phantomsSkippedDrift)
@@ -1535,13 +1547,15 @@ async function runPhaseExtractFacts(
       phase: 'extract_facts',
       status: result.warnings.length > 0 ? 'warn' : 'ok',
       duration_ms: 0,
-      summary: `${result.factsInserted} fact(s) reconciled across ${result.pagesScanned} page(s)${phantomSummary}` +
+      summary: `${result.factsInserted} fact(s) reconciled across ${result.pagesScanned} page(s)${repairSummary}${phantomSummary}` +
         (result.warnings.length > 0 ? ` (${result.warnings.length} warning(s))` : ''),
       details: {
         pagesScanned: result.pagesScanned,
         pagesWithFacts: result.pagesWithFacts,
         factsInserted: result.factsInserted,
         factsDeleted: result.factsDeleted,
+        legacy_rows_repaired: result.legacyRowsRepaired,
+        ...(result.legacyRepair ? { legacy_repair: result.legacyRepair } : {}),
         warnings: result.warnings.slice(0, 5),
         // v0.35.5: phantom counters surfaced so extractTotals() can lift
         // them to CycleReport.totals and the daily report makes the

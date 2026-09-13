@@ -70,6 +70,12 @@ import {
 } from './phantom-redirect.ts';
 import { embed, isAvailable } from '../ai/gateway.ts';
 import { isAborted } from '../abort-check.ts';
+import {
+  repairLegacyRowsForSource,
+  isFactRepairDisabled,
+  type RepairLegacyRowsSummary,
+  type FenceLegacyHooks,
+} from '../facts/fence-legacy.ts';
 
 interface ExistingPageFact {
   // v0.46 (#3014) — the row's own fact id. Read so the supersession-drift
@@ -167,6 +173,18 @@ export interface ExtractFactsOpts {
    * under the worker's 30s force-evict instead of running to completion.
    */
   signal?: AbortSignal;
+  /**
+   * 2026-09-13: self-draining guard. When the guard counts legacy rows and
+   * this run has disk access (`brainDir` set) and is not a dry-run, fence
+   * them in place page by page (src/core/facts/fence-legacy.ts) and re-count
+   * before deciding to halt. Defaults to `brainDir !== undefined`; pass
+   * `false` to keep the pure halt. `GBRAIN_FACT_REPAIR=off` also disables it.
+   */
+  repairLegacy?: boolean;
+  /** Journal + preimage root for the repair. Default `<GBRAIN_HOME>/.gbrain/fact-repair`. */
+  repairJournalDir?: string;
+  /** Test-only failure-injection seams for the repair. */
+  repairHooks?: FenceLegacyHooks;
 }
 
 export interface ExtractFactsResult {
@@ -176,6 +194,10 @@ export interface ExtractFactsResult {
   factsDeleted: number;
   legacyRowsPending: number;
   guardTriggered: boolean;
+  /** Legacy rows the in-cycle repair fenced + stamped before the reconcile ran. */
+  legacyRowsRepaired: number;
+  /** Full repair summary when the repair pass ran (guard armed, disk access, not dry-run). */
+  legacyRepair?: RepairLegacyRowsSummary;
   warnings: string[];
   /** v0.35.5: phantom-redirect pre-pass counts. */
   phantomsScanned: number;
@@ -272,6 +294,7 @@ export async function runExtractFacts(
     factsDeleted: 0,
     legacyRowsPending: 0,
     guardTriggered: false,
+    legacyRowsRepaired: 0,
     warnings: [],
     phantomsScanned: 0,
     phantomsRedirected: 0,
@@ -343,8 +366,48 @@ export async function runExtractFacts(
         )`,
     [sourceId],
   );
-  const legacyCount = parseInt(legacy[0]?.n ?? '0', 10);
+  let legacyCount = parseInt(legacy[0]?.n ?? '0', 10);
   result.legacyRowsPending = legacyCount;
+
+  // ── Self-draining guard (2026-09-13) ─────────────────────────────
+  // The guard has armed. Before halting, fence the rows it armed on — in
+  // THIS source, page by page, under the page lock, refusing per file —
+  // and re-count. Zero afterwards means the reconcile below runs in the
+  // same phase; anything left halts exactly as before, with the refusals
+  // named. Runs only with disk access and never on a dry-run; the
+  // `GBRAIN_FACT_REPAIR=off` kill switch restores the pure halt without
+  // a deploy. Design + crash-safety argument: src/core/facts/fence-legacy.ts.
+  const repairEnabled = (opts.repairLegacy ?? opts.brainDir !== undefined) && !isFactRepairDisabled();
+  if (legacyCount > 0 && repairEnabled && !opts.dryRun) {
+    try {
+      const repair = await repairLegacyRowsForSource(engine, {
+        sourceId,
+        signal: opts.signal,
+        journalDir: opts.repairJournalDir,
+        hooks: opts.repairHooks,
+      });
+      result.legacyRepair = repair;
+      result.legacyRowsRepaired = repair.rowsStamped;
+      legacyCount = repair.rowsRemaining;
+      result.legacyRowsPending = legacyCount;
+      if (repair.pagesSkipped > 0) {
+        const reasons = Object.entries(repair.skippedByReason).map(([k, v]) => `${k}=${v}`).join(' ');
+        result.warnings.push(
+          `extract_facts: legacy repair left ${repair.pagesSkipped} page(s) unfenced in source "${sourceId}" ` +
+          `(${reasons}): ${repair.skippedDetails.join(' | ')}`,
+        );
+      }
+      if (repair.aborted) {
+        result.warnings.push(`extract_facts: legacy repair aborted before finishing source "${sourceId}"`);
+      }
+    } catch (e) {
+      // The repair never throws by contract; if it does, the guard below
+      // still holds — the rows are untouched and the halt is loud.
+      const msg = e instanceof Error ? e.message : String(e);
+      result.warnings.push(`extract_facts: legacy repair failed: ${msg.slice(0, 200)}`);
+    }
+  }
+
   if (legacyCount > 0) {
     result.guardTriggered = true;
     // Drain advice must actually work: a bare `apply-migrations --yes`

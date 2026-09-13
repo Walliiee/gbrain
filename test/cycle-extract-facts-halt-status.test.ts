@@ -92,7 +92,11 @@ function captureHuman(report: CycleReport): string[] {
 describe('extract_facts empty-fence guard → dead phase, not a warning', () => {
   test('guard halt is status=fail with error.class=Halted and a non-success cycle status', async () => {
     await seedLegacyRow();
-    const report = await withEnv({ GBRAIN_HOME: gbrainHome }, () =>
+    // 2026-09-13: the guard heals repairable rows before halting; this test
+    // pins the halt SHAPE, so hold the repair off with its kill switch. The
+    // heal path and the unrepairable halt are covered in
+    // extract-facts-self-draining-guard.test.ts.
+    const report = await withEnv({ GBRAIN_HOME: gbrainHome, GBRAIN_FACT_REPAIR: 'off' }, () =>
       runCycle(engine, { brainDir, sourceId: 'wiki', phases: ['extract_facts'] }));
 
     const xf = report.phases.find(p => p.phase === 'extract_facts');
@@ -124,7 +128,7 @@ describe('extract_facts empty-fence guard → dead phase, not a warning', () => 
 
   test('printHuman renders the halted phase as `✗ extract_facts` (the nightly wrapper contract)', async () => {
     await seedLegacyRow();
-    const report = await withEnv({ GBRAIN_HOME: gbrainHome }, () =>
+    const report = await withEnv({ GBRAIN_HOME: gbrainHome, GBRAIN_FACT_REPAIR: 'off' }, () =>
       runCycle(engine, { brainDir, sourceId: 'wiki', phases: ['extract_facts'] }));
 
     const lines = captureHuman(report);
