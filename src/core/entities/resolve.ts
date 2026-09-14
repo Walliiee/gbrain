@@ -26,6 +26,7 @@ import type { PageReadPolicy } from '../types.ts';
 import { pageReadFilter } from '../search/read-policy-sql.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import { isUndefinedTableError } from '../utils.ts';
+import { isValidSourceId } from '../source-id.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
@@ -103,6 +104,16 @@ function fallbackSlugify(trimmed: string): string {
   return slugify(trimmed);
 }
 
+/** Narrow a per-source lookup inside its grant before querying or capping.
+ * A federated sourceIds array wins over the scalar grant, as on every read. */
+function narrowResolutionPolicy(sourceId: string, policy?: PageReadPolicy): PageReadPolicy | null | undefined {
+  if (!isValidSourceId(sourceId)) return null;
+  if (policy?.sourceIds?.length) {
+    if (!policy.sourceIds.includes(sourceId)) return null;
+  } else if (policy?.sourceId && policy.sourceId !== sourceId) return null;
+  return policy ? { ...policy, sourceId, sourceIds: undefined } : undefined;
+}
+
 /**
  * Alias-exact arm (v0.46.15, #3730): unambiguous single-slug page_aliases hit,
  * verified against LIVE pages — page_aliases has no FK to pages, so stale
@@ -117,16 +128,21 @@ let aliasExactWarned = false;
 async function tryAliasExact(engine: BrainEngine, source_id: string, raw: string, policy?: PageReadPolicy): Promise<string | null> {
   const norm = normalizeAlias(raw);
   if (!norm) return null;
+  const scopedPolicy = narrowResolutionPolicy(source_id, policy);
+  if (scopedPolicy === null) return null;
   try {
-    const hits = (await engine.resolveAliases([norm], { ...policy, sourceId: source_id })).get(norm) ?? [];
+    // Keep source identity even if an adapter returns a foreign/stale hit.
+    // Merely applying its slug to source_id fabricates a different entity.
+    const hits = ((await engine.resolveAliases([norm], { ...scopedPolicy, sourceId: source_id })).get(norm) ?? [])
+      .filter(hit => hit.source_id === source_id);
     if (!hits.length) return null;
     const params: unknown[] = [source_id, [...new Set(hits.map((h) => h.slug))]];
-    const filter = pageReadFilter('pages', policy, params, !!policy);
-    const rows = await engine.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[]) AND ${filter}`,
+    const filter = pageReadFilter('pages', scopedPolicy, params, !!scopedPolicy);
+    const rows = await engine.executeRaw<{ slug: string; source_id: string }>(
+      `SELECT slug, source_id FROM pages WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[]) AND ${filter}`,
       params,
     );
-    const live = [...new Set(rows.map((r) => r.slug))];
+    const live = [...new Set(rows.filter(row => row.source_id === source_id).map(row => row.slug))];
     return live.length === 1 ? live[0] : null;
   } catch (err) {
     if (!isUndefinedTableError(err) && !aliasExactWarned) {
@@ -193,21 +209,23 @@ export async function resolveEntitySlugWithSource(
   if (!raw) return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
+  const scopedPolicy = narrowResolutionPolicy(source_id, policy);
+  if (scopedPolicy === null) return null;
 
   // Mirror resolveEntitySlug's resolution chain but tag each branch.
   if (looksLikeSlug(trimmed)) {
-    const exact = await tryExactSlug(engine, source_id, trimmed, policy);
+    const exact = await tryExactSlug(engine, source_id, trimmed, scopedPolicy);
     if (exact) return { slug: exact, source: 'exact_page' };
   }
 
-  const aliased = await tryAliasExact(engine, source_id, trimmed, policy);
+  const aliased = await tryAliasExact(engine, source_id, trimmed, scopedPolicy);
   if (aliased) return { slug: aliased, source: 'alias_exact' };
 
   if (isBareName(trimmed)) {
-    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed), policy);
+    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed), scopedPolicy);
     if (expanded) return { slug: expanded, source: 'fuzzy_match' };
   } else {
-    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed, policy);
+    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed, scopedPolicy);
     if (fuzzy) return { slug: fuzzy, source: 'fuzzy_match' };
   }
 

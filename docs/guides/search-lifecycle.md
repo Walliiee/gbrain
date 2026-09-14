@@ -13,6 +13,10 @@ gbrain config set search.exclude_statuses '["archived","superseded","retired"]'
 gbrain config get search.exclude_statuses
 ```
 
+Readback reports the DB-effective value. If the DB row is absent it reports
+`[]`; any value for this key in `config.json` is ignored, including when no DB
+value exists. The CLI explains that precedence on stderr.
+
 The value must be a JSON array of non-empty strings without NUL. Configuration
 writes validate it; malformed stored values cause retrieval to fail rather
 than silently disabling the policy. Identifiers match after ASCII case folding
@@ -56,13 +60,17 @@ Each retrieval reads the serving brain's current setting. Semantic result
 reuse is currently disabled; the retained cache identity includes the resolved
 status set so different policies cannot share a cache entry if reuse returns.
 
-When the exclusion list is non-empty, vector retrieval uses an exact distance
-sort over eligible chunks. HNSW can apply page filters after its approximate
-candidate scan and otherwise return nothing when excluded pages fill that
-scan. Exact selection prevents that lifecycle starvation, at a potential
-latency cost on large brains; the existing query timeout and bounded per-page
-pool expansion still apply. With an empty or absent list the existing vector
-index behavior is unchanged.
+Vector retrieval keeps indexed approximate nearest-neighbor (ANN) search as
+its normal path, with the same lifecycle, source and visibility predicates
+inside candidate selection. With exclusions configured, a short or empty page
+triggers bounded ANN expansion (at most three retries, with the HNSW pool
+ceiling unchanged). If the resulting unique pages still cannot satisfy
+`offset + limit`, one exact fallback scans all eligible chunks and collapses
+them by page before pagination. It uses the same predicates and access scope.
+A full ANN result never pays for an exact fallback, including when the
+configured exclusions match no pages. Empty or absent configuration preserves
+the previous vector behavior. Fallback latency on large brains is unmeasured;
+existing query timeouts still apply.
 
 This setting does not implement conditional `expires_at` rules, canonical or
 generated-record exceptions, status weights, source weights, or other ranking

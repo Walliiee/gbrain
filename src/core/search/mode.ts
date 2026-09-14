@@ -965,8 +965,10 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // part; version-only invalidation (same class as the 13→14 detail=medium
 // boost-scope bump and the 21→22 stamp/injection epoch). One-time global
 // cold-miss spike on upgrade; refills within cache.ttl_seconds (3600s).
-// Lifecycle policy changes the eligible set before every retrieval limit.
-export const KNOBS_HASH_VERSION = 29;
+// v=29: lifecycle policy changes the eligible set before every retrieval limit.
+// v=30: configured vector search now uses bounded ANN before exact fallback;
+// candidates can differ from the previous unconditional exact ordering.
+export const KNOBS_HASH_VERSION = 30;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -1530,4 +1532,3 @@ export async function loadSearchModeConfig(
     overrides: loadOverridesFromConfig(configMap),
   };
 }
-

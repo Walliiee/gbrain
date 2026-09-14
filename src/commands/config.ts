@@ -422,6 +422,15 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
   const value = positionals[2];
 
   if (action === 'get' && key) {
+    if (key === 'search.exclude_statuses') {
+      // This policy is read directly from the serving brain's DB, with no
+      // file/env fallback. An absent row means no lifecycle exclusions even
+      // if a config file contains a value for the same key.
+      const dbValue = await engine.getConfig(key);
+      console.log(dbValue ?? '[]');
+      console.error(`[config] source: db plane (${dbValue == null ? 'no DB row; effective exclusions: []' : 'authoritative for this key'}); config-file values are ignored for ${key}.`);
+      return;
+    }
     // #2120: `get` used to read only the DB plane, so a runtime-effective key
     // in ~/.gbrain/config.json (or env) reported not-found. Resolve the way
     // the runtime does — env/file plane wins over DB (loadConfig() already

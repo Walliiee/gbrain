@@ -456,7 +456,7 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // 27→28: compiledTruthBoost suppresses the 2x boost for synthetic
     // chunkless title rows (#4256, fixes #3695's fusion path) — reorders
     // fused rows for identical knobs; version-only invalidation.
-    expect(KNOBS_HASH_VERSION).toBe(29);
+    expect(KNOBS_HASH_VERSION).toBe(30);
   });
 
   test('#3515: detail set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -486,7 +486,7 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // adaptive-on calls now cache instead of skipping.
     // 27→28: compiledTruthBoost synthetic-row suppression (#4256/#3695) —
     // version-only invalidation.
-    expect(KNOBS_HASH_VERSION).toBe(29);
+    expect(KNOBS_HASH_VERSION).toBe(30);
   });
 
   test('#4352 follow-up: excludePrivate true vs false produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -702,8 +702,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 29 (…; 24→25 keywordOrFallback knob kof=; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 lifecycle policy set)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(29);
+  test('KNOBS_HASH_VERSION is 30 (…; 24→25 keywordOrFallback knob kof=; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 lifecycle policy set; 29→30 bounded ANN lifecycle fallback)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(30);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {

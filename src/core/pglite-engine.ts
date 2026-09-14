@@ -2823,8 +2823,8 @@ export class PGLiteEngine implements BrainEngine {
     // by the escalation count instead. (Hoisted resolvedColEarly: same
     // descriptor the cast fragment uses below.)
     const resolvedColEarly = normalizeEngineColumn(opts?.embeddingColumn);
-    const exactLifecycleScan = !!opts.excludeStatuses?.length;
-    const innerCap = !exactLifecycleScan && hnswIndexExpected(resolvedColEarly.type, resolvedColEarly.dimensions)
+    const lifecycleFallback = !!opts.excludeStatuses?.length;
+    const innerCap = hnswIndexExpected(resolvedColEarly.type, resolvedColEarly.dimensions)
       ? HNSW_EF_SEARCH_MAX
       : Number.MAX_SAFE_INTEGER;
     const innerLimit = Math.min(offset + Math.max(limit * 5, 100), innerCap);
@@ -2882,11 +2882,9 @@ export class PGLiteEngine implements BrainEngine {
     // itself is the discriminator (only re-embedded rows have non-NULL).
     const resolvedCol = resolvedColEarly;
     const { col, castSql } = buildVectorCastFragment(resolvedCol);
-    // HNSW applies page filters after its bounded ANN scan. With lifecycle
-    // exclusions, an excluded nearest neighborhood can starve eligible pages.
-    // + 0 disqualifies distance-index ordering so filtering precedes an exact
-    // sort; absent policy retains the existing HNSW path and performance.
-    const distanceOrder = exactLifecycleScan ? `(cc.${col} <=> ${castSql}) + 0` : `cc.${col} <=> ${castSql}`;
+    // Keep indexed distance ordering for the normal pass. Only an underfilled
+    // bounded search falls back to + 0 (exact ordering) over ALL eligible
+    // chunks; the same query body preserves every filter in both passes.
     let modalityFilter: string;
     if (resolvedCol.name === 'embedding_image') {
       modalityFilter = `AND cc.modality = 'image'`;
@@ -2900,7 +2898,7 @@ export class PGLiteEngine implements BrainEngine {
     // 40), so LIMIT $2 past 40 was silently unreachable — see hnswEfSearchFor.
     // SET LOCAL semantics need a transaction (PGLite autocommits bare
     // queries); scoping it locally keeps the engine's single session clean.
-    const runOnce = async (il: number) => (await this.db.transaction(async (tx) => {
+    const runOnce = async (il: number, exact = false) => (await this.db.transaction(async (tx) => {
       await tx.query(`SELECT set_config('hnsw.ef_search', $1, true)`, [String(hnswEfSearchFor(il))]);
       return tx.query(
       `WITH hnsw_candidates AS (
@@ -2918,7 +2916,7 @@ export class PGLiteEngine implements BrainEngine {
          JOIN pages p ON p.id = cc.page_id
          JOIN sources s ON s.id = p.source_id
          WHERE cc.${col} IS NOT NULL ${modalityFilter} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
-         ORDER BY ${distanceOrder}
+         ORDER BY ${exact ? `(cc.${col} <=> ${castSql}) + 0` : `cc.${col} <=> ${castSql}`}
          LIMIT $2
        ),
        -- score as a select-list expr; inner ORDER BY stays pure-distance so
@@ -2955,11 +2953,10 @@ export class PGLiteEngine implements BrainEngine {
       );
     })).rows;
 
-    // v0.46.15 bounded escalation loop — IDENTICAL logic to postgres-engine
-    // (parity-pinned): retry ×4 up to 3 times while the PAGE set is short
-    // but the pre-collapse candidate pool was full; a short page with a
-    // non-full pool is a genuine final page. Zero rows with offset>0
-    // escalates (deep pagination) but never emits — pool unknowable there.
+    // Bounded escalation, identical in both engines: retry ×4 up to 3 times.
+    // Lifecycle filtering can exhaust ANN before its chunk pool fills, even
+    // at offset zero, so every configured short page retries before fallback.
+    // Without exclusions, preserve full-pool/deep-offset retry semantics.
     let escalations = 0;
     let rows = await runOnce(innerLimit);
     for (;;) {
@@ -2968,10 +2965,10 @@ export class PGLiteEngine implements BrainEngine {
       const pool = rows.length > 0
         ? Number((rows[0] as { candidate_pool?: number }).candidate_pool ?? 0)
         : null;
-      const shouldEscalate = pool !== null ? pool >= il : offset > 0;
+      const shouldEscalate = lifecycleFallback || (pool !== null ? pool >= il : offset > 0);
       if (!shouldEscalate) break;
       if (il >= innerCap || escalations >= 3) {
-        if (pool !== null && pool >= il) {
+        if (!lifecycleFallback && pool !== null && pool >= il) {
           opts?.onVectorPoolMeta?.({ underfilled: true, escalations, innerLimit: il });
         }
         break;
@@ -2981,6 +2978,15 @@ export class PGLiteEngine implements BrainEngine {
       rows = await runOnce(params[innerLimitIdx] as number);
     }
 
+    // rows are already unique pages AFTER OFFSET. A full returned page proves
+    // offset + limit eligible pages survived; even zero rows require fallback
+    // when lifecycle filtering may have exhausted the approximate neighborhood.
+    if (lifecycleFallback && rows.length < limit) {
+      // PostgreSQL LIMIT NULL means ALL: no dense eligible page can consume a
+      // second chunk cap before the exact best-per-page collapse.
+      params[innerLimitIdx] = null;
+      rows = await runOnce(innerLimit, true);
+    }
     return (rows as Record<string, unknown>[]).map(rowToSearchResult);
   }
 

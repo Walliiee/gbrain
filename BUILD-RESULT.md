@@ -1,214 +1,99 @@
-# Native lifecycle repair — branch preparation
+# Native lifecycle repair — tested branch revision
 
-Implemented in the isolated worktree. This is an internal review candidate;
-production activation has not been performed.
+This revision addresses all three findings against `2451ed4e923f5082f8210a293d373677e01d13d3` in the isolated worktree. It is an internal review candidate. No live policy, data, runtime or deployment was changed.
 
-- Base: `306ab2a09bf6c77687f5710cc93760ef2cb74494`.
 - Branch: `fix/cos-native-lifecycle-20260914`.
-- Implementation diff SHA-256: `9adff52bcf58230570cb5f6cbdb86d4f5f0ffb335027ad173f1bf739362aab54` (staged binary diff from
-  the base, excluding this report and the supplied `BUILD-COS.md.orig`).
-- The local commit containing this report is the handoff head; obtain its
-  immutable ID with `git log -1 --format=%H -- BUILD-RESULT.md`.
+- Original implementation base: `306ab2a09bf6c77687f5710cc93760ef2cb74494`.
+- Revision base: `2451ed4e923f5082f8210a293d373677e01d13d3`.
+- Revision implementation diff SHA-256: `b68fb259b25c3945d5447bb594a1ebfc7f123168c028b6dd63d69772d82fdf79` (binary diff from the revision base, excluding this report and supplied `.orig` briefs).
+- Obtain the local handoff commit with `git log -1 --format=%H -- BUILD-RESULT.md`.
 
-## Root cause and implementation
+## Fixes
 
-Native candidate queries enforced source/visibility/deletion controls but did
-not interpret `frontmatter.status`. The external governed wrapper separately
-excluded statuses, so native CLI/MCP retrieval could return superseded pages.
-Filtering only the final MCP response would also waste top-k slots and leave
-other retrieval paths unprotected.
+1. **Source-qualified alias identity.** A federated `sourceIds` grant previously overrode the current source's scalar during alias lookup. Reducing those results to bare slugs could attach B's alias to the same slug in A, fabricating A's relationship. Resolution now checks membership in the grant, narrows each query to its current source before candidate limits, and validates alias-hit and live-page source IDs before extracting slugs. Real PGLite tests cover overlapping slugs, B-only aliases, stronger B fuzzy/prefix candidates, ambiguity, invalid/unknown sources and outside-grant requests, with lifecycle configured and absent.
+2. **DB-effective configuration readback.** `config get search.exclude_statuses` now reads the DB plane exclusively. An absent row prints `[]`; stderr states that file values are ignored. Real temporary config files and PGLite verify flat/nested file disagreement, DB absence, explicit empty/raw readback and matching values against the actual policy resolver and search results. Unrelated config keys retain their existing precedence.
+3. **ANN first, exact fallback when underfilled.** Both engines keep index-compatible distance ordering and eligibility predicates in the normal query. Configured short/zero pages retry within the existing bounded ANN expansion. Only an underfilled distinct-page window triggers one exact pass over all eligible chunks, then best-per-page collapse and pagination. Both passes share the SQL predicates and access scope. Unlimited eligible chunks in the fallback prevent one dense page from consuming a second cap. A full ANN page never invokes exact fallback. Empty/absent configuration preserves the previous vector path. Cache epoch advances to 30 because candidates can differ from the previous unconditional exact path.
 
-The new DB-plane key `search.exclude_statuses` accepts a validated JSON array
-of strings. Missing configuration or `[]` preserves historical search behavior.
-Both native engines resolve the serving brain's policy independently of query
-parameters. Invalid configuration fails closed. Matching uses ASCII case
-folding and surrounding ASCII whitespace trimming; missing/null/non-string
-page statuses remain eligible. No status values are hardcoded as defaults.
+The maintained guide and architecture reference now describe conditional fallback, DB readback and the deliberate CRAG boundary. The E2E map includes both shared lifecycle contracts. The module-size ratchet changes only the three enlarged existing modules in this revision.
 
-The shared predicate applies before keyword, chunk-keyword, title, CJK, vector,
-and fuzzy limits. Hybrid propagation covers aliases, exact identity source
-probes, entity seeds, relational edges/origins, and optional code walks before
-their caps. Existing grants, private-page restrictions, quarantine and deletion
-checks remain in place. Explicit historical `get_page` retains its existing
-access controls; search has no local or remote per-query historical opt-out.
+## Retained lifecycle contract
 
-Two adversarial findings were fixed during implementation:
+`search.exclude_statuses` is an optional, validated JSON string array stored in the serving brain's DB. Missing/empty policy excludes no statuses; malformed policy fails closed. Matching trims/folds ASCII, and missing/null/non-string page statuses stay eligible. No status defaults are hardcoded. Native keyword, chunk-keyword, CJK, title, vector and fuzzy candidates are filtered before limits; hybrid passes the policy into identity, alias and graph readers. Source grants, visibility and deletion checks remain active. Explicit historical `get_page` remains available under its existing access controls, with no search-query opt-out.
 
-1. HNSW can exhaust its approximate scan on excluded rows despite SQL `WHERE`
-   preceding `LIMIT`. Configured lifecycle vector searches use exact distance
-   ordering over eligible chunks and remove the HNSW pool ceiling. The
-   unconfigured vector path remains unchanged.
-2. Exact slug lookup previously chose the first source before lifecycle
-   eligibility. Eligible sources are now selected before the five-source cap;
-   a seven-source duplicate-slug fixture proves an active match survives.
+With a nonempty policy, automatic CRAG `think` is deliberately skipped and reports `retrieval.crag.think_skipped: "lifecycle_policy"`. Its separate evidence readers have not been made lifecycle-aware. Standalone `think` remains outside this repair. The setting does not replicate the wrapper's conditional expiry, canonical/generated exceptions, weights or Unicode folding.
 
-An additional optional route is explicitly contained: automatic CRAG `think`
-escalation uses independent takes/time-window readers. With a non-empty
-lifecycle policy, requested automatic synthesis is skipped with
-`retrieval.crag.think_skipped: "lifecycle_policy"`; filtered results and weak
-confidence remain visible. Standalone `think` is outside this repair.
+## Fresh execution evidence
 
-Cache identity includes the normalized exclusion set (epoch 29). Semantic
-result reuse remains disabled as it was at the base. No migration, reindex,
-embedding calls, package installation, or recurring automation was added.
+Each row is an actual execution in this revision, not a sum of unique tests. Unit commands unset `DATABASE_URL`, `GBRAIN_DATABASE_URL`, `GBRAIN_HOME` and `GBRAIN_CONFIG`; repository preloads isolate the home and disable paid provider discovery. Validation used installed dependencies and no provider credentials; nothing was installed.
 
-## Files
-
-- `src/core/search/lifecycle-policy.ts`, `src/core/types.ts`: typed policy,
-  strict parser, normalization and SQL predicate.
-- `src/commands/config.ts`, `src/core/config.ts`: validation and key discovery.
-- `src/core/{pglite,postgres}-engine.ts`, `src/core/search/sql-ranking.ts`:
-  native engine enforcement, CJK threading and exact configured vector scan.
-- `src/core/search/{hybrid,mode,read-policy-sql,read-enrichment,exact-lookup,relational-recall,two-pass}.ts`
-  and `src/core/entities/resolve.ts`: pipeline propagation and cache identity.
-- `src/core/ops/search.ts`, `src/core/search/crag.ts`,
-  `src/core/operations-descriptions.ts`: shared operation contract and explicit
-  automatic-synthesis limitation.
-- `test/search/*lifecycle*.test.ts`,
-  `test/helpers/lifecycle-search-contract.ts`,
-  `test/e2e/native-lifecycle-postgres.test.ts`, `test/search-mode.test.ts`:
-  synthetic regression evidence and cache epoch assertions.
-- `docs/guides/search-lifecycle.md`, `docs/architecture/KEY_FILES.md`,
-  `scripts/e2e-test-map.ts`, `scripts/module-size-limits.tsv`: operator docs,
-  test routing and visible size ceilings. The ceiling metadata also corrects
-  an existing one-line `jobs.ts` overshoot at the base (3158 actual vs 3157
-  ceiling); no `jobs.ts` code changed.
-
-## Actual validation
-
-All counts below are fresh executions, not summed unique coverage. Unit runs
-unset database URL overrides and use the repository's isolated home/provider
-preloads. Dependencies were absent here, so matching existing `node_modules`
-were copied into this worktree using `cp -cR`; dependency declarations and
-`bun.lock` were byte-equivalent. Nothing was installed or changed in the
-source installation.
-
-| Command | Actual result | Full local output |
+| Command | Actual result | Local evidence |
 |---|---|---|
-| `bun test test/search/lifecycle-policy.test.ts test/search/native-lifecycle.test.ts` | 51 pass, 0 fail, 118 assertions | `.context/lifecycle-focused-tests.log` |
-| `bun test test/search/lifecycle-policy.test.ts test/search/native-lifecycle.test.ts test/search/lifecycle-pipeline.test.ts test/relational-fanout.test.ts test/search-mode.test.ts test/two-pass.test.ts test/scripts/e2e-wiring.test.ts test/build-llms.test.ts` | 189 pass, 0 fail, 558 assertions | `.context/lifecycle-final-tests.log` |
-| `bun test test/search/alias-hop.test.ts test/search/exact-lookup.test.ts test/search/searchvector-maxpool.test.ts test/search/searchvector-escalation.test.ts test/search/title-retrieval-arm.test.ts test/search/per-call-mode.test.ts test/config-set.test.ts test/operations-descriptions.test.ts` | 149 pass, 0 fail, 384 assertions | `.context/lifecycle-regression.log` |
-| `bun test test/sql-ranking.test.ts` | 52 pass, 0 fail | `.context/lifecycle-sql-ranking.log` |
-| `bun test test/e2e/native-lifecycle-postgres.test.ts` against the isolated cluster below | 28 pass, 0 fail, 85 assertions | `.context/lifecycle-postgres.log` |
-| `bun run typecheck` | Exit 0, `tsc --noEmit` | `.context/lifecycle-check-typecheck.log` |
+| Focused/regression command below | 370 pass, 0 fail, 1,022 assertions across 19 files | `.context/fix-cos-regression.log` |
+| `bun test test/search/native-lifecycle.test.ts test/search/lifecycle-federated-alias.test.ts test/search/lifecycle-config-readback.test.ts` | 47 pass, 0 fail, 225 assertions | `.context/fix-cos-final-focused.log` |
+| Independent rerun: `bun test test/search/native-lifecycle.test.ts` | 32 pass, 0 fail, 144 assertions | `.context/fix-cos-adversarial.log` |
+| `bun test test/e2e/native-lifecycle-postgres.test.ts` with the explicit isolated test URL | 32 pass, 0 fail, 144 assertions | `.context/fix-cos-postgres.log` |
+| `bun test test/scripts/e2e-wiring.test.ts` | 11 pass, 0 fail, 28 assertions | `.context/fix-cos-e2e-wiring.log` |
+| `bun run typecheck` | Exit 0, `tsc --noEmit` | `.context/fix-cos-typecheck-final.log` |
 
-The focused engine contract proves a stronger historical candidate wins with
-configuration absent, then active/missing-status rows fill the requested limit
-with configuration enabled. It checks source grants, private/deleted pages,
-malformed configuration, CJK fallback, local/remote shared operations,
-keyword-only mode and historical get. The indexed vector fixture verifies the
-HNSW index is selected by a control `EXPLAIN`, places 180 historical chunks
-closer than the active page, and confirms configured search still returns that
-active page at limit 1. Pipeline tests additionally check alias cap 3, source
-probe cap 5, seed cap 10 and graph cap 50 with excluded candidates ahead of
-eligible ones.
+```sh
+env -u DATABASE_URL -u GBRAIN_DATABASE_URL -u GBRAIN_HOME -u GBRAIN_CONFIG \
+  bun test test/search/lifecycle-policy.test.ts \
+  test/search/lifecycle-pipeline.test.ts test/search/lifecycle-federated-alias.test.ts \
+  test/search/lifecycle-config-readback.test.ts test/search/lifecycle-crag.test.ts \
+  test/search/crag-query-op.test.ts test/config-get-plane.test.ts test/config-set.test.ts \
+  test/entity-resolve.test.ts test/entity-resolve-prefix-dirs.test.ts \
+  test/relational-recall.test.ts test/search/alias-hop.test.ts test/search/exact-lookup.test.ts \
+  test/search/searchvector-escalation.test.ts test/search/searchvector-maxpool.test.ts \
+  test/search-mode.test.ts test/two-pass.test.ts test/sql-ranking.test.ts test/build-llms.test.ts
+```
 
-Postgres was **actually executed**, not merely skip-green. Docker was unavailable
-(missing daemon socket). Installed PostgreSQL 17.10 and pgvector 0.8.2 were used
-in a temporary cluster at `/private/tmp/gbrain-lifecycle-pg-81a2bdl4/data`,
-loopback port 56778, database `gbrain_lifecycle_test`, role `lifecycle_test`.
-The first sandbox attempt failed before startup on shared-memory allocation;
-the authorized retry passed. Only that temporary database received test schema
-initialization. `pg_ctl -D /private/tmp/gbrain-lifecycle-pg-81a2bdl4/data status`
-after teardown returned `no server running`, exit 3, with no `postmaster.pid`.
+Eight relevant guards passed: `check:module-size`, `check:engine-dynamic-import`, `check:jsonb`, `check:getpage-scope`, `check:test-isolation`, `check:source-id-projection`, `check:doc-history`, `check:tool-catalog`. Their actual outputs are `.context/fix-cos-check-*.log`; the isolation guard scanned 1,672 non-serial unit files. `bun run build:llms` ran; generated outputs were already current. Final whitespace/index verification is recorded below.
 
-For a new isolated test database, rerun with its explicit test-only URL:
+The shared vector contract observes the actual engine query, bindings, plan and returned rows while still executing the real database. Fixture-only planner controls force HNSW selection so small synthetic data cannot silently test a sequential join instead. The nonmatching-policy case returns ten rows using HNSW without exact fallback. Dense excluded neighbors exercise zero ANN rows; a 1,100-chunk eligible page also exercises short pools and pagination after the approximate neighborhood is exhausted. Exact fallback returns distinct eligible pages despite that density, and source/private/deleted decoys remain excluded in every observed pass. This proves the query path under the stated planner controls, not production planner preference or latency.
+
+Shared operation tests cover the CLI/MCP operation implementation through lexical arms in a keyless environment; their vector arm can be unavailable. Direct engine tests separately prove actual vector execution. This is not physical CLI/MCP transport proof. The parent-owned `.context/parent-native-transport.test.ts` was not modified.
+
+Real PostgreSQL 17.10 with pgvector 0.8.2 ran in a fresh task-owned cluster at `/private/tmp/gbrain-fix-cos-pg-fn8mkgpl/data`, loopback port 60987, database `gbrain_lifecycle_test`, role `lifecycle_test`, with pool size one and an isolated home. The command, server output, test output and teardown are preserved in `.context/fix-cos-postgres.log`. After testing, `pg_ctl ... status` returned `no server running` (exit 3), then only the owned temporary directory was removed. An independent final check confirmed the directory is absent and connecting to its port returns error 61 (connection refused).
+
+To repeat against a newly created disposable test database, supply its explicit URL (the suite initializes schema and truncates its own test database):
 
 ```sh
 GBRAIN_TEST_ALLOW_DATABASE_URL=1 DATABASE_URL="$LIFECYCLE_TEST_DATABASE_URL" \
   bun test test/e2e/native-lifecycle-postgres.test.ts
 ```
 
-That test initializes schema and truncates its test database; it must never
-target an operational database. The complete temporary-cluster setup and
-teardown commands are preserved in the local Postgres receipt.
+The final adversarial rerun also passed all 47 alias/config/native PGLite tests after the last fixture correction. An independent agent reopened both engine paths, checked query parameters and the config file path, then reran the native suite: 32 pass, 0 fail. No actionable finding remains in that bounded review.
 
-Additional checks passed: `check:module-size`, `check:engine-dynamic-import`,
-`check:jsonb` (including positional AST scanner), `check:getpage-scope`,
-`check:test-isolation`, `check:tool-catalog`, `check:doc-history`, E2E wiring,
-and `git diff --check`. Documentation/catalog generation ran; their generated
-outputs were already current. Full Docker CI, full unit/E2E corpus, live MCP
-transport journeys and large-brain latency measurements were not run.
+Failure evidence is preserved, not overwritten:
 
-## Policy differences and parent activation
-
-Read-only verification of the established wrapper found its actual
-`exclude_statuses` array is `archived`, `superseded`, `retired`. Its runtime
-checks that array; the eight-value list in the brief is not the current
-status-only configuration. The implementation supports either list without
-hardcoding either. It does not reproduce conditional `expires_at`,
-canonical/generated exceptions, weights or Unicode case folding. Completed
-and rejected statuses are weighted by the inspected wrapper, not universally
-excluded. No live policy was changed.
-
-Accountable parent reviews this branch and owns activation:
-
-1. Review the code/report and the intended status list. To match the verified
-   wrapper's status-only rule, use the three statuses below. A broader list
-   intentionally changes that behavior.
-2. Review latency risk: configured vector searches scan eligible vectors
-   exactly. Existing query timeouts and bounded page-pool escalation remain;
-   large-brain performance is unmeasured.
-3. Through the separately authorized production release process, build/install
-   the reviewed code into the intended native CLI/MCP runtime. No installation,
-   restart, push or deployment was performed here.
-4. On the intended brain, capture any prior setting, then configure and read
-   it back:
-
-   ```sh
-   gbrain config set search.exclude_statuses '["archived","superseded","retired"]'
-   gbrain config get search.exclude_statuses
-   ```
-
-5. Verify ordinary native CLI and actual MCP results on that runtime: an
-   excluded high-score page must disappear, an eligible lower-score page must
-   fill its slot, source/private protections must hold, and explicit historical
-   get must remain authorized. Keep private reproduction identifiers out of
-   public artifacts. Parent owns this activation proof; no coordination from
-   the requester was required for branch preparation.
-
-Rollback: restore the captured previous key value, or run
-`gbrain config unset search.exclude_statuses` if it was absent. That returns
-the prior native historical-search behavior immediately, including automatic
-CRAG synthesis eligibility and normal HNSW selection. The patch changes no
-schema or stored page content; code rollback can use the recorded base through
-the normal release process.
+- `.context/fix1-before.log`: temporary copies of the revision-base resolver reproduce false A relationships with lifecycle absent and configured (6 pass, 4 fail); the temporary source/test copies were removed. `.context/fix1-after.log` has 83 pass, 0 fail after correction.
+- `.context/fix-cos-vector-contract.log`: initial vector fixture plans chose a non-HNSW join despite disabling sequential scans, so index assertions correctly failed. Fixture controls were tightened. The later 1,100-chunk fixture exposed an overly strict test assertion: a legitimate first ANN attempt can return zero before later attempts return one. The assertion now allows earlier zero attempts while requiring a short nonempty attempt and validating every returned identity. Final fresh checks exercise the corrected fixture.
 
 ## Adversarial completion check
 
-| Strict done-condition | Verdict and re-runnable evidence |
+Each condition was checked against actual files or commands after the changes; previous status messages were not used as proof.
+
+| Strict done-condition and attempt to refute it | Verdict and re-runnable evidence |
 |---|---|
-| Real native engine filtering exists before limits, on both engines | **CONFIRMED** — actual engine suites above pass, including dominant historical and forced-index controls; source files reopened after edits. |
-| Caller parameters cannot weaken operator configuration; prior access boundaries survive | **CONFIRMED** — shared operation contract tests pass for local, remote and granted contexts, including attempted historical/empty-exclusion parameters and denied foreign source. |
-| Optional configuration absent preserves the existing search contract | **CONFIRMED** — each engine leg tests absent versus empty policy; existing retrieval regressions pass. |
-| Historical explicit reads and cache separation are deliberate | **CONFIRMED** — historical get and normalized/different cache-key assertions pass. |
-| Temporary test infrastructure is shut down | **CONFIRMED** — fresh `pg_ctl ... status` → `no server running`, exit 3; PID file absent. |
-| Full release and live-runtime acceptance have passed | **UNVERIFIABLE / not claimed** — no release or live activation was performed; parent requirements are listed above. |
-| All broader wrapper/think semantics and large-brain performance match | **UNVERIFIABLE / not claimed** — explicit limitations above; no full-parity or latency claim. |
+| A B-only alias cannot create A's relationship, and stronger B candidates cannot consume A's limit | **CONFIRMED** — `bun test test/search/lifecycle-federated-alias.test.ts` scenarios passed in the 370-test run; the original false attribution was reproduced before the fix. `resolve.ts` was reopened to verify both grant narrowing and result-source validation. |
+| With a real conflicting file or no DB row, readback and actual retrieval agree on the DB policy | **CONFIRMED** — `bun test test/search/lifecycle-config-readback.test.ts` passes all five cases in the regression run. The fixture path was checked against the actual `configDir()`/`configPath()` implementation. |
+| Configuring a nonmatching exclusion does not itself force exact scan; zero/short ANN can still fill the requested unique-page window safely | **CONFIRMED** — the final focused command above → `47 pass / 0 fail`; the isolated PostgreSQL command → `32 pass / 0 fail`. Actual plans show normal `ANN / hnsw: true / rows: 10` with no exact query; exhausted ANN phases then show `exact / hnsw: false / rows: 2` (or 3), with an unlimited eligible pool. Both engine bodies and final assertions were reopened. |
+| Type safety, relevant guards and unchanged retrieval regressions pass | **CONFIRMED** — `bun run typecheck` → exit 0; eight guards → exit 0; regression command → `370 pass / 0 fail`. |
+| Temporary database resources are shut down and removed | **CONFIRMED** — `pg_ctl -D /private/tmp/gbrain-fix-cos-pg-fn8mkgpl/data status` before removal → `no server running`, exit 3. After cleanup, `test ! -e /private/tmp/gbrain-fix-cos-pg-fn8mkgpl` → exit 0; a socket probe to `127.0.0.1:60987` → connection refused. |
+| Changed files are reviewable without whitespace errors | **CONFIRMED** — `git diff --check` → exit 0; the explicit file list was inspected before staging. The commit hash and post-commit state are checked separately in the final handoff. |
+| Full CI, live activation, physical CLI/MCP acceptance, standalone think parity or production-scale latency passed | **UNVERIFIABLE / not claimed** — none was performed by this revision. |
 
-Final verification after the last operation change:
+## Activation and rollback boundary
 
-- `bun test test/search/crag-query-op.test.ts test/search/lifecycle-crag.test.ts`
-  → **9 pass, 0 fail, 58 assertions** (`.context/lifecycle-crag-regression.log`).
-  The new regression proves automatic synthesis never calls takes or the
-  date-window floor under this policy, and absent policy still performs its
-  real keyless gather. This closes a reproduced historical-evidence bypass.
-- `bun test test/search/crag-escalation-limit.serial.test.ts` → **5 pass,
-  0 fail, 37 assertions** (`.context/lifecycle-crag-limit.log`).
-- `bun test test/search/lifecycle-pipeline.test.ts` after the final exact-lookup
-  error-path adjustment → **8 pass, 0 fail**.
-- `bun run typecheck` → **exit 0** (`.context/lifecycle-typecheck-final.log`).
-- `bun run check:module-size` → **exit 0**, ceilings satisfied
-  (`.context/lifecycle-module-final.log`); `git diff --check` → **exit 0**.
+The accountable parent reviews this committed revision and owns any separately authorized release/activation. Review the desired status list, release into the intended native CLI/MCP runtime, capture the prior DB key, set the approved list, and read back the DB-effective value. On that runtime, prove an excluded dominant result disappears, eligible results fill its slot, grants/private protections hold, and authorized historical get remains available. This branch adds no schema migration or page-content rewrite.
 
-The implementation hash can be regenerated after commit with:
+A status-only example from the original branch preparation is `["archived","superseded","retired"]`; the revision did not re-audit or alter any operational policy. The chosen production list remains the parent's activation decision. Restore the captured DB value to roll back policy, or `gbrain config unset search.exclude_statuses` if it was previously absent. That restores native search without lifecycle exclusions, including automatic CRAG eligibility. Code rollback follows the normal release process.
+
+Remaining risks: exact fallback can be costly on large brains, though full ANN pages avoid it; production latency and planner choice are unmeasured. Existing query timeouts remain, and PostgreSQL imposes its existing eight-second statement timeout per vector attempt. Full CI and live-runtime acceptance remain separate from this tested branch preparation.
+
+Regenerate the revision implementation hash after commit with:
 
 ```sh
-git diff --binary 306ab2a09bf6c77687f5710cc93760ef2cb74494 HEAD -- . \
-  ':!BUILD-RESULT.md' ':!BUILD-COS.md.orig' | shasum -a 256
+git diff --binary 2451ed4e923f5082f8210a293d373677e01d13d3 HEAD -- . \
+  ':!BUILD-RESULT.md' ':!*.orig' | shasum -a 256
 ```
-
-**CONFIRMED:** no unresolved refuted completion claim remains within branch
-preparation. **UNVERIFIABLE / not claimed:** live activation, full CI and
-large-brain performance. Next action: accountable parent reviews the local
-commit and runs the separately authorized activation proof above.

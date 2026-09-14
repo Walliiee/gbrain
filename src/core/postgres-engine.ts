@@ -1967,8 +1967,8 @@ export class PostgresEngine implements BrainEngine {
     // fall back to exact scans where ef_search is irrelevant — capping their
     // SQL LIMIT would make offset >= 1000 permanently empty; they stay
     // bounded by the escalation count instead.
-    const exactLifecycleScan = !!opts.excludeStatuses?.length;
-    const innerCap = !exactLifecycleScan && hnswIndexExpected(resolvedCol.type, resolvedCol.dimensions)
+    const lifecycleFallback = !!opts.excludeStatuses?.length;
+    const innerCap = hnswIndexExpected(resolvedCol.type, resolvedCol.dimensions)
       ? HNSW_EF_SEARCH_MAX
       : Number.MAX_SAFE_INTEGER;
     const innerLimit = Math.min(offset + Math.max(limit * 5, 100), innerCap);
@@ -2044,11 +2044,9 @@ export class PostgresEngine implements BrainEngine {
     // in Voyage multimodal-3 space — no modality filter; the column itself
     // is the discriminator (rows without embedding_multimodal aren't searched).
     const { col, castSql } = buildVectorCastFragment(resolvedCol);
-    // HNSW applies page filters after its bounded ANN scan. With lifecycle
-    // exclusions, an excluded nearest neighborhood can starve eligible pages.
-    // + 0 disqualifies distance-index ordering so filtering precedes an exact
-    // sort; absent policy retains the existing HNSW path and performance.
-    const distanceOrder = exactLifecycleScan ? `(cc.${col} <=> ${castSql}) + 0` : `cc.${col} <=> ${castSql}`;
+    // Keep indexed distance ordering for the normal pass. Only an underfilled
+    // bounded search falls back to + 0 (exact ordering) over ALL eligible
+    // chunks; the same query body preserves every filter in both passes.
     let modalityFilter: string;
     if (resolvedCol.name === 'embedding_image') {
       modalityFilter = `AND cc.modality = 'image'`;
@@ -2058,7 +2056,7 @@ export class PostgresEngine implements BrainEngine {
       modalityFilter = `AND cc.modality = 'text'`;
     }
 
-    const rawQuery = `
+    const rawQuery = (exact: boolean) => `
       WITH hnsw_candidates AS (
         SELECT
           p.slug, p.id as page_id, p.title, p.type, p.source_id,
@@ -2085,7 +2083,7 @@ export class PostgresEngine implements BrainEngine {
           ${sourceClause}
           ${hardExcludeClause}
           ${visibilityClause}
-        ORDER BY ${distanceOrder}
+        ORDER BY ${exact ? `(cc.${col} <=> ${castSql}) + 0` : `cc.${col} <=> ${castSql}`}
         LIMIT ${innerLimitParam}
       ),
       -- score computed as a select-list expr (NOT in the inner ORDER BY, which
@@ -2127,14 +2125,14 @@ export class PostgresEngine implements BrainEngine {
     // v0.46.15 bounded escalation (identical logic in pglite-engine —
     // engine-parity pinned): retry ×4 up to 3 times while the PAGE set is
     // short but the pre-collapse candidate pool was FULL. A short page with
-    // a non-full pool is a genuine final page (corpus/filter exhausted) —
-    // no retry, no event. Zero rows with offset>0 escalates (deep
-    // pagination) but never emits: pool state is unknowable there.
-    const runOnce = async (il: number) =>
+    // Without exclusions, a non-full pool is a final page; offset>0 retries
+    // empty results. Lifecycle filtering can exhaust ANN before its pool fills,
+    // so every configured short page retries before exact fallback.
+    const runOnce = async (il: number, exact = false) =>
       await this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
         await tx`SET LOCAL statement_timeout = '8s'`;
         await tx`SELECT set_config('hnsw.ef_search', ${String(hnswEfSearchFor(il))}, true)`;
-        return await tx.unsafe(rawQuery, params as Parameters<typeof tx.unsafe>[1]);
+        return await tx.unsafe(rawQuery(exact), params as Parameters<typeof tx.unsafe>[1]);
       }, { alwaysTransaction: true });
     let escalations = 0;
     let rows = await runOnce(innerLimit);
@@ -2142,10 +2140,10 @@ export class PostgresEngine implements BrainEngine {
       const il = params[innerLimitIdx] as number;
       if (rows.length >= limit) break;
       const pool = rows.length > 0 ? Number((rows[0] as { candidate_pool?: number }).candidate_pool ?? 0) : null;
-      const shouldEscalate = pool !== null ? pool >= il : offset > 0;
+      const shouldEscalate = lifecycleFallback || (pool !== null ? pool >= il : offset > 0);
       if (!shouldEscalate) break;
       if (il >= innerCap || escalations >= 3) {
-        if (pool !== null && pool >= il) {
+        if (!lifecycleFallback && pool !== null && pool >= il) {
           opts?.onVectorPoolMeta?.({ underfilled: true, escalations, innerLimit: il });
         }
         break;
@@ -2153,6 +2151,15 @@ export class PostgresEngine implements BrainEngine {
       params[innerLimitIdx] = Math.min(il * 4, innerCap);
       escalations++;
       rows = await runOnce(params[innerLimitIdx] as number);
+    }
+    // rows are already unique pages AFTER OFFSET. A full returned page proves
+    // offset + limit eligible pages survived; even zero rows require fallback
+    // when lifecycle filtering may have exhausted the approximate neighborhood.
+    if (lifecycleFallback && rows.length < limit) {
+      // PostgreSQL LIMIT NULL means ALL: no dense eligible page can consume a
+      // second chunk cap before the exact best-per-page collapse.
+      params[innerLimitIdx] = null;
+      rows = await runOnce(innerLimit, true);
     }
     return rows.map(rowToSearchResult);
   }

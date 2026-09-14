@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { lifecycleSearchContract, seedLifecycleCorpus } from '../helpers/lifecycle-search-contract.ts';
+import { lifecycleVectorContract } from '../helpers/lifecycle-vector-contract.ts';
 
 describe('native lifecycle search contract (PGLite)', () => {
   let engine: PGLiteEngine;
@@ -16,4 +17,5 @@ describe('native lifecycle search contract (PGLite)', () => {
   });
 
   lifecycleSearchContract(() => engine);
+  lifecycleVectorContract(() => engine);
 });

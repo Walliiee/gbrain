@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe } from 'bun:test';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 import { lifecycleSearchContract, seedLifecycleCorpus } from '../helpers/lifecycle-search-contract.ts';
+import { lifecycleVectorContract } from '../helpers/lifecycle-vector-contract.ts';
 
 // Never loads .env.testing, operator config or an implicit live database.
 const databaseUrl = process.env.DATABASE_URL;
@@ -21,4 +22,5 @@ describe.skipIf(!databaseUrl)('native lifecycle search contract (Postgres)', () 
   });
 
   lifecycleSearchContract(() => engine);
+  lifecycleVectorContract(() => engine);
 });

@@ -53,6 +53,9 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/search-swamp.test.ts",
   ],
   "src/commands/config.ts": ["test/e2e/native-lifecycle-postgres.test.ts"],
+  // Shared lifecycle contracts run on both engines, including real ANN plans.
+  "test/helpers/lifecycle-search-contract.ts": ["test/e2e/native-lifecycle-postgres.test.ts"],
+  "test/helpers/lifecycle-vector-contract.ts": ["test/e2e/native-lifecycle-postgres.test.ts"],
   // Tree-sitter chunkers feed code-indexing E2E.
   "src/core/chunkers/**": ["test/e2e/code-indexing.test.ts", "test/e2e/legacy-chunk-privacy.test.ts", "test/e2e/chunk-canonical-text-privacy.test.ts"],
   // OpenClaw context-engine plugin: engine + entry feed the plugin-shape E2E
