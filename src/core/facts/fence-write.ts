@@ -766,6 +766,9 @@ class StampRefusal extends Error {
 
 function legacyIsoDate(v: Date | string | null | undefined): string | undefined {
   if (v == null) return undefined;
+  // The repair queries timestamptz columns as text so PostgreSQL preserves the
+  // session's calendar day instead of the JS driver converting it through UTC.
+  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}(?:$|T|\s)/.test(v)) return v.slice(0, 10);
   const d = v instanceof Date ? v : new Date(v);
   return Number.isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
 }
@@ -971,7 +974,8 @@ async function healCrashResidue(
   for (const f of extras) rebuilt = upsertFactRow(rebuilt, parsedToUpsertRow(f)).body;
   if (rebuilt !== working) return 'not_residue';
   const dbRows = await engine.executeRaw<LegacyStampRow>(
-    `SELECT id::text AS id, fact, kind, visibility, notability, context, valid_from, valid_until, source, confidence,
+    `SELECT id::text AS id, fact, kind, visibility, notability, context,
+            valid_from::text AS valid_from, valid_until::text AS valid_until, source, confidence,
             claim_metric, claim_value, claim_unit, claim_period, superseded_by
        FROM facts WHERE source_id = $1 AND entity_slug = $2 AND row_num IS NULL`,
     [sourceId, slug],
@@ -1169,7 +1173,8 @@ export async function stampLegacyFactsToFence(
           }
 
           const current = await tx.executeRaw<LegacyStampRow & { expired_at: unknown; row_num: number | null; entity_slug: string | null }>(
-            `SELECT id::text AS id, fact, source, kind, visibility, notability, context, valid_from, valid_until, confidence,
+            `SELECT id::text AS id, fact, source, kind, visibility, notability, context,
+                    valid_from::text AS valid_from, valid_until::text AS valid_until, confidence,
                     claim_metric, claim_value, claim_unit, claim_period, superseded_by, expired_at, row_num, entity_slug
                FROM facts WHERE id = ANY($1::bigint[]) AND source_id = $2 FOR UPDATE`,
             [ids.map(Number), sourceId],

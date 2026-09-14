@@ -116,8 +116,8 @@ const ELIGIBLE_WHERE = `
 export async function listLegacyRowsForSource(engine: BrainEngine, sourceId: string): Promise<LegacyFactRow[]> {
   return engine.executeRaw<LegacyFactRow>(
     `SELECT f.id::text AS id, f.source_id, f.entity_slug, f.fact, f.kind, f.visibility,
-            f.notability, f.context, f.valid_from, f.valid_until, f.source, f.confidence,
-            f.claim_metric, f.claim_value, f.claim_unit, f.claim_period, f.superseded_by
+            f.notability, f.context, f.valid_from::text AS valid_from, f.valid_until::text AS valid_until,
+            f.source, f.confidence, f.claim_metric, f.claim_value, f.claim_unit, f.claim_period, f.superseded_by
        FROM facts f${ELIGIBLE_WHERE}
       ORDER BY f.entity_slug, f.id`,
     [sourceId],
