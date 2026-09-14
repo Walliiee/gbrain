@@ -7,7 +7,8 @@
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -22,6 +23,12 @@ import {
 } from '../src/core/sweep.ts';
 import { isTotalFailure, runSweep, SWEEP_HELP } from '../src/commands/sweep.ts';
 import { importFromContent } from '../src/core/import-file.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { parseFactsFence } from '../src/core/facts-fence.ts';
+import { parseMarkdown } from '../src/core/markdown.ts';
+import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
+import { repairLegacyRowsForSource } from '../src/core/facts/fence-legacy.ts';
+import { forgetFactInFence } from '../src/core/facts/forget.ts';
 import { currentExitCode, _resetCliExitVerdictForTests } from '../src/core/cli-force-exit.ts';
 import { _resetStdoutRedirectForTests } from '../src/core/console-prefix.ts';
 import type { CapabilityReport } from '../src/core/capability.ts';
@@ -144,6 +151,139 @@ describe('runMaintenanceSweep — facts-fence reconciliation [CX2-4]', () => {
       capabilities: KEYLESS,
     });
     expect(r.factsReconciled).toBe(0);
+  });
+});
+
+describe('runMaintenanceSweep — the fence pass carries the cycle\'s residue protection for a source with a local_path', () => {
+  // Codex acceptance round 4, P1: the extractor's legacy repair + residue-only
+  // sweep are gated on `repairLegacy ?? brainDir !== undefined`, and the sweep
+  // passed neither — so a page the cycle had just halted on (a crashed
+  // repair's fence rows still in the file and the cache, their DB row since
+  // forgotten) was reconciled by the next idle sweep and the forgotten claim
+  // re-inserted. The sweep now resolves `sources.local_path` and enables the
+  // repair for a source that has one.
+  const SRC = 'wiki';
+  const ALICE = 'people/alice';
+  const ALICE_MD = 'people/alice.md';
+  const BODY = '---\ntype: person\ntitle: Alice\n---\n\n# Alice\n\nA person who does things.\n';
+  let repo: string;
+  let home: string;
+  const git = (...args: string[]) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf-8' });
+  const factRows = () => engine.executeRaw<{ id: string; row_num: number | null; expired: boolean }>(
+    `SELECT id::text AS id, row_num, expired_at IS NOT NULL AS expired FROM facts WHERE source_id = $1 ORDER BY id`, [SRC]);
+  const sweep = () => withEnv({ GBRAIN_HOME: home }, () =>
+    runMaintenanceSweep(engine, { sourceId: SRC, capabilities: KEYLESS }));
+
+  beforeEach(async () => {
+    repo = mkdtempSync(join(tmpdir(), 'gbrain-sweep-residue-repo-'));
+    home = mkdtempSync(join(tmpdir(), 'gbrain-sweep-residue-home-'));
+    tmpDirs.push(repo, home);
+    git('init', '-q');
+    git('config', 'user.email', 'test@example.com');
+    git('config', 'user.name', 'test');
+    git('config', 'commit.gpgsign', 'false');
+    mkdirSync(join(repo, 'people'), { recursive: true });
+    writeFileSync(join(repo, ALICE_MD), BODY, 'utf-8');
+    git('add', '--', ALICE_MD);
+    git('commit', '-q', '-m', 'fixture');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ($1, $1, $2) ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path`,
+      [SRC, repo]);
+    const parsed = parseMarkdown(BODY, `${ALICE}.md`);
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline) VALUES ($1, $2, 'person', 'Alice', $3, $4)`,
+      [ALICE, SRC, parsed.compiled_truth, parsed.timeline]);
+  });
+
+  /**
+   * Residue exactly as the real writer leaves it: the repair dies after the
+   * rename and before COMMIT, cannot verify (indeterminate, so the fenced
+   * file stays), the sole row is then forgotten, and a sync imports the
+   * fenced file into the cache — file and cache both carry the forgotten claim.
+   */
+  async function forgottenResidueFromRealWriter(): Promise<string> {
+    const ids = await engine.executeRaw<{ id: string }>(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence)
+       VALUES ($1, $2, 'Founded Acme', 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', 'mcp:put_page', 0.9) RETURNING id::text AS id`,
+      [SRC, ALICE]);
+    const crashed = await withEnv({ GBRAIN_HOME: home }, () => repairLegacyRowsForSource(engine, { sourceId: SRC, hooks: {
+      beforeCommit: () => { throw new Error('crash before COMMIT'); },
+      beforeVerifyLanded: () => { throw new Error('verification unavailable'); },
+    } }));
+    expect(crashed.rowsStamped).toBe(0);
+    const residue = readFileSync(join(repo, ALICE_MD), 'utf-8');
+    expect(parseFactsFence(residue).facts).toHaveLength(1);
+    expect(await forgetFactInFence(engine, Number(ids[0]!.id), { reason: 'forget after crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    const synced = parseMarkdown(residue, `${ALICE}.md`);
+    await engine.refreshPageBody(ALICE, SRC, synced.compiled_truth, synced.timeline, 'synced');
+    expect(parseFactsFence((await engine.getPage(ALICE, { sourceId: SRC }))!.compiled_truth!).facts).toHaveLength(1);
+    return residue;
+  }
+  const noActiveCopy = async () => {
+    const rows = await factRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ row_num: null, expired: true });
+  };
+
+  test('a residue-only page is healed by the sweep, not reconciled from its residue: nothing inserted, the preimage restored, cache cleared', async () => {
+    await forgottenResidueFromRealWriter();
+    const r = await sweep();
+    expect(r.factsReconciled).toBe(0);                                          // pre-fix: 1 — the forgotten claim came back
+    expect(r.skipped).toEqual([]);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(BODY);
+    expect(git('status', '--porcelain=v1', '--', ALICE_MD)).toBe('');
+    expect(parseFactsFence((await engine.getPage(ALICE, { sourceId: SRC }))!.compiled_truth!).facts).toEqual([]);
+    await noActiveCopy();
+  });
+
+  test('after a halted cycle (the repair could not complete), the next sweep does not bypass the halt: still nothing inserted', async () => {
+    const residue = await forgottenResidueFromRealWriter();
+    const raw = engine.executeRaw;
+    engine.executeRaw = (async function (this: PGLiteEngine, ...args: Parameters<typeof raw>) {
+      if (String(args[0]).includes('SELECT f.id::text AS id, f.source_id')) throw new Error('repair failure before the resident sweep');
+      return raw.apply(this, args);
+    }) as typeof raw;
+    let halted;
+    try {
+      halted = await withEnv({ GBRAIN_HOME: home }, () => runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE] }));
+    } finally { engine.executeRaw = raw; }
+    expect(halted).toMatchObject({ guardTriggered: true, factsInserted: 0, repairFailed: expect.stringContaining('listing eligible legacy rows') });
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);          // the halt left the residue in place
+    const r = await sweep();
+    expect(r.factsReconciled).toBe(0);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(BODY);
+    await noActiveCopy();
+  });
+
+  test('a page the sweep cannot prove safe is skipped by the sweep\'s reconcile too, and the halt is visible on the report', async () => {
+    const residue = await forgottenResidueFromRealWriter();
+    const theirs = residue + '\nA paragraph a human added.\n';
+    writeFileSync(join(repo, ALICE_MD), theirs, 'utf-8');
+    const synced = parseMarkdown(theirs, `${ALICE}.md`);
+    await engine.refreshPageBody(ALICE, SRC, synced.compiled_truth, synced.timeline, 'synced');
+    const r = await sweep();
+    expect(r.factsReconciled).toBe(0);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);           // the human's file is never touched
+    await noActiveCopy();
+    // A repair-wide failure halts the pass and the sweep books it like the guard's own halt.
+    const raw = engine.executeRaw;
+    engine.executeRaw = (async function (this: PGLiteEngine, ...args: Parameters<typeof raw>) {
+      if (String(args[0]).includes('SELECT f.id::text AS id, f.source_id')) throw new Error('legacy list unavailable');
+      return raw.apply(this, args);
+    }) as typeof raw;
+    let r2;
+    try { r2 = await sweep(); } finally { engine.executeRaw = raw; }
+    expect(r2.factsReconciled).toBe(0);
+    expect(r2.skipped).toEqual([{ reason: 'facts_fence_guard', count: 1 }]);
+    await noActiveCopy();
+  });
+
+  test('GBRAIN_FACT_REPAIR=off keeps the sweep\'s reconcile exactly as it was: no repair runs (control)', async () => {
+    await forgottenResidueFromRealWriter();
+    const r = await withEnv({ GBRAIN_HOME: home, GBRAIN_FACT_REPAIR: 'off' }, () =>
+      runMaintenanceSweep(engine, { sourceId: SRC, capabilities: KEYLESS }));
+    expect(r.skipped).toEqual([]);
+    expect(parseFactsFence(readFileSync(join(repo, ALICE_MD), 'utf-8')).facts).toHaveLength(1);   // nothing restored
   });
 });
 

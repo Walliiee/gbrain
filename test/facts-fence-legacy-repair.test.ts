@@ -24,7 +24,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } fr
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -1829,6 +1829,237 @@ describe('acceptance round 4 (2026-09-14) — a repair that cannot complete fail
     expect(r.guardTriggered).toBe(false);
     expect(r.repairFailed).toBeUndefined();
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
+  });
+});
+
+describe('acceptance round 5 (2026-09-14) — only a PROVEN clean file reads as clean, in any filename; a page the writer cannot resolve is its own refusal', () => {
+  // Codex acceptance round 4. P1: `gitPathState` compared git's porcelain path
+  // literally, but `core.quotePath` (default true) prints any non-ASCII byte
+  // C-quoted — `"people/\303\251lise.md"` — so the crashed repair's own dirt on
+  // an ordinary é/æ/ø/å filename read as `foreign_dirty`, which the residue
+  // sweep then read as CLEAN: no block, and the reconcile re-inserted the
+  // forgotten claim. P2: `resolvePageWriteTarget` ran outside the writer's
+  // catch, so a DB fault on the second page threw through the repair and the
+  // pass's summary (first page already stamped) was lost.
+  const ELISE = 'people/élise';                                                  // NFC: one code point
+  const ELISE_MD = 'people/élise.md';
+  const NFD_ELISE_MD = ELISE_MD.normalize('NFD');                                // e + combining acute
+  const noActiveCopy = async () => {
+    const rows = await factRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.expired_at).not.toBeNull();
+    expect(rows[0]!.row_num).toBeNull();
+  };
+  async function addPage(slug: string, rel: string): Promise<void> {
+    writeFileSync(join(repo, rel), ALICE_BODY, 'utf-8');
+    git(repo, 'add', '--', rel);
+    git(repo, 'commit', '-q', '-m', `add ${rel}`);
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline) VALUES ($1, $2, 'person', 'Élise', $3, '')`,
+      [slug, SRC, ALICE_DB_BODY],
+    );
+  }
+  const plantResidue = (rel: string) => {
+    const body = upsertFactRow(ALICE_BODY, {
+      rowNum: 1, claim: 'Founded Acme', kind: 'fact', confidence: 0.9, visibility: 'private',
+      notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
+    }).body;
+    writeFileSync(join(repo, rel), body, 'utf-8');
+    return body;
+  };
+
+  test('P1: a non-ASCII filename under Git\'s default core.quotePath — the real writer\'s crash residue is recognised as its own dirt, the preimage restored, nothing inserted', async () => {
+    git(repo, 'config', 'core.quotePath', 'true');                              // git's default, pinned against any global override
+    await addPage(ELISE, ELISE_MD);
+    const a = await seed('Founded Acme', ELISE);
+    const crashed = await run({
+      beforeCommit: () => { throw new Error('crash before COMMIT'); },
+      beforeVerifyLanded: () => { throw new Error('verification unavailable'); },
+    });
+    expect(crashed.rowsStamped).toBe(0);
+    expect(diskFence(ELISE_MD).facts).toHaveLength(1);                           // the residue is on disk
+    // The shape that bypassed the sweep: git's own porcelain output for this
+    // path is the C-quoted, octal-escaped form, not the filename.
+    expect(git(repo, 'status', '--porcelain=v1', '--', ELISE_MD)).toBe(' M "people/\\303\\251lise.md"\n');
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'forget after crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    await syncBody(ELISE, ELISE_MD);
+    expect((await dbFence(ELISE)).facts).toHaveLength(1);
+    const r = await reconcile({ slugs: [ELISE] });
+    expect(r.factsInserted).toBe(0);                                             // pre-fix: 1 — the forgotten claim came back
+    expect(r.guardTriggered).toBe(false);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1, residuePagesBlocked: [] });
+    expect(readFileSync(join(repo, ELISE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect(git(repo, 'status', '--porcelain=v1', '--', ELISE_MD)).toBe('');
+    expect((await dbFence(ELISE)).facts).toEqual([]);
+    await noActiveCopy();
+  });
+
+  test('P1: the index holds the path in NFD while the DB names it in NFC (core.precomposeunicode=false): still recognised — the sweep asks git for every form and HEAD is found under the form it holds', async () => {
+    if (process.platform !== 'darwin') return;                                  // needs a normalization-insensitive filesystem
+    git(repo, 'config', 'core.precomposeunicode', 'false');
+    await addPage(ELISE, NFD_ELISE_MD);                                          // created and committed under the NFD name
+    expect(git(repo, 'ls-files', '-z').split('\0')).toContain(NFD_ELISE_MD);
+    // The NFC pathspec matches NOTHING in this index — an empty status that
+    // used to read as clean.
+    expect(git(repo, 'status', '--porcelain=v1', '--', ELISE_MD)).toBe('');
+    const a = await seed('Founded Acme', ELISE);
+    plantResidue(ELISE_MD);                                                      // the same file, reached under its NFC name
+    expect(git(repo, 'status', '--porcelain=v1', '--', ELISE_MD)).toBe('');     // still invisible to the NFC pathspec
+    expect(git(repo, 'status', '--porcelain=v1', '-z', '--', NFD_ELISE_MD)).toBe(` M ${NFD_ELISE_MD}\0`);
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'forget after crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    await syncBody(ELISE, ELISE_MD);
+    const r = await reconcile({ slugs: [ELISE] });
+    expect(r.factsInserted).toBe(0);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1, residuePagesBlocked: [] });
+    expect(readFileSync(join(repo, ELISE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect((await dbFence(ELISE)).facts).toEqual([]);
+    await noActiveCopy();
+  });
+
+  test('P1: an unmerged file is not clean — the residue-only sweep hands it back not_residue and the reconcile leaves the page alone', async () => {
+    // Two branches each commit a different fence row at the same spot: the
+    // merge leaves `UU people/alice.md` — dirt the parse must not attribute to
+    // the repair, and must not read as clean either.
+    const theirs = plantResidue(ALICE_MD); commitAll('theirs');
+    git(repo, 'branch', 'theirs');
+    git(repo, 'reset', '-q', '--hard', 'HEAD~1');
+    writeFileSync(join(repo, ALICE_MD), upsertFactRow(ALICE_BODY, {
+      rowNum: 1, claim: 'Founded Acme Corp', kind: 'fact', confidence: 0.9, visibility: 'private',
+      notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
+    }).body, 'utf-8');
+    commitAll('ours');
+    expect(() => git(repo, 'merge', 'theirs')).toThrow();
+    expect(git(repo, 'status', '--porcelain=v1', '--', ALICE_MD)).toBe(`UU ${ALICE_MD}\n`);
+    const conflicted = readFileSync(join(repo, ALICE_MD), 'utf-8');
+    expect(conflicted).toContain('<<<<<<<');
+    const a = await seed('Founded Acme');
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'forgotten' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    await syncBody();                                                            // a sync imported the conflicted file as-is
+    expect((await dbFence()).facts.length).toBeGreaterThan(0);
+    const r = await reconcile();
+    expect(r.factsInserted).toBe(0);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.stringContaining('foreign_dirty') }]);
+    expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
+    expect(r.factsInserted).toBe(0);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(conflicted);         // untouched
+    await noActiveCopy();
+    expect(theirs).not.toBe(conflicted);
+  });
+
+  test('P1: a source directory that is not a git repository is not clean either — blocked `error`, never read as clean', async () => {
+    const a = await seed('Founded Acme');
+    const body = plantResidue(ALICE_MD);
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'forgotten' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    await syncBody();
+    rmSync(join(repo, '.git'), { recursive: true, force: true });
+    // The tempdir may itself sit inside an unrelated repository (a TMPDIR
+    // under a checked-out home); the ceiling keeps git's discovery from
+    // climbing into it, so this fixture is "no repository" everywhere.
+    const r = await withEnv({ GBRAIN_HOME: home, GIT_CEILING_DIRECTORIES: dirname(repo) }, () =>
+      runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE] }));
+    expect(r.factsInserted).toBe(0);
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'error', detail: expect.stringContaining('git state unknown') }]);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 0, residuePagesHealed: 0 });
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
+    await noActiveCopy();
+  });
+
+  test('P1: an empty status is not a proof — a source nested in an unrelated repository that git-ignores it has no committed preimage: blocked not_residue, never read as clean', async () => {
+    // `repo` stays the enclosing repository; the source lives in an ignored
+    // subdirectory of it and is not a repository of its own. `git status` for
+    // the file is empty (ignored paths are not listed), which used to read as
+    // clean — the same shape as the stamp path's "ignored is not a preimage".
+    writeFileSync(join(repo, '.gitignore'), 'brain/\n', 'utf-8');
+    commitAll('ignore the nested brain');
+    const brain = join(repo, 'brain');
+    mkdirSync(join(brain, 'people'), { recursive: true });
+    await engine.executeRaw(`UPDATE sources SET local_path = $2 WHERE id = $1`, [SRC, brain]);
+    const a = await seed('Founded Acme');
+    const body = upsertFactRow(ALICE_BODY, {
+      rowNum: 1, claim: 'Founded Acme', kind: 'fact', confidence: 0.9, visibility: 'private',
+      notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
+    }).body;
+    writeFileSync(join(brain, ALICE_MD), body, 'utf-8');
+    expect(git(repo, 'status', '--porcelain=v1', '--untracked-files=all', '--', `brain/${ALICE_MD}`)).toBe('');
+    expect(git(repo, 'check-ignore', `brain/${ALICE_MD}`).trim()).toBe(`brain/${ALICE_MD}`);
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'forgotten' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    const parsed = parseMarkdown(body, `${ALICE}.md`);
+    await engine.refreshPageBody(ALICE, SRC, parsed.compiled_truth, parsed.timeline, 'synced');
+    const r = await reconcile();
+    expect(r.factsInserted).toBe(0);
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.stringContaining('ignored: no committed preimage') }]);
+    expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
+    expect(readFileSync(join(brain, ALICE_MD), 'utf-8')).toBe(body);
+    await noActiveCopy();
+  });
+
+  test('P2: a target-resolution query that throws for the second page is that page\'s `error` refusal — the first stamp stands, the summary comes back with every counter, nothing throws', async () => {
+    const BOB = 'people/bob';
+    await addPage(BOB, 'people/bob.md');
+    await seed('Fact for alice');
+    await seed('Fact for bob', BOB);
+    const raw = engine.executeRaw;
+    let injected = false;
+    engine.executeRaw = (async function (this: PGLiteEngine, ...args: Parameters<typeof raw>) {
+      if (String(args[0]).includes('SELECT source_path, source_uri FROM pages') && (args[1] as unknown[])?.[1] === BOB) {
+        injected = true;
+        throw new Error('bob target query unavailable');
+      }
+      return raw.apply(this, args);
+    }) as typeof raw;
+    let s;
+    try { s = await run(); } finally { engine.executeRaw = raw; }
+    expect(injected).toBe(true);
+    expect(s.failure).toBeUndefined();                                             // the pass COMPLETED; one page refused
+    expect(s).toMatchObject({ rowsEligible: 2, rowsStamped: 1, rowsAppended: 1, pagesFenced: 1, pagesSkipped: 1, rowsRemaining: 1 });
+    expect(s.skippedByReason).toEqual({ error: 1 });
+    expect(s.skippedDetails).toEqual(['people/bob (error: bob target query unavailable)']);
+    const rows = await factRows();
+    expect(rows.map(x => [x.fact, x.row_num])).toEqual([['Fact for alice', 1], ['Fact for bob', null]]);
+    expect(diskFence().facts.map(f => f.claim)).toEqual(['Fact for alice']);
+    expect(diskFence('people/bob.md').facts).toEqual([]);
+
+    // Through the phase: the guard halts on bob's row with the partial repair
+    // reported (stamped 1, 1 page refused), not as an incomplete repair.
+    engine.executeRaw = (async function (this: PGLiteEngine, ...args: Parameters<typeof raw>) {
+      if (String(args[0]).includes('SELECT source_path, source_uri FROM pages') && (args[1] as unknown[])?.[1] === BOB) throw new Error('bob target query unavailable');
+      return raw.apply(this, args);
+    }) as typeof raw;
+    let r;
+    try { r = await reconcile({ slugs: [ALICE, BOB] }); } finally { engine.executeRaw = raw; }
+    expect(r.guardTriggered).toBe(true);
+    expect(r.repairFailed).toBeUndefined();
+    expect(r.legacyRowsRepaired).toBe(0);                                          // alice was stamped by the pass above; nothing new
+    expect(r.legacyRowsPending).toBe(1);
+    expect(r.legacyRepair).toMatchObject({ rowsEligible: 1, rowsStamped: 0, pagesSkipped: 1, skippedByReason: { error: 1 }, rowsRemaining: 1 });
+    expect(r.warnings).toContainEqual(expect.stringContaining('legacy repair left 1 page(s) unfenced'));
+    expect(r.warnings).not.toContainEqual(expect.stringContaining('FACTS_REPAIR_INCOMPLETE'));
+    expect(r.factsInserted).toBe(0);
+    // The fault clears: the next run stamps bob and reconciles.
+    const r2 = await reconcile({ slugs: [ALICE, BOB] });
+    expect(r2.guardTriggered).toBe(false);
+    expect(r2.legacyRowsRepaired).toBe(1);
+    expect((await factRows()).map(x => x.row_num)).toEqual([1, 1]);
+  });
+
+  test('P2: the pre-lock write-through switch read throwing is the same per-page `error` refusal; a dry-run never throws either', async () => {
+    await seed('Founded Acme');
+    const raw = engine.executeRaw;
+    const failing = (async function (this: PGLiteEngine, ...args: Parameters<typeof raw>) {
+      if (String(args[0]).includes('SELECT source_path, source_uri FROM pages')) throw new Error('target query unavailable');
+      return raw.apply(this, args);
+    }) as typeof raw;
+    engine.executeRaw = failing;
+    let s, d;
+    try {
+      s = await run();
+      d = await run(undefined, { dryRun: true });
+    } finally { engine.executeRaw = raw; }
+    expect(s).toMatchObject({ rowsStamped: 0, pagesSkipped: 1, skippedByReason: { error: 1 }, rowsRemaining: 1 });
+    expect(d).toMatchObject({ dryRun: true, rowsStamped: 0, pagesSkipped: 1, skippedByReason: { error: 1 } });
+    expect((await factRows())[0]!.row_num).toBeNull();
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
   });
 });
 

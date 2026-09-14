@@ -173,28 +173,49 @@ function gitRootRelative(repoPath: string, rel: string): string {
   }
 }
 
+/**
+ * The Unicode forms a path may take in git's index and worktree, deduped. macOS
+ * is normalization-insensitive: a file the DB names in NFC (`é` as one code
+ * point) may sit in the index as NFD (`e` + combining acute) or the reverse,
+ * and a pathspec in the other form matches NOTHING — an empty status that
+ * would read as clean. Ask git for every form; compare on one.
+ */
+function pathspecForms(rel: string): string[] {
+  return [...new Set([rel, rel.normalize('NFC'), rel.normalize('NFD')])];
+}
+
+function samePath(a: string, b: string): boolean {
+  return a.normalize('NFC') === b.normalize('NFC');
+}
+
 function gitPathState(repoPath: string, filePath: string): FactFenceGitPathState {
   try {
     const rel = relative(repoPath, filePath);
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) return 'unknown';
+    // `-z`: every path verbatim and NUL-terminated. Without it, `core.quotePath`
+    // (default true) prints any non-ASCII byte C-quoted — `"people/\303\251lise.md"`
+    // for `people/élise.md` — which no literal comparison recognises, so an
+    // ordinary æ/ø/å or é filename read as foreign dirt.
     const status = execFileSync(
       'git',
-      ['-C', repoPath, 'status', '--porcelain=v1', '--untracked-files=all', '--', rel],
+      ['-C', repoPath, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...pathspecForms(rel)],
       GIT_OPTS,
     );
-    const lines = status.split('\n').filter((l) => l.length > 0);
-    if (lines.length === 0) return 'clean';
+    const entries = status.split('\0').filter((l) => l.length > 0);
+    if (entries.length === 0) return 'clean';
     const rootRel = gitRootRelative(repoPath, rel);
     // Distinguish dirt that IS the target fence file (safe for the
     // path-limited commit to sweep — a prior gbrain fence-commit that failed
     // leaves exactly this shape) from genuinely foreign dirt: unmerged
-    // conflict states, rename entries naming a second path, or any entry the
-    // parse can't positively attribute to the file (git quotes special chars).
-    for (const line of lines) {
-      const xy = line.slice(0, 2);
+    // conflict states, rename/copy entries (under `-z` the ORIGINAL path
+    // follows as a second NUL-terminated field, so returning here also keeps
+    // it from being read as an entry of its own), or any entry the parse
+    // can't positively attribute to the file.
+    for (const entry of entries) {
+      const xy = entry.slice(0, 2);
       if (xy.includes('U') || xy === 'AA' || xy === 'DD') return 'foreign_dirty';
-      const pathField = line.slice(3);
-      if (pathField !== rootRel && pathField !== `"${rootRel}"`) return 'foreign_dirty';
+      if (xy.includes('R') || xy.includes('C')) return 'foreign_dirty';
+      if (!samePath(entry.slice(3), rootRel)) return 'foreign_dirty';
     }
     return 'self_dirty';
   } catch {
@@ -231,23 +252,34 @@ function gitTrackedAtHead(repoPath: string, filePath: string): FactFenceTrackedS
       return typeof status === 'number' ? status : 128;
     }
   };
-  const listed = run(['ls-files', '--error-unmatch', '--', rel]);
-  if (listed !== 0) {
+  // The index may hold the path in another Unicode form than the DB names it
+  // (see `pathspecForms`); `--error-unmatch` fails on ANY unmatched pathspec,
+  // so each form is asked on its own and the first hit is the file's.
+  let listed = 1;
+  let indexed = rel;
+  for (const form of pathspecForms(rel)) {
+    listed = run(['ls-files', '--error-unmatch', '--', form]);
+    if (listed === 0) { indexed = form; break; }
     if (listed !== 1) return 'unknown';               // 128: not a git repo / unreadable
+  }
+  if (listed !== 0) {
     return run(['check-ignore', '-q', '--', rel]) === 0 ? 'ignored' : 'untracked';
   }
-  return run(['cat-file', '-e', `HEAD:./${rel.replaceAll('\\', '/')}`]) === 0 ? 'tracked' : 'not_at_head';
+  return run(['cat-file', '-e', `HEAD:./${indexed.replaceAll('\\', '/')}`]) === 0 ? 'tracked' : 'not_at_head';
 }
 
-/** The committed preimage of `filePath` (`HEAD:./<rel>`), or null when git holds none. */
+/** The committed preimage of `filePath` (`HEAD:./<rel>`, in whichever Unicode form HEAD holds it), or null when git holds none. */
 function gitHeadBlob(repoPath: string, filePath: string): string | null {
   const rel = relative(repoPath, filePath);
   if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null;
-  try {
-    return execFileSync('git', ['-C', repoPath, 'show', `HEAD:./${rel.replaceAll('\\', '/')}`], GIT_OPTS);
-  } catch {
-    return null;
+  for (const form of pathspecForms(rel)) {
+    try {
+      return execFileSync('git', ['-C', repoPath, 'show', `HEAD:./${form.replaceAll('\\', '/')}`], GIT_OPTS);
+    } catch {
+      // not under this form; try the next
+    }
   }
+  return null;
 }
 
 async function commitFactFenceFile(
@@ -1052,10 +1084,12 @@ async function residueCacheIsFile(
 }
 
 /**
- * `error` (lock not acquired, or a throw mid-sweep) leaves the page's state
- * unknown; `skipped` means the sweep never looked (write-through off, target
- * unresolvable, file missing or a symlink). The caller blocks the reconcile on
- * `not_residue`, `cache_unsafe` and `error`.
+ * `clean` is PROVEN: the file is tracked with a blob at HEAD and its status is
+ * empty. `error` (lock not acquired, a throw mid-sweep, or a git state that
+ * could not be read at all) leaves the page's state unknown; `skipped` means
+ * the sweep never looked (write-through off, target unresolvable, file
+ * missing or a symlink). The caller blocks the reconcile on `not_residue`,
+ * `cache_unsafe` and `error`.
  */
 export type ResidueSweepOutcome = ResidueHealOutcome | 'clean' | 'skipped' | 'error';
 
@@ -1065,8 +1099,14 @@ export type ResidueSweepOutcome = ResidueHealOutcome | 'clean' | 'skipped' | 'er
  * them (review finding 3). The stamp path never visits such a page, so a sync
  * would import the uncommitted residue and the reconcile would re-insert the
  * forgotten claims. Same lock, same target resolution, same recognizer as the
- * stamp path; a clean file, an unresolvable target or a foreign edit is a
- * no-op. Never throws.
+ * stamp path; a clean file or an unresolvable target is a no-op. Only a
+ * PROVEN clean file reads as clean — empty status on a file git holds at
+ * HEAD. Uncommitted change the parse cannot attribute to the file
+ * (`foreign_dirty`), or an empty status on a file with no committed preimage
+ * (an ignored path — the shape a source nested in an unrelated repo yields),
+ * is handed back `not_residue`; a git that could not be asked (`unknown`, a
+ * directory that is not a repository) is `error`. None of those proves the
+ * file free of a crashed run's appends. Never throws.
  */
 export async function healResidueOnlyPage(
   engine: BrainEngine,
@@ -1074,6 +1114,19 @@ export async function healResidueOnlyPage(
   opts: { lockTimeoutMs?: number } = {},
 ): Promise<{ slug: string; outcome: ResidueSweepOutcome; detail?: string }> {
   const { sourceId, slug } = target;
+  type Verdict = { slug: string; outcome: ResidueSweepOutcome; detail?: string };
+  const unproven = (state: string, why: string): Verdict =>
+    state === 'unknown'
+      ? { slug, outcome: 'error', detail: 'git state unknown: not a git repository, or git could not be run' }
+      : { slug, outcome: 'not_residue', detail: `${state}: ${why}` };
+  // `self_dirty` → recognise; a verdict otherwise.
+  const proven = (writeRoot: string, filePath: string): 'self_dirty' | Verdict => {
+    const state = gitPathState(writeRoot, filePath);
+    if (state === 'self_dirty') return state;
+    if (state !== 'clean') return unproven(state, 'uncommitted changes the sweep cannot attribute to this repair');
+    const tracked = gitTrackedAtHead(writeRoot, filePath);
+    return tracked === 'tracked' ? { slug, outcome: 'clean' } : unproven(tracked, 'no committed preimage to prove the file against');
+  };
   try {
     if (await isWriteThroughDisabled(engine)) return { slug, outcome: 'skipped', detail: 'write_through_disabled' };
     const resolved = await resolvePageWriteTarget(engine, slug, sourceId);
@@ -1082,9 +1135,11 @@ export async function healResidueOnlyPage(
     let st: ReturnType<typeof lstatSync>;
     try { st = lstatSync(filePath); } catch { return { slug, outcome: 'skipped', detail: 'file_missing' }; }
     if (st.isSymbolicLink() || !st.isFile()) return { slug, outcome: 'skipped', detail: 'symlink' };
-    if (gitPathState(writeRoot, filePath) !== 'self_dirty') return { slug, outcome: 'clean' };
+    const state = proven(writeRoot, filePath);
+    if (state !== 'self_dirty') return state;
     return await withPageLock(slug, async () => {
-      if (gitPathState(writeRoot, filePath) !== 'self_dirty') return { slug, outcome: 'clean' as const };
+      const locked = proven(writeRoot, filePath);
+      if (locked !== 'self_dirty') return locked;
       const outcome = await healCrashResidue(engine, sourceId, slug, writeRoot, filePath);
       return { slug, outcome };
     }, { timeoutMs: opts.lockTimeoutMs ?? 5_000 });
@@ -1093,11 +1148,32 @@ export async function healResidueOnlyPage(
   }
 }
 
+/**
+ * Stamp one page's legacy rows. Never throws — every outcome is a
+ * `LegacyStampResult`, so a repair pass keeps every counter and block it has
+ * collected whatever one page does. The locked body below already refuses per
+ * page; this boundary contains the reads BEFORE the lock (the write-through
+ * switch, target resolution, a dry-run's plan), which reach the DB and the
+ * file too and used to escape as a throw that discarded the pass's summary.
+ */
 export async function stampLegacyFactsToFence(
   engine: BrainEngine,
   target: { sourceId: string; slug: string },
   rows: LegacyStampRow[],
   opts: { dryRun?: boolean; lockTimeoutMs?: number; hooks?: LegacyStampHooks } = {},
+): Promise<LegacyStampResult> {
+  try {
+    return await stampLegacyFactsToFenceUnguarded(engine, target, rows, opts);
+  } catch (err) {
+    return skip(target.slug, 'error', err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function stampLegacyFactsToFenceUnguarded(
+  engine: BrainEngine,
+  target: { sourceId: string; slug: string },
+  rows: LegacyStampRow[],
+  opts: { dryRun?: boolean; lockTimeoutMs?: number; hooks?: LegacyStampHooks },
 ): Promise<LegacyStampResult> {
   const { sourceId, slug } = target;
   if (rows.length === 0) return { slug, status: 'stamped', stamped: 0, appended: 0, rewritten: 0, committed: false };

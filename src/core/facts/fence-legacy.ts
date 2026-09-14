@@ -93,12 +93,15 @@ export interface RepairLegacyRowsSummary {
   residuePagesBlocked: Array<{ slug: string; reason: Exclude<ResidueSweepOutcome, 'healed' | 'clean' | 'skipped'> | 'unswept'; detail?: string }>;
   /**
    * Set when a repair-WIDE step threw — listing the eligible rows, listing the
-   * residue-only pages, or the final recount (the per-page writer calls never
-   * throw; they refuse per page). The summary is then PARTIAL: every counter
-   * and every block collected before the throw is kept, but no page the pass
-   * did not reach is proven safe, and `rowsRemaining` is NOT a fresh count.
-   * The caller must fail closed on it — a repair that could not complete is
-   * not a repair that found nothing to block (Codex acceptance round 3, P1).
+   * residue-only pages, or the final recount. The per-page writer calls never
+   * throw: `stampLegacyFactsToFence` and `healResidueOnlyPage` contain their
+   * whole body, so a page whose target resolution or write-through read hits
+   * a DB fault is that page's `error` refusal, counted like any other. The
+   * summary is then PARTIAL: every counter and every block collected before
+   * the throw is kept, but no page the pass did not reach is proven safe, and
+   * `rowsRemaining` is NOT a fresh count. The caller must fail closed on it —
+   * a repair that could not complete is not a repair that found nothing to
+   * block.
    */
   failure?: string;
   dryRun: boolean;
@@ -207,11 +210,12 @@ const DEFAULT_MAX_PAGES = 500;
 /**
  * Drain every eligible legacy row in `sourceId`, page by page, then sweep the
  * pages whose never-fenced rows have all been forgotten for a crashed run's
- * uncommitted residue. Never throws: a page the writer refuses is counted
- * under its reason and left for the guard to report, and a repair-wide query
- * that throws returns the partial summary with `failure` set — the caller
- * fails closed on it, nothing collected so far is lost. `rowsRemaining` is
- * re-counted after the pass.
+ * uncommitted residue. Never throws: the two per-page writer calls contain
+ * their whole body (a page they cannot even resolve is counted under `error`
+ * with the message), and each of the three repair-wide queries is caught
+ * here — a throw ends the pass and returns the partial summary with
+ * `failure` set, so the caller fails closed on it and nothing collected so
+ * far is lost. `rowsRemaining` is re-counted after the pass.
  */
 export async function repairLegacyRowsForSource(
   engine: BrainEngine,
@@ -309,8 +313,7 @@ export async function repairLegacyRowsForSource(
   } catch (err) {
     // Every block and counter collected above stays on the summary; only the
     // fresh count is missing, and the caller must not treat its absence as
-    // zero. Pre-fix this throw discarded a `not_residue` block that had
-    // already been collected.
+    // zero — a `not_residue` block collected above must survive this throw.
     return fail('re-counting eligible legacy rows', err);
   }
   return summary;

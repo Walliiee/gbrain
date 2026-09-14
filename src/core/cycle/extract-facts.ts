@@ -276,7 +276,10 @@ export interface ExtractFactsOpts {
    * them onto their pages through the native fence writer
    * (fence-write.ts `stampLegacyFactsToFence`) and re-count before deciding
    * to halt. Defaults to `brainDir !== undefined`; pass `false` to keep the
-   * pure halt. `GBRAIN_FACT_REPAIR=off` also disables it.
+   * pure halt, or `true` to enable it without a brainDir — the repair and
+   * its residue protection resolve files from `sources.local_path`, which is
+   * how the maintenance sweep (no brainDir, no phantom pass) gets the same
+   * protection as the cycle. `GBRAIN_FACT_REPAIR=off` also disables it.
    */
   repairLegacy?: boolean;
   /** Test-only crash seams for the repair. */
