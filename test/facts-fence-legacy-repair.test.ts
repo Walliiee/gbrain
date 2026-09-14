@@ -288,12 +288,21 @@ describe('stamp mode — refuses per file, never per tree', () => {
     expect(s.rowsRemaining).toBe(1);
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
     expect((await factRows())[0]!.row_num).toBeNull();
-    // Once committed (the owner's morning commit) and synced, the repair proceeds.
+    // Committed (the owner's morning commit) but not yet synced: the DB body is
+    // still the OLD file's, so the stamp refuses inside its transaction rather
+    // than mirror file-derived content over a cache it cannot vouch for.
     commitAll('theirs');
+    const s1b = await run();
+    expect(s1b.skippedByReason.verify_failed).toBe(1);
+    expect(s1b.skippedDetails[0]).toContain('stale page cache');
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
+    expect((await engine.getPage(ALICE, { sourceId: SRC }))!.compiled_truth).toBe(ALICE_DB_BODY);
+    // Once synced (what the cycle's sync phase does before extract_facts), it proceeds.
     await syncBody();
     const s2 = await run();
     expect(s2.rowsStamped).toBe(1);
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toContain('Their uncommitted paragraph.');
+    expect((await dbFence()).facts.map(f => f.claim)).toEqual(['Founded Acme']);
   });
 
   test('unmerged conflict on the path refuses', async () => {
@@ -1085,8 +1094,12 @@ describe('finding 2 (review 2) — re-using an existing fence row never stamps a
     expect(s.skippedByReason.fence_row_mismatch).toBe(1);
     expect(s.skippedDetails[0]).toContain('claimMetric');
     expect((await factRows()).find(r => r.id === id)!.row_num).toBeNull();
+    // Both sinks still hold exactly the synced preimage: the conflicting
+    // committed row (arr/annual) on disk AND in the DB body, untouched.
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
-    expect((await dbFence()).facts).toEqual([]);
+    expect((await dbFence()).facts).toEqual(parseFactsFence(body).facts);
+    expect((await dbFence()).facts[0]).toMatchObject({ rowNum: 2, claimMetric: 'arr', claimPeriod: 'annual' });
+    expect(git(repo, 'status', '--porcelain', '--', ALICE_MD)).toBe('');
     expect(await typedColumns(id)).toEqual({ claim_metric: 'mrr', claim_value: 50000, claim_unit: 'USD', claim_period: 'monthly' });
   });
 
@@ -1102,6 +1115,8 @@ describe('finding 2 (review 2) — re-using an existing fence row never stamps a
     expect(s.skippedByReason.fence_row_mismatch).toBe(1);
     expect(s.skippedDetails[0]).toContain('confidence');
     expect((await factRows())[0]!.row_num).toBeNull();
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
+    expect((await dbFence()).facts).toEqual(parseFactsFence(body).facts);
   });
 
   test('reuse path: the same claim STRUCK on disk while the DB row is active refuses (stamping it would let the reconcile expire the row)', async () => {
@@ -1120,6 +1135,7 @@ describe('finding 2 (review 2) — re-using an existing fence row never stamps a
     expect((await factRows())[0]!.row_num).toBeNull();
     expect((await factRows())[0]!.expired_at).toBeNull();
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
+    expect((await dbFence()).facts).toEqual(parseFactsFence(body).facts);
   });
 
   test('dry-run reports the in-place rewrite it would make without touching the file', async () => {
