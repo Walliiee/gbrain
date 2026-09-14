@@ -1336,6 +1336,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // equal by test/config-search-registry.test.ts). camelCase where the code
   // reads camelCase (#4605 — snake_case rows here had no reader).
   'search.mode',
+  'search.exclude_statuses',
   'search.cache.enabled',
   'search.cache.similarity_threshold',
   'search.cache.ttl_seconds',

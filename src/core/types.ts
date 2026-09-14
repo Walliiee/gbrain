@@ -1,3 +1,5 @@
+import type { SearchLifecyclePolicy } from './search/lifecycle-policy.ts';
+
 // Page types
 // v0.38: `PageType` opens from a closed 23-element union to `string`. The
 // closed union was always a fiction — every gbrain user accumulated organic
@@ -383,7 +385,7 @@ export interface PageReadScope {
   requireSafeChunks?: boolean;
 }
 
-export interface PageReadPolicy extends PageReadScope {
+export interface PageReadPolicy extends PageReadScope, SearchLifecyclePolicy {
   /** Undefined is unrestricted; an empty list permits no holders. */
   takesHoldersAllowList?: string[];
 }

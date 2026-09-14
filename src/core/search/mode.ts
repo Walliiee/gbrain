@@ -26,7 +26,11 @@
 import { createHash } from 'crypto';
 import { CR_MODES, type CRMode } from '../types.ts';
 import { getFtsLanguage } from '../fts-language.ts';
+<<<<<<< HEAD
 import { loadConfigSnapshot, type BulkConfigReader } from '../config-snapshot.ts';
+=======
+import { normalizeLifecycleStatus } from './lifecycle-policy.ts';
+>>>>>>> 2451ed4e9 (fix(search): enforce configured lifecycle exclusions natively)
 import { getRecipe } from '../ai/recipes/index.ts';
 // #3657 seam: the runtime/mode-bundle reranker default has ONE code home
 // (ai/defaults.ts — a leaf module, no SDK loads). The three bundles below
@@ -1093,6 +1097,7 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // part; version-only invalidation (same class as the 13→14 detail=medium
 // boost-scope bump and the 21→22 stamp/injection epoch). One-time global
 // cold-miss spike on upgrade; refills within cache.ttl_seconds (3600s).
+<<<<<<< HEAD
 //
 // bump 28→29 (ranker wave): `evb=` — the expansion_variant_budget knob joins
 // the key (append-only, last part). A budget-weighted write (variant lists
@@ -1118,6 +1123,9 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // identical other knobs, so a `lexical` write must never serve an `always`
 // lookup (and vice versa). A partial-knobs literal hashes as `mbg=always`;
 // appended after `kacf=`, same unshipped epoch — no extra bump.
+=======
+// Lifecycle policy changes the eligible set before every retrieval limit.
+>>>>>>> 2451ed4e9 (fix(search): enforce configured lifecycle exclusions natively)
 export const KNOBS_HASH_VERSION = 29;
 
 /**
@@ -1132,6 +1140,8 @@ export const KNOBS_HASH_VERSION = 29;
  * don't know the column produce a stable hash for the default case.
  */
 export interface KnobsHashContext {
+  /** Effective brain-owned lifecycle exclusions, independent of search mode. */
+  excludeStatuses?: readonly string[];
   /** Resolved column name, e.g. 'embedding', 'embedding_voyage'. */
   embeddingColumn?: string;
   /** Resolved provider:model, e.g. 'voyage:voyage-3-large'. */
@@ -1356,6 +1366,7 @@ export function knobsHash(
     `sal=${ctx?.salience ?? 'off'}`,
     `rec=${ctx?.recency ?? 'off'}`,
     `ipat=${ctx?.intentPatterns ?? 'none'}`,
+    `lifecycle=${JSON.stringify([...new Set((ctx?.excludeStatuses ?? []).map(normalizeLifecycleStatus))].sort())}`,
     // v=27 ALSO covers a same-knobs behavioral change shipped in the same
     // release (#3617 follow-up): OR-relaxed keyword/title rows no longer
     // vote in RRF when the vector arm is non-empty, so a pre-fix cache row

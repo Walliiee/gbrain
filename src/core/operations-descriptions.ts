@@ -68,6 +68,7 @@ export const LIST_PAGES_DESCRIPTION =
 
 export const QUERY_DESCRIPTION =
   "Hybrid search with vector + keyword + multi-query expansion. " +
+  "Honors the brain's search.exclude_statuses policy; callers cannot override it. For explicit historical page lookup use get_page. " +
   "Prefer `query` for concept / synonym / landscape questions ('all the X that " +
   "do Y', 'the landscape of Z') — expansion recovers synonym- and " +
   "outcome-phrased matches a single embedding misses. Still top-K, and the " +
@@ -84,6 +85,7 @@ export const QUERY_DESCRIPTION =
 
 export const SEARCH_DESCRIPTION =
   "Cheap hybrid search (vector + keyword + RRF) with no LLM expansion. " +
+  "Honors the brain's search.exclude_statuses policy; callers cannot override it. For explicit historical page lookup use get_page. " +
   "Best for exact known tokens, names, and structured-field lookups. A populated " +
   "result set is NOT proof of coverage — for concept / synonym / landscape " +
   "questions use `query` (adds multi-query expansion); for exhaustive " +

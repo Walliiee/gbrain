@@ -1,5 +1,6 @@
 import type { PageReadScope } from './types.ts';
 import type { PageReadPolicy } from './types.ts';
+import { lifecycleFilterFragment, resolveSearchLifecyclePolicy } from './search/lifecycle-policy.ts';
 import { readRelationalFanout, readAliases, readBacklinkCounts, readAdjacencyBoosts, readContentFlags, readExtractionStates, readEffectiveDates, readSalienceScores } from './search/read-enrichment.ts';
 import postgres from 'postgres';
 import type {
@@ -1388,6 +1389,7 @@ export class PostgresEngine implements BrainEngine {
 
   async resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean }): Promise<string[]> {
     const sql = this.sql;
+    const lifecycle = sql.unsafe(` AND ${lifecycleFilterFragment('pages', (await resolveSearchLifecyclePolicy(this)).excludeStatuses)}`);
 
     // v0.41.13 #1436: source scope via postgres.js tagged-template
     // fragments. When neither opt is set the resolver stays unscoped
@@ -1404,14 +1406,14 @@ export class PostgresEngine implements BrainEngine {
         : sql``;
 
     // Try exact match first
-    const exact = await sql`SELECT slug FROM pages WHERE slug = ${partial} AND deleted_at IS NULL${scopeFragment}${privacy}`;
+    const exact = await sql`SELECT slug FROM pages WHERE slug = ${partial} AND deleted_at IS NULL${scopeFragment}${privacy}${lifecycle}`;
     if (exact.length > 0) return [exact[0].slug];
 
     // Fuzzy match via pg_trgm
     const fuzzy = await sql`
       SELECT slug, similarity(title, ${partial}) AS sim
       FROM pages
-      WHERE deleted_at IS NULL AND (title % ${partial} OR slug ILIKE ${'%' + partial + '%'})${scopeFragment}${privacy}
+      WHERE deleted_at IS NULL AND (title % ${partial} OR slug ILIKE ${'%' + partial + '%'})${scopeFragment}${privacy}${lifecycle}
       ORDER BY sim DESC
       LIMIT 5
     `;
@@ -1425,6 +1427,7 @@ export class PostgresEngine implements BrainEngine {
   // list_pages etc. see zero breaking changes. A2 two-pass (Layer 7)
   // consumes searchKeywordChunks for the raw chunk-grain primitive.
   async searchKeyword(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
+    opts = { ...opts, ...await resolveSearchLifecyclePolicy(this) };
     const limit = clampSearchLimit(opts?.limit);
     const offset = opts?.offset || 0;
     const type = opts?.type;
@@ -1462,7 +1465,7 @@ export class PostgresEngine implements BrainEngine {
     if (hasCJK(query)) {
       return this._searchKeywordCJK(query, {
         limit, offset, innerLimit, sourceFactorCase, hardExcludeClause,
-        visibilityClause: buildVisibilityClause('p', 's'),
+        visibilityClause: buildVisibilityClause('p', 's', opts),
         detailFilter: detailLow ? `AND cc.chunk_source = 'compiled_truth'` : '',
         opts, dedup: true,
       });
@@ -1631,6 +1634,7 @@ export class PostgresEngine implements BrainEngine {
    * preserved; oversized pasted context is bounded before websearch FTS.
    */
   async searchTitles(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
+    opts = { ...opts, ...await resolveSearchLifecyclePolicy(this) };
     // language/symbolKind are chunk-grain code filters with no page-grain
     // meaning; a code-scoped query gets no title candidates rather than
     // rows that silently violate the caller's filter.
@@ -1774,6 +1778,7 @@ export class PostgresEngine implements BrainEngine {
    * contract). This is intentionally a narrow internal knob.
    */
   async searchKeywordChunks(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
+    opts = { ...opts, ...await resolveSearchLifecyclePolicy(this) };
     const limit = clampSearchLimit(opts?.limit);
     const offset = opts?.offset || 0;
     const type = opts?.type;
@@ -1802,7 +1807,7 @@ export class PostgresEngine implements BrainEngine {
         limit, offset,
         innerLimit: 0,             // unused on chunk-grain (no inner CTE)
         sourceFactorCase, hardExcludeClause,
-        visibilityClause: buildVisibilityClause('p', 's'),
+        visibilityClause: buildVisibilityClause('p', 's', opts),
         detailFilter: detailLow ? `AND cc.chunk_source = 'compiled_truth'` : '',
         opts, dedup: false,
       });
@@ -1929,6 +1934,7 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]> {
+    opts = { ...opts, ...await resolveSearchLifecyclePolicy(this) };
     const limit = clampSearchLimit(opts?.limit);
     const offset = opts?.offset || 0;
     const type = opts?.type;
@@ -1977,7 +1983,8 @@ export class PostgresEngine implements BrainEngine {
     // fall back to exact scans where ef_search is irrelevant — capping their
     // SQL LIMIT would make offset >= 1000 permanently empty; they stay
     // bounded by the escalation count instead.
-    const innerCap = hnswIndexExpected(resolvedCol.type, resolvedCol.dimensions)
+    const exactLifecycleScan = !!opts.excludeStatuses?.length;
+    const innerCap = !exactLifecycleScan && hnswIndexExpected(resolvedCol.type, resolvedCol.dimensions)
       ? HNSW_EF_SEARCH_MAX
       : Number.MAX_SAFE_INTEGER;
     const innerLimit = Math.min(offset + Math.max(limit * 5, 100), innerCap);
@@ -2053,6 +2060,11 @@ export class PostgresEngine implements BrainEngine {
     // in Voyage multimodal-3 space — no modality filter; the column itself
     // is the discriminator (rows without embedding_multimodal aren't searched).
     const { col, castSql } = buildVectorCastFragment(resolvedCol);
+    // HNSW applies page filters after its bounded ANN scan. With lifecycle
+    // exclusions, an excluded nearest neighborhood can starve eligible pages.
+    // + 0 disqualifies distance-index ordering so filtering precedes an exact
+    // sort; absent policy retains the existing HNSW path and performance.
+    const distanceOrder = exactLifecycleScan ? `(cc.${col} <=> ${castSql}) + 0` : `cc.${col} <=> ${castSql}`;
     let modalityFilter: string;
     if (resolvedCol.name === 'embedding_image') {
       modalityFilter = `AND cc.modality = 'image'`;
@@ -2089,7 +2101,7 @@ export class PostgresEngine implements BrainEngine {
           ${sourceClause}
           ${hardExcludeClause}
           ${visibilityClause}
-        ORDER BY cc.${col} <=> ${castSql}
+        ORDER BY ${distanceOrder}
         LIMIT ${innerLimitParam}
       ),
       -- score computed as a select-list expr (NOT in the inner ORDER BY, which

@@ -100,7 +100,7 @@ async function resolveSeedScoped(
   const out: Array<{ source_id: string; slug: string }> = [];
   const seen = new Set<string>();
   for (const sid of sources) {
-    const r = await resolveEntitySlugWithSource(engine, sid, phrase);
+    const r = await resolveEntitySlugWithSource(engine, sid, phrase, hasReadPolicy(policy) ? policy : undefined);
     if (!r || r.source === 'fallback_slugify') continue;
     const key = `${sid}:${r.slug}`;
     if (seen.has(key)) continue;
@@ -291,6 +291,7 @@ export async function buildRelationalArm(
       sourceId: opts.sourceId,
       sourceIds: opts.sourceIds,
       excludePrivate: opts.excludePrivate,
+      excludeStatuses: opts.excludeStatuses,
       requireSafeChunks: opts.requireSafeChunks,
       takesHoldersAllowList: opts.takesHoldersAllowList,
       linkTypes: parsed.linkTypes,

@@ -1,6 +1,7 @@
 import { GRANT_COLUMNS_SQL } from './grants/schema.ts';
 import type { PageReadScope } from './types.ts';
 import type { PageReadPolicy } from './types.ts';
+import { lifecycleFilterFragment, resolveSearchLifecyclePolicy } from './search/lifecycle-policy.ts';
 import { readRelationalFanout, readAliases, readBacklinkCounts, readAdjacencyBoosts, readContentFlags, readExtractionStates, readEffectiveDates, readSalienceScores } from './search/read-enrichment.ts';
 import { PGlite } from '@electric-sql/pglite';
 import type { Transaction } from '@electric-sql/pglite';
@@ -2367,6 +2368,7 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean }): Promise<string[]> {
+    const lifecycle = lifecycleFilterFragment('pages', (await resolveSearchLifecyclePolicy(this)).excludeStatuses);
     // v0.41.13 #1436: source scope. When opts.sourceIds is set
     // (federated_read OAuth tier), filter via `source_id = ANY($N::text[])`.
     // When opts.sourceId is set (scalar single-source tier), filter via
@@ -2383,7 +2385,7 @@ export class PGLiteEngine implements BrainEngine {
         : '';
 
     // Try exact match first
-    const exactSql = `SELECT slug FROM pages WHERE slug = $1 AND deleted_at IS NULL${scopeSql.replace('__N__', '2')}${privacy}`;
+    const exactSql = `SELECT slug FROM pages WHERE slug = $1 AND deleted_at IS NULL${scopeSql.replace('__N__', '2')}${privacy} AND ${lifecycle}`;
     const exactParams: unknown[] = sources ? [partial, sources] : scalar ? [partial, scalar] : [partial];
     const exact = await this.db.query(exactSql, exactParams);
     if (exact.rows.length > 0) return [(exact.rows[0] as { slug: string }).slug];
@@ -2391,7 +2393,7 @@ export class PGLiteEngine implements BrainEngine {
     // Fuzzy match via pg_trgm
     const fuzzySql = `SELECT slug, similarity(title, $1) AS sim
        FROM pages
-       WHERE deleted_at IS NULL AND (title % $1 OR slug ILIKE $2)${scopeSql.replace('__N__', '3')}${privacy}
+       WHERE deleted_at IS NULL AND (title % $1 OR slug ILIKE $2)${scopeSql.replace('__N__', '3')}${privacy} AND ${lifecycle}
        ORDER BY sim DESC
        LIMIT 5`;
     const fuzzyParams: unknown[] = sources
@@ -2418,6 +2420,7 @@ export class PGLiteEngine implements BrainEngine {
   // than direct window function + GROUP BY. Fetch more chunks than the
   // page limit (3x) to ensure N dedup'd pages survive; bounded and fast.
   async searchKeyword(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
+    opts = { ...opts, ...await resolveSearchLifecyclePolicy(this) };
     const limit = clampSearchLimit(opts?.limit);
     const offset = opts?.offset || 0;
     const detailFilter = opts?.detail === 'low' ? `AND cc.chunk_source = 'compiled_truth'` : '';
@@ -2560,6 +2563,7 @@ export class PGLiteEngine implements BrainEngine {
    * fallback stays keyword-arm-only.
    */
   async searchTitles(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
+    opts = { ...opts, ...await resolveSearchLifecyclePolicy(this) };
     // language/symbolKind are chunk-grain code filters with no page-grain
     // meaning; a code-scoped query gets no title candidates rather than
     // rows that silently violate the caller's filter.
@@ -2722,6 +2726,7 @@ export class PGLiteEngine implements BrainEngine {
    * contract). This method is intentionally a narrow internal knob.
    */
   async searchKeywordChunks(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
+    opts = { ...opts, ...await resolveSearchLifecyclePolicy(this) };
     const limit = clampSearchLimit(opts?.limit);
     const offset = opts?.offset || 0;
     const detailFilter = opts?.detail === 'low' ? `AND cc.chunk_source = 'compiled_truth'` : '';
@@ -2810,6 +2815,7 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]> {
+    opts = { ...opts, ...await resolveSearchLifecyclePolicy(this) };
     const limit = clampSearchLimit(opts?.limit);
     const offset = opts?.offset || 0;
     const vecStr = '[' + Array.from(embedding).join(',') + ']';
@@ -2848,7 +2854,8 @@ export class PGLiteEngine implements BrainEngine {
     // by the escalation count instead. (Hoisted resolvedColEarly: same
     // descriptor the cast fragment uses below.)
     const resolvedColEarly = normalizeEngineColumn(opts?.embeddingColumn);
-    const innerCap = hnswIndexExpected(resolvedColEarly.type, resolvedColEarly.dimensions)
+    const exactLifecycleScan = !!opts.excludeStatuses?.length;
+    const innerCap = !exactLifecycleScan && hnswIndexExpected(resolvedColEarly.type, resolvedColEarly.dimensions)
       ? HNSW_EF_SEARCH_MAX
       : Number.MAX_SAFE_INTEGER;
     const innerLimit = Math.min(offset + Math.max(limit * 5, 100), innerCap);
@@ -2906,6 +2913,11 @@ export class PGLiteEngine implements BrainEngine {
     // itself is the discriminator (only re-embedded rows have non-NULL).
     const resolvedCol = resolvedColEarly;
     const { col, castSql } = buildVectorCastFragment(resolvedCol);
+    // HNSW applies page filters after its bounded ANN scan. With lifecycle
+    // exclusions, an excluded nearest neighborhood can starve eligible pages.
+    // + 0 disqualifies distance-index ordering so filtering precedes an exact
+    // sort; absent policy retains the existing HNSW path and performance.
+    const distanceOrder = exactLifecycleScan ? `(cc.${col} <=> ${castSql}) + 0` : `cc.${col} <=> ${castSql}`;
     let modalityFilter: string;
     if (resolvedCol.name === 'embedding_image') {
       modalityFilter = `AND cc.modality = 'image'`;
@@ -2937,7 +2949,7 @@ export class PGLiteEngine implements BrainEngine {
          JOIN pages p ON p.id = cc.page_id
          JOIN sources s ON s.id = p.source_id
          WHERE cc.${col} IS NOT NULL ${modalityFilter} ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
-         ORDER BY cc.${col} <=> ${castSql}
+         ORDER BY ${distanceOrder}
          LIMIT $2
        ),
        -- score as a select-list expr; inner ORDER BY stays pure-distance so

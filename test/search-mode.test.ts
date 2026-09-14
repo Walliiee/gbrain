@@ -486,6 +486,7 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // 27→28: compiledTruthBoost suppresses the 2x boost for synthetic
     // chunkless title rows (#4256, fixes #3695's fusion path) — reorders
     // fused rows for identical knobs; version-only invalidation.
+<<<<<<< HEAD
     // 28→29: evb= expansion variant budget fold (ranker wave) — budget-weighted
     // variant fusion reorders rows for identical knobs; null hashes as legacy.
     // v=29 ALSO carries rrp= (relational rerank pin, ranker wave R1) — same
@@ -494,6 +495,8 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
     // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
     // Cat 13) — same unshipped epoch; a partial literal hashes as always.
+=======
+>>>>>>> 2451ed4e9 (fix(search): enforce configured lifecycle exclusions natively)
     expect(KNOBS_HASH_VERSION).toBe(29);
   });
 
@@ -524,6 +527,7 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // adaptive-on calls now cache instead of skipping.
     // 27→28: compiledTruthBoost synthetic-row suppression (#4256/#3695) —
     // version-only invalidation.
+<<<<<<< HEAD
     // 28→29: evb= expansion variant budget fold (ranker wave) — budget-weighted
     // variant fusion reorders rows for identical knobs; null hashes as legacy.
     // v=29 ALSO carries rrp= (relational rerank pin, ranker wave R1) — same
@@ -532,6 +536,8 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
     // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
     // Cat 13) — same unshipped epoch; a partial literal hashes as always.
+=======
+>>>>>>> 2451ed4e9 (fix(search): enforce configured lifecycle exclusions natively)
     expect(KNOBS_HASH_VERSION).toBe(29);
   });
 
@@ -748,6 +754,7 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
+<<<<<<< HEAD
   test('KNOBS_HASH_VERSION is 29 (…; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 evb= expansion variant budget fold)', () => {
     // 28→29: evb= expansion variant budget fold (ranker wave) — budget-weighted
     // variant fusion reorders rows for identical knobs; null hashes as legacy.
@@ -757,6 +764,9 @@ describe('v0.42.3.0 — autocut knobs', () => {
     // Phase E2 / Cat 13) — same unshipped epoch; null hashes as off.
     // v=29 ALSO carries mbg= (metadata boost gate, ranker wave Phase E3 /
     // Cat 13) — same unshipped epoch; a partial literal hashes as always.
+=======
+  test('KNOBS_HASH_VERSION is 29 (…; 24→25 keywordOrFallback knob kof=; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256; 28→29 lifecycle policy set)', () => {
+>>>>>>> 2451ed4e9 (fix(search): enforce configured lifecycle exclusions natively)
     expect(KNOBS_HASH_VERSION).toBe(29);
   });
 

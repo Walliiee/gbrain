@@ -110,6 +110,8 @@ export interface CragMetaBlock {
   escalated_confidence?: RetrievalConfidence;
   /** Still weak after (or without) escalation → the honest next move. */
   escalate_to_think?: boolean;
+  /** Automatic synthesis skipped because its gather cannot honor search policy. */
+  think_skipped?: 'lifecycle_policy';
   /** Present when search.crag_think ran the think pipeline. */
   think?: {
     answer: string;
