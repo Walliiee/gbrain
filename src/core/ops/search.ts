@@ -24,6 +24,7 @@ import type { HybridSearchMeta } from '../types.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
+import { resolveSearchLifecyclePolicy } from '../search/lifecycle-policy.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
@@ -629,7 +630,13 @@ const query: Operation = {
         // (spend + privacy: think synthesizes with the configured LLM).
         crag.escalate_to_think = true;
         if (thinkCfg === 'true' && ctx.remote === false) {
-          try {
+          // Think also gathers date-window pages and takes, which do not yet
+          // implement this search-only policy. Do not reintroduce excluded
+          // evidence through automatic synthesis; disclose the skipped step.
+          const lifecycle = await resolveSearchLifecyclePolicy(ctx.engine);
+          if (lifecycle.excludeStatuses.length) {
+            crag.think_skipped = 'lifecycle_policy';
+          } else try {
             const { runThink } = await import('../think/index.ts');
             const { embedQuery } = await import('../embedding.ts');
             const thinkScope = thinkSourceScopeOpts(ctx);

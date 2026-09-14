@@ -1,4 +1,4 @@
-import type { PageReadScope, PageReadPolicy, AdjacencyRow, RelationalFanoutOpts, RelationalFanoutRow } from '../types.ts';
+import type { PageReadPolicy, AdjacencyRow, RelationalFanoutOpts, RelationalFanoutRow } from '../types.ts';
 import { unverifiedExtractionFragment } from '../extraction-review.ts';
 import { requiresSafeChunks, safeChunksFilter } from './safe-chunks.ts';
 import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
@@ -7,7 +7,7 @@ import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
 export type ReadQuery = <T = Record<string, unknown>>(sql: string, params?: unknown[]) => Promise<T[]>;
 type PageRef = { slug: string; source_id: string };
 
-function originFilter(scope: PageReadScope | undefined, params: unknown[]): string {
+function originFilter(scope: PageReadPolicy | undefined, params: unknown[]): string {
   if (!scope) return 'TRUE';
   const filter = pageReadFilter('origin', scope, params, true);
   return `(l.origin_page_id IS NULL OR EXISTS (SELECT 1 FROM pages origin WHERE origin.id = l.origin_page_id AND ${filter}))`;
@@ -74,7 +74,7 @@ export async function readRelationalFanout(query: ReadQuery, seeds: string[], op
   }));
 }
 
-export async function readBacklinkCounts(query: ReadQuery, ids: number[], scope?: PageReadScope): Promise<Map<number, number>> {
+export async function readBacklinkCounts(query: ReadQuery, ids: number[], scope?: PageReadPolicy): Promise<Map<number, number>> {
   const result = new Map(ids.map(id => [id, 0]));
   if (!ids.length) return result;
   const params: unknown[] = [ids];
@@ -91,7 +91,7 @@ export async function readBacklinkCounts(query: ReadQuery, ids: number[], scope?
   return result;
 }
 
-export async function readAdjacencyBoosts(query: ReadQuery, ids: number[], scope?: PageReadScope): Promise<Map<number, AdjacencyRow>> {
+export async function readAdjacencyBoosts(query: ReadQuery, ids: number[], scope?: PageReadPolicy): Promise<Map<number, AdjacencyRow>> {
   if (!ids.length) return new Map();
   const params: unknown[] = [ids];
   const from = pageReadFilter('p', scope, params, !!scope);
@@ -108,7 +108,7 @@ export async function readAdjacencyBoosts(query: ReadQuery, ids: number[], scope
   return new Map(rows.map(row => [Number(row.to_page_id), { hits: Number(row.hits), cross_source_hits: Number(row.cross_source_hits) }]));
 }
 
-export async function readContentFlags(query: ReadQuery, ids: number[], scope?: PageReadScope): Promise<Map<number, { reason: string; detail: string }>> {
+export async function readContentFlags(query: ReadQuery, ids: number[], scope?: PageReadPolicy): Promise<Map<number, { reason: string; detail: string }>> {
   if (!ids.length) return new Map();
   const params: unknown[] = [ids];
   const filter = pageReadFilter('p', scope, params, !!scope);
@@ -119,7 +119,7 @@ export async function readContentFlags(query: ReadQuery, ids: number[], scope?: 
   return new Map(rows.filter(row => row.reason).map(row => [Number(row.id), { reason: row.reason!, detail: row.detail ?? '' }]));
 }
 
-export async function readExtractionStates(query: ReadQuery, ids: number[], scope?: PageReadScope): Promise<Map<number, { unverified: boolean; status: string }>> {
+export async function readExtractionStates(query: ReadQuery, ids: number[], scope?: PageReadPolicy): Promise<Map<number, { unverified: boolean; status: string }>> {
   if (!ids.length) return new Map();
   const params: unknown[] = [ids];
   const filter = pageReadFilter('p', scope, params, !!scope);
@@ -129,7 +129,7 @@ export async function readExtractionStates(query: ReadQuery, ids: number[], scop
   return new Map(rows.map(row => [Number(row.id), { unverified: row.unverified === true, status: row.status }]));
 }
 
-export async function readEffectiveDates(query: ReadQuery, refs: PageRef[], scope?: PageReadScope): Promise<Map<string, Date>> {
+export async function readEffectiveDates(query: ReadQuery, refs: PageRef[], scope?: PageReadPolicy): Promise<Map<string, Date>> {
   if (!refs.length) return new Map();
   const params: unknown[] = [refs.map(r => r.slug), refs.map(r => r.source_id)];
   const filter = pageReadFilter('p', scope, params, !!scope);
@@ -161,7 +161,7 @@ export async function readSalienceScores(query: ReadQuery, refs: PageRef[], scop
 }
 
 /** Resolve alias contributors before callers rank or cap canonical pages. */
-export async function readAliases(query: ReadQuery, aliases: string[], scope?: PageReadScope): Promise<Map<string, PageRef[]>> {
+export async function readAliases(query: ReadQuery, aliases: string[], scope?: PageReadPolicy): Promise<Map<string, PageRef[]>> {
   const out = new Map<string, PageRef[]>();
   if (!aliases.length) return out;
   const params: unknown[] = [aliases];

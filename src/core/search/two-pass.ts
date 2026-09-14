@@ -22,12 +22,13 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import type { SearchResult } from '../types.ts';
+import type { SearchResult, PageReadPolicy } from '../types.ts';
+import { pageReadFilter } from './read-policy-sql.ts';
 
 const MAX_WALK_DEPTH = 2;
 const NEIGHBOR_CAP_PER_HOP = 50;
 
-export interface TwoPassOpts {
+export interface TwoPassOpts extends PageReadPolicy {
   /** 1 or 2 — capped at 2. 0 or undefined → no-op (returns anchors as-is). */
   walkDepth?: number;
   /** When set, find chunks whose symbol_name_qualified matches; add to anchor set. */
@@ -54,6 +55,7 @@ export async function expandAnchors(
   opts: TwoPassOpts = {},
 ): Promise<ChunkWithScore[]> {
   const depth = Math.min(Math.max(opts.walkDepth ?? 0, 0), MAX_WALK_DEPTH);
+  if (opts.excludeStatuses?.length) return expandEligibleAnchors(engine, anchors, opts, depth);
   if (depth === 0 && !opts.nearSymbol) {
     return anchors.map(a => ({
       chunk_id: a.chunk_id,
@@ -188,8 +190,11 @@ export async function expandAnchors(
 export async function hydrateChunks(
   engine: BrainEngine,
   chunkIds: number[],
+  policy?: PageReadPolicy,
 ): Promise<SearchResult[]> {
   if (chunkIds.length === 0) return [];
+  const params: unknown[] = [chunkIds];
+  const filter = pageReadFilter('p', policy, params, !!policy);
   const rows = await engine.executeRaw<{
     slug: string; page_id: number; title: string; type: string; source_id: string;
     chunk_id: number; chunk_index: number; chunk_text: string; chunk_source: string;
@@ -198,8 +203,8 @@ export async function hydrateChunks(
             cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source
        FROM content_chunks cc
        JOIN pages p ON p.id = cc.page_id
-       WHERE cc.id = ANY($1::int[])`,
-    [chunkIds],
+       WHERE cc.id = ANY($1::int[]) AND ${filter}`,
+    params,
   );
   return rows.map((r) => ({
     slug: r.slug,
@@ -214,4 +219,58 @@ export async function hydrateChunks(
     stale: false,
     source_id: r.source_id,
   } as SearchResult));
+}
+
+/** Lifecycle-aware walk: admit anchors and every neighbor BEFORE its cap.
+ * The legacy engine edge getters cap before joining pages, so filtering their
+ * output would starve this arm whenever excluded neighbors fill that cap. */
+async function expandEligibleAnchors(
+  engine: BrainEngine,
+  anchors: SearchResult[],
+  opts: TwoPassOpts,
+  depth: number,
+): Promise<ChunkWithScore[]> {
+  const seen = new Map<number, ChunkWithScore>();
+  const params: unknown[] = [anchors.map(a => a.chunk_id), opts.nearSymbol ?? null];
+  const filter = pageReadFilter('p', opts, params, true);
+  const admitted = await engine.executeRaw<{ id: number }>(
+    `SELECT cc.id FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+     WHERE cc.id = ANY($1::int[]) AND ${filter}
+     UNION
+     (SELECT cc.id FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+      WHERE cc.symbol_name_qualified = $2 AND ${filter}
+      ORDER BY cc.id LIMIT ${NEIGHBOR_CAP_PER_HOP})`, params,
+  );
+  const scores = new Map(anchors.map(a => [a.chunk_id, a.score]));
+  for (const { id } of admitted) seen.set(id, {
+    chunk_id: id, score: scores.get(id) ?? anchors[0]?.score ?? 1.0, hop: 0, source: 'anchor',
+  });
+  let frontier = [...seen.keys()];
+  for (let hop = 1; hop <= depth && frontier.length; hop++) {
+    const next: number[] = [];
+    for (const chunkId of frontier) {
+      const params: unknown[] = [chunkId];
+      const filter = pageReadFilter('p', opts, params, true);
+      const rows = await engine.executeRaw<{ id: number }>(
+        `WITH neighbors AS (
+           SELECT CASE WHEN e.from_chunk_id = $1 THEN e.to_chunk_id ELSE e.from_chunk_id END AS id
+           FROM code_edges_chunk e WHERE e.from_chunk_id = $1 OR e.to_chunk_id = $1
+           UNION
+           SELECT cc.id FROM code_edges_symbol e
+           JOIN content_chunks cc ON cc.symbol_name_qualified = e.to_symbol_qualified
+           WHERE e.from_chunk_id = $1
+         )
+         SELECT cc.id FROM neighbors n JOIN content_chunks cc ON cc.id = n.id
+         JOIN pages p ON p.id = cc.page_id WHERE ${filter}
+         ORDER BY cc.id LIMIT ${NEIGHBOR_CAP_PER_HOP}`, params,
+      );
+      for (const { id } of rows) {
+        if (seen.has(id)) continue;
+        seen.set(id, { chunk_id: id, score: seen.get(chunkId)!.score / (1 + hop), hop, source: 'neighbor' });
+        next.push(id);
+      }
+    }
+    frontier = next;
+  }
+  return [...seen.values()];
 }

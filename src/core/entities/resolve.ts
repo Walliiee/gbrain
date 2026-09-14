@@ -22,6 +22,8 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import type { PageReadPolicy } from '../types.ts';
+import { pageReadFilter } from '../search/read-policy-sql.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import { isUndefinedTableError } from '../utils.ts';
 
@@ -112,15 +114,17 @@ function fallbackSlugify(trimmed: string): string {
  * other errors warn once per process so degradation isn't silent.
  */
 let aliasExactWarned = false;
-async function tryAliasExact(engine: BrainEngine, source_id: string, raw: string): Promise<string | null> {
+async function tryAliasExact(engine: BrainEngine, source_id: string, raw: string, policy?: PageReadPolicy): Promise<string | null> {
   const norm = normalizeAlias(raw);
   if (!norm) return null;
   try {
-    const hits = (await engine.resolveAliases([norm], { sourceId: source_id })).get(norm) ?? [];
+    const hits = (await engine.resolveAliases([norm], { ...policy, sourceId: source_id })).get(norm) ?? [];
     if (!hits.length) return null;
+    const params: unknown[] = [source_id, [...new Set(hits.map((h) => h.slug))]];
+    const filter = pageReadFilter('pages', policy, params, !!policy);
     const rows = await engine.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[])`,
-      [source_id, [...new Set(hits.map((h) => h.slug))]],
+      `SELECT slug FROM pages WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[]) AND ${filter}`,
+      params,
     );
     const live = [...new Set(rows.map((r) => r.slug))];
     return live.length === 1 ? live[0] : null;
@@ -184,6 +188,7 @@ export async function resolveEntitySlugWithSource(
   engine: BrainEngine,
   source_id: string,
   raw: string,
+  policy?: PageReadPolicy,
 ): Promise<ResolveResult | null> {
   if (!raw) return null;
   const trimmed = raw.trim();
@@ -191,18 +196,18 @@ export async function resolveEntitySlugWithSource(
 
   // Mirror resolveEntitySlug's resolution chain but tag each branch.
   if (looksLikeSlug(trimmed)) {
-    const exact = await tryExactSlug(engine, source_id, trimmed);
+    const exact = await tryExactSlug(engine, source_id, trimmed, policy);
     if (exact) return { slug: exact, source: 'exact_page' };
   }
 
-  const aliased = await tryAliasExact(engine, source_id, trimmed);
+  const aliased = await tryAliasExact(engine, source_id, trimmed, policy);
   if (aliased) return { slug: aliased, source: 'alias_exact' };
 
   if (isBareName(trimmed)) {
-    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
+    const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed), policy);
     if (expanded) return { slug: expanded, source: 'fuzzy_match' };
   } else {
-    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
+    const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed, policy);
     if (fuzzy) return { slug: fuzzy, source: 'fuzzy_match' };
   }
 
@@ -266,6 +271,7 @@ export async function findPrefixCandidates(
   engine: BrainEngine,
   source_id: string,
   token: string,
+  policy?: PageReadPolicy,
 ): Promise<Array<{ slug: string; connection_count: number }>> {
   if (!token) return [];
   // Build LIKE pattern set for each configured directory:
@@ -280,6 +286,8 @@ export async function findPrefixCandidates(
     patterns.push(`${dir}/${token}-%`);
   }
   try {
+    const params: unknown[] = [source_id, patterns];
+    const filter = pageReadFilter('p', policy, params, !!policy);
     const rows = await engine.executeRaw<{
       slug: string;
       connection_count: number;
@@ -293,9 +301,10 @@ export async function findPrefixCandidates(
        WHERE p.source_id = $1
          AND p.deleted_at IS NULL
          AND p.slug LIKE ANY($2::text[])
+         AND ${filter}
        ORDER BY connection_count DESC, p.slug ASC
        LIMIT 10`,
-      [source_id, patterns],
+      params,
     );
     return rows;
   } catch {
@@ -311,8 +320,9 @@ async function tryUnambiguousPrefixExpansion(
   engine: BrainEngine,
   source_id: string,
   token: string,
+  policy?: PageReadPolicy,
 ): Promise<string | null> {
-  const candidates = await findPrefixCandidates(engine, source_id, token);
+  const candidates = await findPrefixCandidates(engine, source_id, token, policy);
   return candidates.length === 1 ? candidates[0].slug : null;
 }
 
@@ -394,11 +404,14 @@ async function tryExactSlug(
   engine: BrainEngine,
   source_id: string,
   candidate: string,
+  policy?: PageReadPolicy,
 ): Promise<string | null> {
   try {
+    const params: unknown[] = [source_id, candidate];
+    const filter = pageReadFilter('pages', policy, params, !!policy);
     const rows = await engine.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
-      [source_id, candidate],
+      `SELECT slug FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL AND ${filter} LIMIT 1`,
+      params,
     );
     if (rows.length > 0) return rows[0].slug;
   } catch {
@@ -411,6 +424,7 @@ async function tryFuzzyMatch(
   engine: BrainEngine,
   source_id: string,
   raw: string,
+  policy?: PageReadPolicy,
 ): Promise<string | null> {
   const lc = raw.toLowerCase();
   const fragment = slugify(raw);
@@ -418,6 +432,8 @@ async function tryFuzzyMatch(
   // tends to be display-name-shaped ("Alice Example" vs "alice-example"). Cap at
   // 3 candidates; pick the first deterministic one.
   try {
+    const params: unknown[] = [source_id, lc, fragment];
+    const filter = pageReadFilter('pages', policy, params, !!policy);
     const rows = await engine.executeRaw<{ slug: string; title: string; score: number }>(
       `SELECT slug, title,
          GREATEST(
@@ -427,13 +443,14 @@ async function tryFuzzyMatch(
        FROM pages
        WHERE source_id = $1
          AND deleted_at IS NULL
+         AND ${filter}
          AND (
            lower(title) % $2
            OR slug ILIKE '%' || $3 || '%'
          )
        ORDER BY score DESC, slug ASC
        LIMIT 3`,
-      [source_id, lc, fragment],
+      params,
     );
     // 0.4 confidently misattributes names that share only a generic company
     // token (for example "Beacon Capital" → "Benton Capital"). Keep fuzzy

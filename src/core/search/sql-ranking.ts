@@ -21,6 +21,7 @@ import { quarantineFilterFragment } from '../quarantine.ts';
 import { unverifiedExtractionFragment } from '../extraction-review.ts';
 import { privatePagesFilterFragment } from './private-visibility.ts';
 import { requiresSafeChunks, safeChunksFilter } from './safe-chunks.ts';
+import { lifecycleFilterFragment } from './lifecycle-policy.ts';
 
 /**
  * Escape `%`, `_`, and `\` so a string can be used as a LIKE prefix literal.
@@ -185,6 +186,8 @@ export function buildVisibilityClause(
      */
     excludePrivate?: boolean;
     requireSafeChunks?: boolean;
+    /** Operator policy resolved from this brain; absent preserves historical retrieval. */
+    excludeStatuses?: readonly string[];
   },
 ): string {
   // Single source of truth for the quarantine SQL lives in quarantine.ts so
@@ -196,7 +199,10 @@ export function buildVisibilityClause(
     ? ` AND ${privatePagesFilterFragment(pageAlias)}`
     : '';
   const chunksClause = requiresSafeChunks(opts) ? ` AND ${safeChunksFilter(pageAlias)}` : '';
-  return `AND ${pageAlias}.deleted_at IS NULL AND NOT ${sourceAlias}.archived AND ${quarantine}${privateClause}${chunksClause}`;
+  const lifecycleClause = opts?.excludeStatuses?.length
+    ? ` AND ${lifecycleFilterFragment(pageAlias, opts.excludeStatuses)}`
+    : '';
+  return `AND ${pageAlias}.deleted_at IS NULL AND NOT ${sourceAlias}.archived AND ${quarantine}${privateClause}${chunksClause}${lifecycleClause}`;
 }
 
 // ============================================================

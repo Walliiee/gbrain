@@ -23,6 +23,7 @@ import type {
 } from '../types.ts';
 import { affectsRecall } from '../types.ts';
 import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
+import { resolveSearchLifecyclePolicy } from './lifecycle-policy.ts';
 import { requiresSafeChunks } from './safe-chunks.ts';
 import { embed, embedQuery } from '../embedding.ts';
 import { registerBackgroundWorkDrainer } from '../background-work.ts';
@@ -896,7 +897,7 @@ export async function applyAliasHop(
   engine: import('../engine.ts').BrainEngine,
   results: SearchResult[],
   query: string,
-  opts: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; requireSafeChunks?: boolean },
+  opts: PageReadPolicy,
 ): Promise<SearchResult[]> {
   if (!query) return results;
   const qNorm = normalizeAlias(query);
@@ -1178,6 +1179,7 @@ export async function hybridSearch(
   query: string,
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
+  opts = { ...opts, ...await resolveSearchLifecyclePolicy(engine) };
   // v0.32.3 search-lite mode: resolve the active mode + per-key overrides
   // once at entry. Mode supplies DEFAULTS for intentWeighting, tokenBudget,
   // expansion, and searchLimit when the caller leaves those undefined.
@@ -1291,6 +1293,7 @@ export async function hybridSearch(
     // state, same leak class as source scoping above: dropping it here would
     // let an untrusted caller read `visibility: private` pages through the
     // hybrid hot path.
+    excludeStatuses: opts?.excludeStatuses,
     excludePrivate: opts?.excludePrivate,
     requireSafeChunks: opts?.requireSafeChunks,
     // v0.36 (D11): pass the pre-validated descriptor into the engine so
@@ -1441,6 +1444,7 @@ export async function hybridSearch(
   const postFusionOpts: PostFusionOpts = {
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
+    excludeStatuses: opts?.excludeStatuses,
     excludePrivate: opts?.excludePrivate,
     requireSafeChunks: opts?.requireSafeChunks,
     takesHoldersAllowList: opts?.takesHoldersAllowList,
@@ -1479,6 +1483,7 @@ export async function hybridSearch(
       // #4352 remediation: the arm hydrates titles + compiled_truth snippets
       // straight from pages — thread the caller's private-page gate or a
       // remote relational query bypasses the keyword/vector visibility clause.
+      excludeStatuses: opts?.excludeStatuses,
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
       takesHoldersAllowList: opts?.takesHoldersAllowList,
@@ -1544,6 +1549,7 @@ export async function hybridSearch(
     const noEmbedPreExact = await applyAliasHop(engine, dedupResults(noEmbedResults), query, {
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
+      excludeStatuses: opts?.excludeStatuses,
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
     });
@@ -1552,6 +1558,7 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
       titleCandidates: titleResults,
+      excludeStatuses: opts?.excludeStatuses,
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
       takesHoldersAllowList: opts?.takesHoldersAllowList,
@@ -1939,6 +1946,7 @@ export async function hybridSearch(
     const kwPreExact = await applyAliasHop(engine, dedupResults(fallbackResults), query, {
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
+      excludeStatuses: opts?.excludeStatuses,
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
     });
@@ -1947,6 +1955,7 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
       titleCandidates: titleResults,
+      excludeStatuses: opts?.excludeStatuses,
       excludePrivate: opts?.excludePrivate,
       requireSafeChunks: opts?.requireSafeChunks,
       takesHoldersAllowList: opts?.takesHoldersAllowList,
@@ -2130,6 +2139,9 @@ export async function hybridSearch(
         walkDepth,
         nearSymbol: opts?.nearSymbol,
         sourceId: opts?.sourceId,
+        sourceIds: opts?.sourceIds,
+        excludeStatuses: opts?.excludeStatuses,
+        excludePrivate: opts?.excludePrivate,
       });
       // Resolve new chunk IDs (not already in fused) into full rows.
       const existingIds = new Set(fused.map(r => r.chunk_id));
@@ -2137,7 +2149,7 @@ export async function hybridSearch(
         .filter(e => !existingIds.has(e.chunk_id))
         .map(e => e.chunk_id);
       if (newIds.length > 0) {
-        const hydrated = await hydrateChunks(engine, newIds);
+        const hydrated = await hydrateChunks(engine, newIds, opts?.excludeStatuses?.length ? opts : undefined);
         const scoreById = new Map(expanded.map(e => [e.chunk_id, e.score]));
         for (const r of hydrated) {
           r.score = scoreById.get(r.chunk_id) ?? 0.01;
@@ -2216,6 +2228,7 @@ export async function hybridSearch(
   const preExact = await applyAliasHop(engine, reranked, query, {
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
+    excludeStatuses: opts?.excludeStatuses,
     excludePrivate: opts?.excludePrivate,
     requireSafeChunks: opts?.requireSafeChunks,
   });
@@ -2230,6 +2243,7 @@ export async function hybridSearch(
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
     titleCandidates: titleResults,
+    excludeStatuses: opts?.excludeStatuses,
     excludePrivate: opts?.excludePrivate,
     requireSafeChunks: opts?.requireSafeChunks,
     takesHoldersAllowList: opts?.takesHoldersAllowList,
@@ -2423,6 +2437,7 @@ export async function hybridSearchCached(
   query: string,
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
+  opts = { ...opts, ...await resolveSearchLifecyclePolicy(engine) };
   // v0.32.3 search-lite mode: resolve mode + per-key overrides once. The
   // resolved knob set drives cache enable/threshold/TTL AND the knobs_hash
   // that scopes the cache row so a tokenmax write can't be served to a
@@ -2512,6 +2527,7 @@ export async function hybridSearchCached(
     // include_slug_prefixes — exactly what the engines' query-build path
     // resolves) into the cache key so a row written under one exclude
     // policy can't be served to a lookup under another.
+    excludeStatuses: opts?.excludeStatuses,
     hardExcludes: resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes),
     // #3515 — fold the EFFECTIVE detail level into the cache key. detail
     // gates dedup, chunk-source filtering, and the compiled_truth boost, so

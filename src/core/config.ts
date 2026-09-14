@@ -1299,6 +1299,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'backup.check_interval_days',
   // DB-plane (v0.32.3 search modes + related)
   'search.mode',
+  'search.exclude_statuses',
   'search.cache.enabled',
   'search.cache.similarity_threshold',
   'search.cache.ttl_seconds',

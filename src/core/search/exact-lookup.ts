@@ -32,7 +32,7 @@
  */
 
 import { sanitizeRemoteBody } from '../remote-body.ts';
-import { hasReadPolicy } from './read-policy-sql.ts';
+import { hasReadPolicy, pageReadFilter } from './read-policy-sql.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { SearchResult, PageReadPolicy } from '../types.ts';
 import { normalizeAlias } from './alias-normalize.ts';
@@ -109,12 +109,23 @@ export async function structuralExactLookup(
 
   // Slug probe — only for slug-shaped queries (zero cost otherwise).
   if (isSlugShapedQuery(q)) {
-    const scopes: Array<string | undefined> =
+    let scopes: Array<string | undefined> =
       opts.sourceIds && opts.sourceIds.length > 0
         ? [...opts.sourceIds].sort().slice(0, MAX_SLUG_PROBE_SOURCES)
         : opts.sourceId != null
           ? [opts.sourceId]
           : [undefined];
+    if (opts.excludeStatuses?.length) {
+      // getPage is intentionally a historical read. Resolve eligible sources
+      // first so an excluded first match cannot consume the identity probe cap.
+      const params: unknown[] = [q];
+      const filter = pageReadFilter('p', opts, params, true);
+      const rows = await engine.executeRaw<{ source_id: string }>(
+        `SELECT p.source_id FROM pages p WHERE p.slug = $1 AND ${filter}
+         ORDER BY p.source_id LIMIT ${MAX_SLUG_PROBE_SOURCES}`, params,
+      ).catch(() => []);
+      scopes = rows.map(row => row.source_id);
+    }
     for (const scope of scopes) {
       try {
         const page = scope != null

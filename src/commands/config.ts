@@ -828,6 +828,13 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       }
     }
 
+    if (key === 'search.exclude_statuses') {
+      const { parseExcludedStatuses } = await import('../core/search/lifecycle-policy.ts');
+      // Validate before the write; the same parser rejects malformed values
+      // on reads instead of silently disabling an operator's exclusions.
+      parseExcludedStatuses(value);
+    }
+
     // v0.36 (D12 + D14): validate embedding-column keys at set time so a
     // bad config gets rejected loud + early. The `--coverage-override`
     // flag lets the user proceed past the < 90% gate when they know
