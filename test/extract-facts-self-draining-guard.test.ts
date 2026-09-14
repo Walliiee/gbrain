@@ -72,7 +72,7 @@ async function seed(fact: string): Promise<void> {
   await engine.executeRaw(
     `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
                         valid_from, source, confidence)
-     VALUES ($1, 'people/alice', $2, 'fact', 'private', 'medium', '2026-01-02', 'mcp:put_page', 1.0)`,
+     VALUES ($1, 'people/alice', $2, 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', 'mcp:put_page', 1.0)`,
     [SRC, fact],
   );
 }

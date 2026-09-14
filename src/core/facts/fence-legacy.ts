@@ -25,8 +25,9 @@
  * so counted-there and repaired-here cannot diverge), grouping, the
  * residue-only sweep over pages whose never-fenced rows have ALL been
  * forgotten (the stamp path never visits them; the writer's own recognizer
- * decides what is residue), the per-source summary the halt reports, and a
- * kill switch.
+ * decides what is residue, and a page it cannot prove safe is handed back
+ * as `residuePagesBlocked` for the reconcile to leave alone), the per-source
+ * summary the halt reports, and a kill switch.
  *
  * Rollback after a COMMITTED stamp is git-native and has no code here:
  * un-stamp FIRST (`UPDATE facts SET row_num = NULL, source_markdown_slug =
@@ -44,9 +45,11 @@ import { isAborted } from '../abort-check.ts';
 import {
   stampLegacyFactsToFence,
   healResidueOnlyPage,
+  fenceDateSql,
   type LegacyStampRow,
   type LegacyStampHooks,
   type LegacyStampSkipReason,
+  type ResidueSweepOutcome,
 } from './fence-write.ts';
 
 export type { LegacyStampHooks, LegacyStampSkipReason } from './fence-write.ts';
@@ -80,6 +83,14 @@ export interface RepairLegacyRowsSummary {
    */
   residuePagesChecked: number;
   residuePagesHealed: number;
+  /**
+   * Residue-only pages the sweep could NOT prove safe: a self-dirty file that
+   * is not this repair's exact residue (`not_residue`), a restored file whose
+   * cache still carries another body (`cache_unsafe`), a lock or a throw
+   * (`error`), or a page the per-pass cap left unvisited (`unswept`). The
+   * reconcile skips these slugs; a later sync, commit or restore clears them.
+   */
+  residuePagesBlocked: Array<{ slug: string; reason: Exclude<ResidueSweepOutcome, 'healed' | 'clean' | 'skipped'> | 'unswept'; detail?: string }>;
   dryRun: boolean;
   aborted: boolean;
 }
@@ -129,7 +140,7 @@ const ELIGIBLE_WHERE = `
 export async function listLegacyRowsForSource(engine: BrainEngine, sourceId: string): Promise<LegacyFactRow[]> {
   return engine.executeRaw<LegacyFactRow>(
     `SELECT f.id::text AS id, f.source_id, f.entity_slug, f.fact, f.kind, f.visibility,
-            f.notability, f.context, f.valid_from::text AS valid_from, f.valid_until::text AS valid_until,
+            f.notability, f.context, ${fenceDateSql('f.valid_from')} AS valid_from, ${fenceDateSql('f.valid_until')} AS valid_until,
             f.source, f.confidence, f.claim_metric, f.claim_value, f.claim_unit, f.claim_period, f.superseded_by
        FROM facts f${ELIGIBLE_WHERE}
       ORDER BY f.entity_slug, f.id`,
@@ -199,7 +210,7 @@ export async function repairLegacyRowsForSource(
     rowsEligible: 0, rowsStamped: 0, rowsAppended: 0, rowsRewritten: 0,
     pagesFenced: 0, pagesSkipped: 0,
     skippedByReason: {}, skippedDetails: [],
-    rowsRemaining: 0, residuePagesChecked: 0, residuePagesHealed: 0,
+    rowsRemaining: 0, residuePagesChecked: 0, residuePagesHealed: 0, residuePagesBlocked: [],
     dryRun, aborted: false,
   };
 
@@ -238,17 +249,23 @@ export async function repairLegacyRowsForSource(
   // on a dry-run (nothing is written there); the writer's own recognizer
   // decides, so only this repair's exact bytes are ever put back. A page the
   // stamp loop just visited is skipped — its self-dirt is the stamp's own
-  // append, not residue.
+  // append, not residue. Every page the sweep cannot prove safe — including
+  // one the cap left unvisited — is handed back blocked, never silently
+  // left for the reconcile.
   if (!dryRun && !summary.aborted) {
     const residuePages = await listResidueOnlyPagesForSource(engine, opts.sourceId);
     for (const slug of residuePages) {
       if (bySlug.has(slug)) continue;
       if (isAborted(opts.signal)) { summary.aborted = true; break; }
-      if (pages++ >= (opts.maxPages ?? DEFAULT_MAX_PAGES)) break;
+      if (pages++ >= (opts.maxPages ?? DEFAULT_MAX_PAGES)) {
+        summary.residuePagesBlocked.push({ slug, reason: 'unswept', detail: 'per-pass page cap reached' });
+        continue;
+      }
       const r = await healResidueOnlyPage(engine, { sourceId: opts.sourceId, slug }, { lockTimeoutMs: opts.lockTimeoutMs });
       if (r.outcome === 'clean' || r.outcome === 'skipped') continue;
-      summary.residuePagesChecked += 1;
+      if (r.outcome !== 'error') summary.residuePagesChecked += 1;
       if (r.outcome === 'healed') summary.residuePagesHealed += 1;
+      else summary.residuePagesBlocked.push({ slug, reason: r.outcome, detail: r.detail });
     }
   }
 

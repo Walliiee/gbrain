@@ -367,6 +367,46 @@ describe('runExtractFacts — happy path', () => {
     }
   }, 15_000);
 
+  test('insert-only branch refuses a stale cache too: a fence row the pages cache carries but the canonical file does not is never inserted', async () => {
+    // 2026-09-14 acceptance review, finding 2: a file restored to its committed
+    // preimage while the cache still carries a crashed repair's appended row.
+    // No existing DB rows, so the reconcile takes the insert-only branch — which
+    // used to bypass the canonical-file check and resurrect the row.
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-facts-stale-insert-'));
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (engine as any).db.query(
+        `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+        [root],
+      );
+      const cachedBody = FACT_FENCE(
+        `| 1 | Restored away | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |`,
+      );
+      await putPage('people/alice-stale-insert', cachedBody);
+      mkdirSync(join(root, 'people'), { recursive: true });
+      writeFileSync(join(root, 'people', 'alice-stale-insert.md'), '# Page\n\nBody.\n', 'utf-8');
+
+      const r = await runExtractFacts(engine, { slugs: ['people/alice-stale-insert'] });
+      expect(r.factsInserted).toBe(0);
+      expect(r.factsDeleted).toBe(0);
+      expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_PAGE_CACHE_STALE'));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const rows = await (engine as any).db.query(
+        `SELECT fact FROM facts WHERE source_markdown_slug = 'people/alice-stale-insert'`,
+      );
+      expect(rows.rows).toEqual([]);
+
+      // Once the cache is the file's body again (a sync), the same page inserts normally.
+      await putPage('people/alice-stale-insert', cachedBody);
+      writeFileSync(join(root, 'people', 'alice-stale-insert.md'), cachedBody, 'utf-8');
+      const r2 = await runExtractFacts(engine, { slugs: ['people/alice-stale-insert'] });
+      expect(r2.warnings.some(w => w.includes('FACTS_PAGE_CACHE_STALE'))).toBe(false);
+      expect(r2.factsInserted).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('fresh cache: canonical Markdown equal to the pages cache lets destructive reconcile proceed', async () => {
     // Twin of the stale-refusal test above with ONE difference: the on-disk
     // file carries the same body as the pages row. Pins the comparison itself,

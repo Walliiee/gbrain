@@ -50,7 +50,7 @@ describe.skipIf(skip)('legacy-fact repair on Postgres', () => {
   async function seed(fact: string): Promise<string> {
     const r = await engine.executeRaw<{ id: string }>(
       `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence)
-       VALUES ($1, $2, $3, 'fact', 'private', 'medium', '2026-01-02', 'mcp:put_page', 0.9) RETURNING id::text AS id`,
+       VALUES ($1, $2, $3, 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', 'mcp:put_page', 0.9) RETURNING id::text AS id`,
       [SRC, ALICE, fact],
     );
     return r[0]!.id;
@@ -234,7 +234,7 @@ describe.skipIf(skip)('legacy-fact repair on Postgres', () => {
     await engine.executeRaw(
       `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence,
                           claim_metric, claim_value, claim_unit, claim_period)
-       VALUES ($1, $2, 'MRR is 50000', 'fact', 'private', 'medium', '2026-01-02', 'mcp:put_page', 0.9, 'mrr', 50000, 'USD', 'monthly')`, [SRC, ALICE]);
+       VALUES ($1, $2, 'MRR is 50000', 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', 'mcp:put_page', 0.9, 'mrr', 50000, 'USD', 'monthly')`, [SRC, ALICE]);
     const s = await run();
     expect(s).toMatchObject({ rowsStamped: 1, rowsAppended: 0, rowsRewritten: 1, pagesSkipped: 0 });
     expect(diskFence().facts[0]).toMatchObject({ rowNum: 4, claimMetric: 'mrr', claimValue: 50000, claimUnit: 'USD', claimPeriod: 'monthly' });
@@ -255,7 +255,7 @@ describe.skipIf(skip)('legacy-fact repair on Postgres', () => {
     const r0 = await engine.executeRaw<{ id: string }>(
       `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence,
                           claim_metric, claim_value, claim_unit, claim_period)
-       VALUES ($1, $2, '  MRR is 50000 ', 'fact', 'private', 'medium', '2026-01-02', '', 0.9, 'mrr', 50000, 'USD', 'monthly')
+       VALUES ($1, $2, '  MRR is 50000 ', 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', '', 0.9, 'mrr', 50000, 'USD', 'monthly')
        RETURNING id::text AS id`, [SRC, ALICE]);
     const s = await run();
     expect(s.rowsStamped).toBe(1);

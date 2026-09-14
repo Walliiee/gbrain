@@ -102,11 +102,18 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
+/**
+ * Legacy rows are seeded as the API writes them: `insertFact` binds a JS Date,
+ * so a fence day `2026-01-02` is the UTC-midnight INSTANT `2026-01-02T00:00:00Z`.
+ * A bare `'2026-01-02'` literal would be the SESSION's midnight — bun test pins
+ * TZ to UTC, so the two only coincide here by accident; the calendar-day tests
+ * below set the session zone explicitly.
+ */
 async function seed(fact: string, slug = ALICE, sourceId = SRC, source = 'mcp:put_page'): Promise<string> {
   const r = await engine.executeRaw<{ id: string }>(
     `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
                         valid_from, source, confidence)
-     VALUES ($1, $2, $3, 'fact', 'private', 'medium', '2026-01-02', $4, 0.9)
+     VALUES ($1, $2, $3, 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', $4, 0.9)
      RETURNING id::text AS id`,
     [sourceId, slug, fact, source],
   );
@@ -398,7 +405,7 @@ describe('stamp mode — refuses per file, never per tree', () => {
     await syncBody();
     await engine.executeRaw(
       `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence, row_num, source_markdown_slug)
-       VALUES ($1, $2, 'Founded Acme', 'fact', 'private', 'medium', '2026-01-02', 'mcp:put_page', 0.9, 1, $2)`, [SRC, ALICE]);
+       VALUES ($1, $2, 'Founded Acme', 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', 'mcp:put_page', 0.9, 1, $2)`, [SRC, ALICE]);
     const legacy = await seed('Founded Acme');
     const s = await run();
     expect(s.skippedByReason.fence_row_owned).toBe(1);
@@ -750,7 +757,7 @@ describe('finding 5 — typed metadata rides into the fence', () => {
     const r0 = await engine.executeRaw<{ id: string }>(
       `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence,
                           claim_metric, claim_value, claim_unit, claim_period)
-       VALUES ($1, $2, 'MRR is 50000', 'fact', 'private', 'medium', '2026-01-02', 'mcp:put_page', 0.9, 'mrr', 50000, 'USD', 'monthly')
+       VALUES ($1, $2, 'MRR is 50000', 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', 'mcp:put_page', 0.9, 'mrr', 50000, 'USD', 'monthly')
        RETURNING id::text AS id`, [SRC, ALICE]);
     const id = r0[0]!.id;
     const s = await run();
@@ -1006,7 +1013,7 @@ describe('finding 2 (review 2) — re-using an existing fence row never stamps a
     const r = await engine.executeRaw<{ id: string }>(
       `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence,
                           claim_metric, claim_value, claim_unit, claim_period)
-       VALUES ($1, $2, $3, 'fact', 'private', 'medium', '2026-01-02', 'mcp:put_page', 0.9, 'mrr', 50000, 'USD', 'monthly')
+       VALUES ($1, $2, $3, 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', 'mcp:put_page', 0.9, 'mrr', 50000, 'USD', 'monthly')
        RETURNING id::text AS id`, [SRC, ALICE, fact]);
     return r[0]!.id;
   }
@@ -1484,14 +1491,29 @@ describe('acceptance finding 3 — residue on a page whose ONLY never-fenced row
     await noActiveCopy();
   });
 
-  test('a residue-only page carrying a HUMAN edit is left alone by the sweep (checked, not healed)', async () => {
+  test('a residue-only page carrying a HUMAN edit is left alone by the sweep (checked, not healed) AND the reconcile leaves it alone too — the forgotten claim is not resurrected from the human\'s file', async () => {
     const a = await seed('Founded Acme');
     const theirs = plantResidue() + '\nA paragraph a human added.\n';
     writeFileSync(join(repo, ALICE_MD), theirs, 'utf-8');
     expect(await forgetFactInFence(engine, Number(a), { reason: 'after the crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    await syncBody();                                                         // the residue + the note are in the cache: file and cache agree
     const r = await reconcile();
     expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: undefined }]);
+    expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
+    expect(r.factsInserted).toBe(0);
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
+    await noActiveCopy();
+    // Blocked, not stuck: once the human COMMITS the file, the fence row is a
+    // committed, human-authored row and the fence-is-canonical contract inserts
+    // it — the block lifts because the file is clean, not because time passed.
+    const r2 = await reconcile();
+    expect(r2.factsInserted).toBe(0);
+    await noActiveCopy();
+    commitAll('the human keeps the row');
+    const r3 = await reconcile();
+    expect(r3.legacyRepair).toBeUndefined();
+    expect(r3.factsInserted).toBe(1);
   });
 
   test('a residue-only page whose file is clean costs nothing: not counted, summary omitted', async () => {
@@ -1509,6 +1531,181 @@ describe('acceptance finding 3 — residue on a page whose ONLY never-fenced row
     const r = await reconcile({ dryRun: true });
     expect(r.legacyRepair).toBeUndefined();
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
+  });
+});
+
+describe('acceptance round 3 (2026-09-14) — recovery never overwrites a concurrent edit, and reconciliation stays blocked until file AND cache are proven safe', () => {
+  const plantResidue = () => {
+    const body = upsertFactRow(ALICE_BODY, {
+      rowNum: 1, claim: 'Founded Acme', kind: 'fact', confidence: 0.9, visibility: 'private',
+      notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
+    }).body;
+    writeFileSync(join(repo, ALICE_MD), body, 'utf-8');
+    return body;
+  };
+  const noActiveCopy = async () => {
+    const rows = await factRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.expired_at).not.toBeNull();
+    expect(rows[0]!.row_num).toBeNull();
+  };
+  /** Residue on disk whose only DB row has since been forgotten — the sole-forgotten-fact shape. */
+  async function forgottenResidue(): Promise<string> {
+    const a = await seed('Founded Acme');
+    const body = plantResidue();
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'after the crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    return body;
+  }
+
+  test('P1: a human paragraph saved WHILE recovery awaits its DB read is never overwritten — refused as not_residue, blocked, nothing inserted', async () => {
+    await forgottenResidue();
+    await syncBody();
+    const theirs = readFileSync(join(repo, ALICE_MD), 'utf-8') + '\nHuman note written while recovery reads DB.\n';
+    const raw = engine.executeRaw;
+    let humanWrite = false;
+    // The healer's one await between reading the file and replacing it.
+    engine.executeRaw = (async function (this: PGLiteEngine, ...args: Parameters<typeof raw>) {
+      const rows = await raw.apply(this, args);
+      if (!humanWrite && String(args[0]).includes('FROM facts WHERE source_id = $1 AND entity_slug = $2 AND row_num IS NULL')) {
+        humanWrite = true;
+        writeFileSync(join(repo, ALICE_MD), theirs, 'utf-8');
+      }
+      return rows;
+    }) as typeof raw;
+    let r;
+    try { r = await reconcile(); } finally { engine.executeRaw = raw; }
+    expect(humanWrite).toBe(true);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: undefined }]);
+    expect(r.warnings).not.toContainEqual(expect.stringContaining('restored the committed preimage'));
+    expect(r.factsInserted).toBe(0);
+    await noActiveCopy();
+  });
+
+  test('P1: a transient cache-refresh failure is NOT healed — the file is restored, the page reports cache_unsafe and stays blocked, nothing is inserted; a later sync clears it', async () => {
+    await forgottenResidue();
+    await syncBody();
+    const refresh = engine.refreshPageBody;
+    let failures = 0;
+    engine.refreshPageBody = (async function (this: PGLiteEngine, ...args: Parameters<typeof refresh>) {
+      failures += 1;
+      if (failures === 1) throw new Error('transient refresh failure');
+      return refresh.apply(this, args);
+    }) as typeof refresh;
+    let r;
+    try { r = await reconcile(); } finally { engine.refreshPageBody = refresh; }
+    expect(failures).toBe(1);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);        // the file IS restored
+    expect((await dbFence()).facts).toHaveLength(1);                             // the cache still carries the residue
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'cache_unsafe', detail: undefined }]);
+    expect(r.warnings).not.toContainEqual(expect.stringContaining('restored the committed preimage'));
+    expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
+    expect(r.factsInserted).toBe(0);
+    await noActiveCopy();
+    // Next cycle, sync still pending: the file is clean so the sweep has nothing
+    // to say, and the reconcile's own stale-cache rule holds the insert.
+    const r2 = await reconcile();
+    expect(r2.legacyRepair).toBeUndefined();
+    expect(r2.warnings).toContainEqual(expect.stringContaining('FACTS_PAGE_CACHE_STALE'));
+    expect(r2.factsInserted).toBe(0);
+    await noActiveCopy();
+    await syncBody();
+    const r3 = await reconcile();
+    expect(r3.factsInserted).toBe(0);
+    expect((await dbFence()).facts).toEqual([]);
+    await noActiveCopy();
+  });
+
+  test('P1: a cache that is neither the residue nor the preimage (residue plus a cache-only paragraph) is cache_unsafe — blocked, nothing inserted, and a sync of the restored file clears it', async () => {
+    await forgottenResidue();
+    const disk = parseMarkdown(readFileSync(join(repo, ALICE_MD), 'utf-8'), `${ALICE}.md`);
+    await engine.refreshPageBody(ALICE, SRC, disk.compiled_truth + '\n\nCache-only human note.', disk.timeline, 'synced');
+    const r = await reconcile();
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect((await dbFence()).facts).toHaveLength(1);
+    expect((await engine.getPage(ALICE, { sourceId: SRC }))!.compiled_truth).toContain('Cache-only human note.');   // never touched
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'cache_unsafe', detail: undefined }]);
+    expect(r.factsInserted).toBe(0);
+    await noActiveCopy();
+    await syncBody();
+    const r2 = await reconcile();
+    expect(r2.factsInserted).toBe(0);
+    expect((await dbFence()).facts).toEqual([]);
+    await noActiveCopy();
+  });
+
+  test('a residue page the per-pass cap leaves unvisited is blocked as unswept, never silently left for the reconcile', async () => {
+    await forgottenResidue();
+    const s = await run(undefined, { maxPages: 0 });
+    expect(s.residuePagesChecked).toBe(0);
+    expect(s.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'unswept', detail: 'per-pass page cap reached' }]);
+  });
+
+  test('a healed page reports no block and the cache is read back as the preimage (control)', async () => {
+    await forgottenResidue();
+    await syncBody();
+    const r = await reconcile();
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1, residuePagesBlocked: [] });
+    expect(r.warnings).not.toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
+    expect((await dbFence()).facts).toEqual([]);
+    await noActiveCopy();
+  });
+});
+
+describe('acceptance round 3 (2026-09-14) — calendar days are the UTC day the API wrote, whatever the DB session zone', () => {
+  // The normal input path: the fence mapper / `remember` bind UTC-midnight
+  // Dates. Rendering the SESSION's day (the 2d5c08f90 form) shifts these back
+  // a day under any negative offset; rendering the UTC day round-trips.
+  for (const zone of ['Europe/Copenhagen', 'America/Los_Angeles', 'Pacific/Kiritimati']) {
+    test(`${zone}: a legacy row at UTC midnight 2026-01-02..2026-12-31 stamps as 2026-01-02..2026-12-31, and the reconcile after a sync keeps the instants`, async () => {
+      await engine.executeRaw(`SET TIME ZONE '${zone}'`);
+      try {
+        const mapped = extractFactsFromFenceText([{
+          rowNum: 1, claim: 'Calendar fact', kind: 'fact', visibility: 'private', notability: 'medium',
+          confidence: 0.9, validFrom: '2026-01-02', validUntil: '2026-12-31', source: 'mcp:put_page', active: true,
+        }], ALICE, SRC)[0]!;
+        expect(mapped.valid_from!.toISOString()).toBe('2026-01-02T00:00:00.000Z');
+        const { id } = await engine.insertFact(mapped, { source_id: SRC });   // insertFact writes no row_num: a legacy row
+        expect((await factRows())[0]!.row_num).toBeNull();
+
+        const s = await run();
+        expect(s).toMatchObject({ rowsStamped: 1, rowsRemaining: 0 });
+        const f = diskFence().facts[0]!;
+        expect([f.validFrom, f.validUntil]).toEqual(['2026-01-02', '2026-12-31']);
+        expect((await dbFence()).facts[0]!.validFrom).toBe('2026-01-02');
+
+        // A wipe + reinsert from the fence must land on the same instants.
+        await engine.executeRaw(
+          `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence, row_num, source_markdown_slug)
+           VALUES ($1, $2, 'Stale unrelated row', 'fact', 'private', 'medium', now(), 'mcp:put_page', 0.9, 99, $2)`, [SRC, ALICE]);
+        const r = await reconcile();
+        expect(r.factsDeleted).toBe(2);
+        expect(r.factsInserted).toBe(1);
+        const dates = await engine.executeRaw<{ vf: string; vu: string }>(
+          `SELECT to_char(valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') AS vf, to_char(valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') AS vu
+             FROM facts WHERE source_id = $1 AND fact = 'Calendar fact'`, [SRC]);
+        expect(dates).toEqual([{ vf: '2026-01-02 00:00', vu: '2026-12-31 00:00' }]);
+        expect(id).toBeGreaterThan(0);
+      } finally {
+        await engine.executeRaw(`RESET TIME ZONE`);
+      }
+    });
+  }
+
+  test('America/Los_Angeles: the in-transaction re-check renders the same UTC day as the eligibility read, so a negative offset is not mistaken for an edit', async () => {
+    await engine.executeRaw(`SET TIME ZONE 'America/Los_Angeles'`);
+    try {
+      await engine.insertFact({ entity_slug: ALICE, fact: 'Founded Acme', kind: 'fact', visibility: 'private', notability: 'medium',
+        confidence: 0.9, valid_from: new Date('2026-01-02'), source: 'mcp:put_page' }, { source_id: SRC });
+      const s = await run();
+      expect(s.skippedByReason).toEqual({});
+      expect(s.rowsStamped).toBe(1);
+      expect(diskFence().facts[0]!.validFrom).toBe('2026-01-02');
+    } finally {
+      await engine.executeRaw(`RESET TIME ZONE`);
+    }
   });
 });
 

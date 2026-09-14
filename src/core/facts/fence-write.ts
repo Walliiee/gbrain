@@ -773,10 +773,22 @@ class StampRefusal extends Error {
   }
 }
 
+/**
+ * A `timestamptz` column rendered as the fence's `YYYY-MM-DD`: its UTC calendar
+ * day, whatever the session time zone. That is the day every fence writer
+ * renders (`toISOString().slice(0, 10)`, incl. the v0.32.2 backfill) and the
+ * day the fence mapper parses back (`new Date('YYYY-MM-DD')` is UTC midnight),
+ * so a row inserted through the API round-trips. Rendering in the SESSION zone
+ * instead shifts a UTC-midnight instant back a day under any negative offset.
+ */
+export function fenceDateSql(column: string): string {
+  return `to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD')`;
+}
+
 function legacyIsoDate(v: Date | string | null | undefined): string | undefined {
   if (v == null) return undefined;
-  // The repair queries timestamptz columns as text so PostgreSQL preserves the
-  // session's calendar day instead of the JS driver converting it through UTC.
+  // Every repair SELECT renders the day with fenceDateSql; a Date (tests,
+  // typed callers) takes the same UTC day.
   if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}(?:$|T|\s)/.test(v)) return v.slice(0, 10);
   const d = v instanceof Date ? v : new Date(v);
   return Number.isNaN(d.getTime()) ? undefined : d.toISOString().slice(0, 10);
@@ -952,22 +964,25 @@ interface StampPlan {
  * view on every fence column, and re-rendering those DB rows onto HEAD must
  * reproduce the working file byte for byte; a row that merely shares the
  * (claim, source) key but carries a note, a date or typed columns the DB row
- * does not is someone's addition and refuses (`not_residue`). Restores HEAD in
- * place and reports `healed`.
+ * does not is someone's addition and refuses (`not_residue`). The DB read is
+ * an await: the file is re-read immediately before the rename and only the
+ * exact bytes recognised as residue are ever replaced — a save that landed
+ * meanwhile is someone's and stays (`not_residue`). Restores HEAD in place.
  *
- * If a sync already imported the residue into the pages cache, the cache is
- * put back to the restored file's body too (hash kept, so the next sync
- * re-imports): otherwise the reconcile would insert the residue rows from the
- * stale cache even though the file no longer carries them. A cache that is
- * neither the residue's nor the preimage's body is left alone.
+ * `healed` is reported only once the pages cache is PROVEN to carry the
+ * restored body too (`residueCacheIsFile`): a sync may already have imported
+ * the residue, and the reconcile inserts from the cache. Otherwise
+ * `cache_unsafe` — the file is healed, the page is not yet safe to reconcile.
  */
+export type ResidueHealOutcome = 'healed' | 'cache_unsafe' | 'not_residue';
+
 async function healCrashResidue(
   engine: BrainEngine,
   sourceId: string,
   slug: string,
   writeRoot: string,
   filePath: string,
-): Promise<'healed' | 'not_residue'> {
+): Promise<ResidueHealOutcome> {
   const headBody = gitHeadBlob(writeRoot, filePath);
   if (headBody === null) return 'not_residue';
   const working = readFileSync(filePath, 'utf-8');
@@ -979,7 +994,7 @@ async function healCrashResidue(
   if (extras.length === 0 || extras.some(f => !f.active)) return 'not_residue';
   const dbRows = await engine.executeRaw<LegacyStampRow>(
     `SELECT id::text AS id, fact, kind, visibility, notability, context,
-            valid_from::text AS valid_from, valid_until::text AS valid_until, source, confidence,
+            ${fenceDateSql('valid_from')} AS valid_from, ${fenceDateSql('valid_until')} AS valid_until, source, confidence,
             claim_metric, claim_value, claim_unit, claim_period, superseded_by
        FROM facts WHERE source_id = $1 AND entity_slug = $2 AND row_num IS NULL`,
     [sourceId, slug],
@@ -1002,23 +1017,47 @@ async function healCrashResidue(
     rebuilt = upsertFactRow(rebuilt, legacyRowToFenceRow(match.row, f.rowNum)).body;
   }
   if (rebuilt !== working) return 'not_residue';
+  if (readFileSync(filePath, 'utf-8') !== working) return 'not_residue';
   atomicReplace(filePath, headBody);
-  // A sync may already have imported the residue into the pages cache.
-  try {
-    const page = await engine.getPage(slug, { sourceId });
-    if (page && !pageBodyIsFile(page, headBody, slug) && pageBodyIsFile(page, working, slug)) {
-      const restored = parseMarkdown(headBody, `${slug}.md`);
-      await engine.refreshPageBody(slug, sourceId,
-        sanitizeText(restored.compiled_truth), sanitizeText(restored.timeline),
-        page.content_hash || contentHash(page));
-    }
-  } catch (err) {
-    recordWriteFailure(slug, sourceId, [`residue_cache_refresh_failed: ${err instanceof Error ? err.message : String(err)}`], filePath);
-  }
-  return 'healed';
+  return residueCacheIsFile(engine, sourceId, slug, headBody, working, filePath);
 }
 
-export type ResidueSweepOutcome = 'healed' | 'not_residue' | 'clean' | 'skipped';
+/**
+ * The pages cache after a residue restore: already the preimage's body (or no
+ * row) → `healed`; the residue's body → put back to the preimage (hash kept,
+ * so the next sync re-imports) and READ BACK before `healed`; any other body,
+ * a refresh that fails, or a cache that cannot be read → `cache_unsafe`,
+ * audited to the write-failure log.
+ */
+async function residueCacheIsFile(
+  engine: BrainEngine, sourceId: string, slug: string, headBody: string, residueBody: string, filePath: string,
+): Promise<'healed' | 'cache_unsafe'> {
+  const unsafe = (why: string): 'cache_unsafe' => {
+    recordWriteFailure(slug, sourceId, [`residue_cache_unsafe: ${why}`], filePath);
+    return 'cache_unsafe';
+  };
+  try {
+    const page = await engine.getPage(slug, { sourceId });
+    if (!page || pageBodyIsFile(page, headBody, slug)) return 'healed';
+    if (!pageBodyIsFile(page, residueBody, slug)) return unsafe('cache body is neither the preimage nor the residue; run gbrain sync');
+    const restored = parseMarkdown(headBody, `${slug}.md`);
+    await engine.refreshPageBody(slug, sourceId,
+      sanitizeText(restored.compiled_truth), sanitizeText(restored.timeline),
+      page.content_hash || contentHash(page));
+    const after = await engine.getPage(slug, { sourceId });
+    return after && pageBodyIsFile(after, headBody, slug) ? 'healed' : unsafe('cache did not read back as the preimage after refresh');
+  } catch (err) {
+    return unsafe(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/**
+ * `error` (lock not acquired, or a throw mid-sweep) leaves the page's state
+ * unknown; `skipped` means the sweep never looked (write-through off, target
+ * unresolvable, file missing or a symlink). The caller blocks the reconcile on
+ * `not_residue`, `cache_unsafe` and `error`.
+ */
+export type ResidueSweepOutcome = ResidueHealOutcome | 'clean' | 'skipped' | 'error';
 
 /**
  * Residue-only entry point for a page that has NO eligible legacy row left —
@@ -1050,7 +1089,7 @@ export async function healResidueOnlyPage(
       return { slug, outcome };
     }, { timeoutMs: opts.lockTimeoutMs ?? 5_000 });
   } catch (err) {
-    return { slug, outcome: 'skipped', detail: err instanceof Error ? err.message : String(err) };
+    return { slug, outcome: 'error', detail: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -1114,7 +1153,9 @@ export async function stampLegacyFactsToFence(
     let gitState = gitPathState(writeRoot, filePath);
     let healedResidue = false;
     if (gitState === 'self_dirty' && locked) {
-      if (await healCrashResidue(engine, sourceId, slug, writeRoot, filePath) === 'healed') {
+      // `cache_unsafe` restored the file too; the stamp transaction's own
+      // DB-body-is-the-file check (`verify_failed`) then decides.
+      if (await healCrashResidue(engine, sourceId, slug, writeRoot, filePath) !== 'not_residue') {
         healedResidue = true;
         gitState = gitPathState(writeRoot, filePath);
       }
@@ -1238,7 +1279,7 @@ export async function stampLegacyFactsToFence(
 
           const current = await tx.executeRaw<LegacyStampRow & { expired_at: unknown; row_num: number | null; entity_slug: string | null }>(
             `SELECT id::text AS id, fact, source, kind, visibility, notability, context,
-                    valid_from::text AS valid_from, valid_until::text AS valid_until, confidence,
+                    ${fenceDateSql('valid_from')} AS valid_from, ${fenceDateSql('valid_until')} AS valid_until, confidence,
                     claim_metric, claim_value, claim_unit, claim_period, superseded_by, expired_at, row_num, entity_slug
                FROM facts WHERE id = ANY($1::bigint[]) AND source_id = $2 FOR UPDATE`,
             [ids.map(Number), sourceId],

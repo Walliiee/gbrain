@@ -115,15 +115,19 @@ function dedupeFactsByContentKey(facts: FenceExtractedFact[]): FenceExtractedFac
 }
 
 /**
- * Destructive reconciliation may only trust the pages-table body when it
- * still matches the canonical Markdown file. The fact writer deliberately
- * commits Markdown first and then stamps the facts index, while page sync is
- * asynchronous. In that gap a sweep can observe the old pages.compiled_truth
- * plus the new fact row and otherwise delete the new row as "stale".
+ * Reconciliation may only trust the pages-table body when it still matches
+ * the canonical Markdown file — on the insert-only branch as much as the
+ * destructive ones. The fact writer deliberately commits Markdown first and
+ * then stamps the facts index, while page sync is asynchronous. In that gap a
+ * sweep can observe the old pages.compiled_truth plus the new fact row and
+ * otherwise delete the new row as "stale"; in the mirror-image gap (a file
+ * restored to its committed preimage while the cache still carries a crashed
+ * repair's appends) an unchecked insert resurrects a row the file no longer
+ * has — the forgotten-fact resurrection of the 2026-09-14 acceptance review.
  *
  * `unavailable` preserves the existing DB-only/thin-client behaviour. A local
- * canonical file that exists but cannot be read is fail-closed: destructive
- * cleanup waits for a healthy sync/read instead of guessing that the cache is
+ * canonical file that exists but cannot be read is fail-closed: the write
+ * waits for a healthy sync/read instead of guessing that the cache is
  * authoritative.
  */
 async function canonicalCacheState(
@@ -150,7 +154,7 @@ async function canonicalCacheState(
   }
 }
 
-async function refuseDestructiveReconcileOnStaleCache(
+async function refuseReconcileOnStaleCache(
   engine: BrainEngine,
   slug: string,
   sourceId: string,
@@ -168,17 +172,17 @@ async function refuseDestructiveReconcileOnStaleCache(
   if (state !== 'stale') return false;
   warnings.push(
     `${slug}: FACTS_PAGE_CACHE_STALE: canonical Markdown differs from the pages cache; ` +
-    'refusing destructive fact reconciliation until gbrain sync refreshes the page index.',
+    'refusing fact reconciliation until gbrain sync refreshes the page index.',
   );
   return true;
 }
 
 /**
- * Run one page's destructive reconcile under its page lock (5s, matching the
- * fence writers in fence-write.ts / forget.ts). A lock still held past the
- * deadline degrades to a FACTS_PAGE_LOCK_TIMEOUT warning for THAT page and a
- * null result, so one wedged page cannot abort the remaining slugs of the
- * phase run. Errors thrown by `fn` itself still propagate.
+ * Run one page's DB write under its page lock (5s, matching the fence writers
+ * in fence-write.ts / forget.ts). A lock still held past the deadline
+ * degrades to a FACTS_PAGE_LOCK_TIMEOUT warning for THAT page and a null
+ * result, so one wedged page cannot abort the remaining slugs of the phase
+ * run. Errors thrown by `fn` itself still propagate.
  */
 async function underPageLock<T>(
   slug: string,
@@ -190,7 +194,7 @@ async function underPageLock<T>(
   if (!handle) {
     warnings.push(
       `${slug}: FACTS_PAGE_LOCK_TIMEOUT: page lock held by another writer; ` +
-      'skipping destructive fact reconciliation for this page until the next run.',
+      'skipping fact reconciliation for this page until the next run.',
     );
     return null;
   }
@@ -480,6 +484,11 @@ export async function runExtractFacts(
   const residuePagesPending = repairEnabled && !opts.dryRun && legacyCount === 0
     ? (await listResidueOnlyPagesForSource(engine, sourceId)).length > 0
     : false;
+  // Residue-only pages the sweep could not prove safe (file still carrying
+  // uncommitted fence rows that are not exactly a crashed repair's, or a cache
+  // not yet back to the file's body): the reconcile below leaves them alone,
+  // otherwise it would insert the forgotten rows from that file or cache.
+  const blockedResidueSlugs = new Set<string>();
   if ((legacyCount > 0 || residuePagesPending) && repairEnabled && !opts.dryRun) {
     try {
       const repair = await repairLegacyRowsForSource(engine, {
@@ -489,7 +498,7 @@ export async function runExtractFacts(
       });
       // A sweep that found every candidate page clean is not a repair worth
       // reporting; the summary stays as quiet as a run with nothing to do.
-      if (repair.rowsEligible > 0 || repair.residuePagesChecked > 0) result.legacyRepair = repair;
+      if (repair.rowsEligible > 0 || repair.residuePagesChecked > 0 || repair.residuePagesBlocked.length > 0) result.legacyRepair = repair;
       result.legacyRowsRepaired = repair.rowsStamped;
       legacyCount = repair.rowsRemaining;
       result.legacyRowsPending = legacyCount;
@@ -497,6 +506,16 @@ export async function runExtractFacts(
         result.warnings.push(
           `extract_facts: restored the committed preimage over a crashed repair's uncommitted fence rows on ` +
           `${repair.residuePagesHealed} page(s) in source "${sourceId}"`,
+        );
+      }
+      if (repair.residuePagesBlocked.length > 0) {
+        for (const b of repair.residuePagesBlocked) blockedResidueSlugs.add(b.slug);
+        const named = repair.residuePagesBlocked.slice(0, 10)
+          .map(b => `${b.slug} (${b.reason}${b.detail ? `: ${b.detail.slice(0, 120)}` : ''})`).join(' | ');
+        result.warnings.push(
+          `extract_facts: FACTS_RESIDUE_UNRESOLVED: ${repair.residuePagesBlocked.length} page(s) in source "${sourceId}" ` +
+          `still carry a crashed repair's fence rows in the file or the page cache; their fact reconciliation is skipped ` +
+          `until the file is committed or restored (git checkout -- <file>) and gbrain sync has refreshed the page: ${named}`,
         );
       }
       if (repair.pagesSkipped > 0) {
@@ -622,6 +641,9 @@ export async function runExtractFacts(
     // partial state; the receipt/rollup below still runs with partial counts.
     if (isAborted(opts.signal)) break;
     result.pagesScanned += 1;
+    // Named in the FACTS_RESIDUE_UNRESOLVED warning above; neither its file
+    // nor its cache is proven free of a crashed repair's rows.
+    if (blockedResidueSlugs.has(slug)) continue;
 
     const page = await engine.getPage(slug, { sourceId });
     if (!page) {
@@ -698,7 +720,7 @@ export async function runExtractFacts(
     if (extracted.length === 0) {
       if (existing.length > 0) {
         const deletion = await underPageLock(slug, async () => {
-          if (await refuseDestructiveReconcileOnStaleCache(
+          if (await refuseReconcileOnStaleCache(
             engine,
             slug,
             sourceId,
@@ -858,26 +880,27 @@ export async function runExtractFacts(
 
     if (toInsert.length === 0) continue;
 
-    const insert = () => engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
-      toInsert,
-      { source_id: sourceId },
-      deleteForPageFirst ? { deleteForPageFirst } : undefined,
-    );
-    const inserted = deleteForPageFirst
-      ? await underPageLock(slug, async () => {
-        if (await refuseDestructiveReconcileOnStaleCache(
-          engine,
-          slug,
-          sourceId,
-          page.compiled_truth ?? '',
-          page.timeline ?? '',
-          result.warnings,
-        )) {
-          return null;
-        }
-        return insert();
-      }, opts, result.warnings)
-      : await insert();
+    // Insert-only or wipe + reinsert alike: under the page lock, and only
+    // from a cache that still IS the canonical file. An insert from a cache
+    // the file no longer matches is how a restored preimage's forgotten rows
+    // came back (2026-09-14 acceptance review, finding 2).
+    const inserted = await underPageLock(slug, async () => {
+      if (await refuseReconcileOnStaleCache(
+        engine,
+        slug,
+        sourceId,
+        page.compiled_truth ?? '',
+        page.timeline ?? '',
+        result.warnings,
+      )) {
+        return null;
+      }
+      return engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
+        toInsert,
+        { source_id: sourceId },
+        deleteForPageFirst ? { deleteForPageFirst } : undefined,
+      );
+    }, opts, result.warnings);
     if (!inserted) continue;
     result.factsInserted += inserted.inserted;
     // v0.46 (#3014) — the wipe (when needed) ran inside insertFacts' txn;
