@@ -92,7 +92,8 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // 27→28: compiledTruthBoost suppresses the 2x boost for synthetic
     // chunkless title rows (#4256, fixes #3695's fusion path) — reorders
     // fused rows for identical knobs; version-only invalidation.
-    expect(KNOBS_HASH_VERSION).toBe(28);
+    // 28→29: lifecycle policy set; 29→30 bounded ANN lifecycle fallback.
+    expect(KNOBS_HASH_VERSION).toBe(30);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {

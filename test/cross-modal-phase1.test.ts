@@ -211,7 +211,8 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
 
     // 27→28: compiledTruthBoost synthetic-row suppression (#4256/#3695) —
     // version-only invalidation.
-    expect(KNOBS_HASH_VERSION).toBe(28);
+    // 28→29: lifecycle policy set; 29→30 bounded ANN lifecycle fallback.
+    expect(KNOBS_HASH_VERSION).toBe(30);
   });
 
   test('flipping unified_multimodal changes the hash', () => {

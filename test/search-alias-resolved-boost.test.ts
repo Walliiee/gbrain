@@ -92,6 +92,7 @@ describe('KNOBS_HASH_VERSION', () => {
     // fusion-demotion behavioral change (one bump per wave).
     // 27→28: compiledTruthBoost synthetic-row suppression (#4256/#3695) —
     // version-only invalidation.
-    expect(KNOBS_HASH_VERSION).toBe(28);
+    // 28→29: lifecycle policy set; 29→30 bounded ANN lifecycle fallback.
+    expect(KNOBS_HASH_VERSION).toBe(30);
   });
 });
