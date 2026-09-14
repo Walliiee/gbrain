@@ -51,7 +51,7 @@
  */
 
 import {
-  existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync,
+  existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'fs';
 import { dirname, join } from 'path';
 import { createHash, randomBytes } from 'crypto';
@@ -152,7 +152,9 @@ export type PushLockResult =
   | { acquired: false; holderPid: number | null };
 
 export function pushLockDir(repoRoot: string): string {
-  const hash = createHash('sha256').update(repoRoot).digest('hex').slice(0, 16);
+  let root = repoRoot;
+  try { root = realpathSync(repoRoot); } catch { /* keep the given path when it does not exist yet */ }
+  const hash = createHash('sha256').update(root).digest('hex').slice(0, 16);
   return join(ensureGbrainHome(), 'locks', `push-${hash}.lock`);
 }
 

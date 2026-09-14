@@ -147,8 +147,21 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
  * guard: a stale `worker-<pid>.json` plus an OS-reused pid would otherwise make
  * us report an unrelated process's niceness (Codex #8). Returns null when
  * undeterminable — callers must NOT treat null as "reused".
+ *
+ * Prefer elapsed time (`etime`) over `lstart`: `Date.parse` of `lstart` is
+ * timezone-ambiguous and can place a live pid in the future, which falsely
+ * trips the reuse guard.
  */
 function processStartMs(pid: number): number | null {
+  try {
+    const etime = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
+      encoding: 'utf8',
+      timeout: 2000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const elapsedMs = etimeToMs(etime);
+    if (elapsedMs !== null) return Date.now() - elapsedMs;
+  } catch { /* fall through to lstart */ }
   try {
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf8',
@@ -161,6 +174,19 @@ function processStartMs(pid: number): number | null {
   } catch {
     return null;
   }
+}
+
+/** Parse `ps -o etime=` (`[[dd-]hh:]mm:ss`) to elapsed milliseconds. */
+function etimeToMs(raw: string): number | null {
+  const s = raw.trim();
+  if (!s) return null;
+  const parts = s.replace('-', ':').split(':').map((p) => Number(p));
+  if (parts.length < 2 || parts.length > 4 || parts.some((n) => !Number.isFinite(n))) return null;
+  let sec = 0;
+  if (parts.length === 2) sec = parts[0]! * 60 + parts[1]!;
+  else if (parts.length === 3) sec = parts[0]! * 3600 + parts[1]! * 60 + parts[2]!;
+  else sec = parts[0]! * 86400 + parts[1]! * 3600 + parts[2]! * 60 + parts[3]!;
+  return sec * 1000;
 }
 
 /** Tolerance (ms) for the PID-reuse start-time comparison — covers the small gap

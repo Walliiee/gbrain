@@ -16,15 +16,23 @@ import { tmpdir } from 'os';
 
 let home: string;
 const origHome = process.env.GBRAIN_HOME;
+const origDbUrl = process.env.DATABASE_URL;
+const origGbrainDbUrl = process.env.GBRAIN_DATABASE_URL;
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'gbrain-reg-'));
   process.env.GBRAIN_HOME = home;
+  delete process.env.DATABASE_URL;
+  delete process.env.GBRAIN_DATABASE_URL;
 });
 
 afterEach(() => {
   if (origHome === undefined) delete process.env.GBRAIN_HOME;
   else process.env.GBRAIN_HOME = origHome;
+  if (origDbUrl === undefined) delete process.env.DATABASE_URL;
+  else process.env.DATABASE_URL = origDbUrl;
+  if (origGbrainDbUrl === undefined) delete process.env.GBRAIN_DATABASE_URL;
+  else process.env.GBRAIN_DATABASE_URL = origGbrainDbUrl;
   try { rmSync(home, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
