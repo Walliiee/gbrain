@@ -74,6 +74,7 @@ import { embed, isAvailable } from '../ai/gateway.ts';
 import { isAborted } from '../abort-check.ts';
 import {
   repairLegacyRowsForSource,
+  listResidueOnlyPagesForSource,
   isFactRepairDisabled,
   type RepairLegacyRowsSummary,
   type LegacyStampHooks,
@@ -472,17 +473,32 @@ export async function runExtractFacts(
   // a deploy. Safety properties live in the writer's stamp mode
   // (fence-write.ts); the caller is src/core/facts/fence-legacy.ts.
   const repairEnabled = (opts.repairLegacy ?? opts.brainDir !== undefined) && !isFactRepairDisabled();
-  if (legacyCount > 0 && repairEnabled && !opts.dryRun) {
+  // The repair also runs when the guard is NOT armed but a page still carries
+  // forgotten never-fenced rows (review finding 3): a crashed run's residue on
+  // such a page would otherwise be imported by the next sync and re-inserted
+  // by the reconcile below, with no eligible row left to bring the repair back.
+  const residuePagesPending = repairEnabled && !opts.dryRun && legacyCount === 0
+    ? (await listResidueOnlyPagesForSource(engine, sourceId)).length > 0
+    : false;
+  if ((legacyCount > 0 || residuePagesPending) && repairEnabled && !opts.dryRun) {
     try {
       const repair = await repairLegacyRowsForSource(engine, {
         sourceId,
         signal: opts.signal,
         hooks: opts.repairHooks,
       });
-      result.legacyRepair = repair;
+      // A sweep that found every candidate page clean is not a repair worth
+      // reporting; the summary stays as quiet as a run with nothing to do.
+      if (repair.rowsEligible > 0 || repair.residuePagesChecked > 0) result.legacyRepair = repair;
       result.legacyRowsRepaired = repair.rowsStamped;
       legacyCount = repair.rowsRemaining;
       result.legacyRowsPending = legacyCount;
+      if (repair.residuePagesHealed > 0) {
+        result.warnings.push(
+          `extract_facts: restored the committed preimage over a crashed repair's uncommitted fence rows on ` +
+          `${repair.residuePagesHealed} page(s) in source "${sourceId}"`,
+        );
+      }
       if (repair.pagesSkipped > 0) {
         const reasons = Object.entries(repair.skippedByReason).map(([k, v]) => `${k}=${v}`).join(' ');
         result.warnings.push(

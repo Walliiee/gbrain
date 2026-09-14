@@ -906,6 +906,52 @@ describe('put_page / restore_page hold the page lock across the DB write AND the
     await h!.release();
   });
 
+  test('acceptance finding 4: the lock is taken on the NORMALIZED target slug — holding people/ⅰ refuses a save through people/Ⅰ; once free, the save lands under people/ⅰ', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const stored = 'people/ⅰ';   // U+2170 — what importFromContent stores
+    const input = 'people/Ⅰ';    // U+2160 — a valid input that case-folds onto it
+    expect(input).not.toBe(stored);
+    expect(input.toLowerCase()).toBe(stored);
+    const holder = (await inHome(() => acquirePageLock(stored)))!;
+    try {
+      await expect(inHome(() => put_page.handler(ctx(), { slug: input, content: NEW }))).rejects.toMatchObject({ code: 'storage_error' });
+      expect(await engine.getPage(stored, { sourceId: 'default' })).toBeNull();
+      expect(await engine.getPage(input, { sourceId: 'default' })).toBeNull();
+      expect(fs.existsSync(path.join(brainDir, `${stored}.md`))).toBe(false);
+    } finally {
+      await holder.release();
+    }
+    const res = await inHome(() => put_page.handler(ctx(), { slug: input, content: NEW })) as Record<string, any>;
+    expect(res.status).toBe('created_or_updated');
+    expect(res.slug).toBe(stored);
+    expect(res.write_through.written).toBe(true);
+    expect(res.write_through.path).toBe(path.join(brainDir, `${stored}.md`));
+    expect(fs.readFileSync(res.write_through.path, 'utf8')).toContain('# New content, acknowledged');
+    expect(fs.existsSync(lockFileFor(stored))).toBe(false);
+  }, 20_000);
+
+  test('acceptance finding 4: only a GENUINE unchanged dedup (status skipped, nothing written) tolerates a busy other page; the requested slug is never created', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const original = 'people/dedup-original';
+    const requested = 'people/dedup-request';
+    const content = '---\ntitle: T\ntype: note\nid: ext-dup-1\n---\n\n# Same external record\n';
+    const first = await inHome(() => put_page.handler(ctx(), { slug: original, content })) as Record<string, any>;
+    expect(first.status).toBe('created_or_updated');
+    // Someone holds the ORIGINAL page while the same external record is saved under another slug.
+    const holder = (await inHome(() => acquirePageLock(original)))!;
+    try {
+      const res = await inHome(() => put_page.handler(ctx(), { slug: requested, content })) as Record<string, any>;
+      expect(res.status).toBe('skipped');                                  // importFromContent wrote nothing
+      expect(res.slug).toBe(original);
+      expect(res.write_through).toEqual({ written: false, skipped: 'page_lock_timeout' });
+      expect(await engine.getPage(requested, { sourceId: 'default' })).toBeNull();
+      expect(fs.existsSync(path.join(brainDir, `${requested}.md`))).toBe(false);
+      expect(fs.readFileSync(path.join(brainDir, `${original}.md`), 'utf8')).toContain('# Same external record');
+    } finally {
+      await holder.release();
+    }
+  }, 20_000);
+
   test('restore_page: a held lock refuses BEFORE the row is restored; once free, the row is restored AND the file re-rendered', async () => {
     await engine.setConfig('sync.repo_path', brainDir);
     const slug = 'people/restore-locked';

@@ -23,7 +23,10 @@
  * UPDATE) and are subject to the same wipe + reinsert every fence-owned row
  * is. This file owns only: the eligibility query (the guard's own predicate,
  * so counted-there and repaired-here cannot diverge), grouping, the
- * per-source summary the halt reports, and a kill switch.
+ * residue-only sweep over pages whose never-fenced rows have ALL been
+ * forgotten (the stamp path never visits them; the writer's own recognizer
+ * decides what is residue), the per-source summary the halt reports, and a
+ * kill switch.
  *
  * Rollback after a COMMITTED stamp is git-native and has no code here:
  * un-stamp FIRST (`UPDATE facts SET row_num = NULL, source_markdown_slug =
@@ -40,6 +43,7 @@ import type { BrainEngine } from '../engine.ts';
 import { isAborted } from '../abort-check.ts';
 import {
   stampLegacyFactsToFence,
+  healResidueOnlyPage,
   type LegacyStampRow,
   type LegacyStampHooks,
   type LegacyStampSkipReason,
@@ -67,6 +71,15 @@ export interface RepairLegacyRowsSummary {
   skippedDetails: string[];
   /** Legacy rows still eligible after the pass — re-counted, not derived. */
   rowsRemaining: number;
+  /**
+   * Residue-only sweep (review finding 3): pages whose never-fenced rows have
+   * ALL been forgotten, checked for a crashed run's uncommitted appends.
+   * `residuePagesChecked` counts pages with a self-dirty file that were
+   * examined; `residuePagesHealed` those whose dirt was exactly this repair's
+   * residue and were put back to their committed preimage.
+   */
+  residuePagesChecked: number;
+  residuePagesHealed: number;
   dryRun: boolean;
   aborted: boolean;
 }
@@ -129,12 +142,53 @@ export async function countLegacyRowsForSource(engine: BrainEngine, sourceId: st
   return parseInt(rows[0]?.n ?? '0', 10);
 }
 
+/**
+ * Pages in `sourceId` that carry never-fenced rows which have ALL been
+ * forgotten (soft-expired, `row_num IS NULL`) and no eligible row: the guard
+ * does not arm on them and the stamp path never visits them, yet a crashed
+ * run may have left its appends on their file (review finding 3). Live page,
+ * source with a local_path — the same fenceability terms as the guard.
+ */
+export async function listResidueOnlyPagesForSource(engine: BrainEngine, sourceId: string): Promise<string[]> {
+  const rows = await engine.executeRaw<{ entity_slug: string }>(
+    `SELECT DISTINCT f.entity_slug
+       FROM facts f
+      WHERE f.source_id = $1
+        AND f.row_num IS NULL
+        AND f.entity_slug IS NOT NULL
+        AND f.expired_at IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM pages p
+           WHERE p.source_id = f.source_id
+             AND p.slug = f.entity_slug
+             AND p.deleted_at IS NULL
+        )
+        AND EXISTS (
+          SELECT 1 FROM sources s
+           WHERE s.id = f.source_id
+             AND s.local_path IS NOT NULL
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM facts e
+           WHERE e.source_id = f.source_id
+             AND e.entity_slug = f.entity_slug
+             AND e.row_num IS NULL
+             AND e.expired_at IS NULL
+        )
+      ORDER BY f.entity_slug`,
+    [sourceId],
+  );
+  return rows.map(r => r.entity_slug);
+}
+
 const DEFAULT_MAX_PAGES = 500;
 
 /**
- * Drain every eligible legacy row in `sourceId`, page by page. Never throws:
- * a page the writer refuses is counted under its reason and left for the
- * guard to report. `rowsRemaining` is re-counted after the pass.
+ * Drain every eligible legacy row in `sourceId`, page by page, then sweep the
+ * pages whose never-fenced rows have all been forgotten for a crashed run's
+ * uncommitted residue. Never throws: a page the writer refuses is counted
+ * under its reason and left for the guard to report. `rowsRemaining` is
+ * re-counted after the pass.
  */
 export async function repairLegacyRowsForSource(
   engine: BrainEngine,
@@ -145,12 +199,12 @@ export async function repairLegacyRowsForSource(
     rowsEligible: 0, rowsStamped: 0, rowsAppended: 0, rowsRewritten: 0,
     pagesFenced: 0, pagesSkipped: 0,
     skippedByReason: {}, skippedDetails: [],
-    rowsRemaining: 0, dryRun, aborted: false,
+    rowsRemaining: 0, residuePagesChecked: 0, residuePagesHealed: 0,
+    dryRun, aborted: false,
   };
 
   const rows = await listLegacyRowsForSource(engine, opts.sourceId);
   summary.rowsEligible = rows.length;
-  if (rows.length === 0) return summary;
 
   const bySlug = new Map<string, LegacyFactRow[]>();
   for (const r of rows) bySlug.set(r.entity_slug, [...(bySlug.get(r.entity_slug) ?? []), r]);
@@ -177,6 +231,24 @@ export async function repairLegacyRowsForSource(
       if (summary.skippedDetails.length < 10) {
         summary.skippedDetails.push(`${slug} (${reason}${r.detail ? `: ${r.detail.slice(0, 160)}` : ''})`);
       }
+    }
+  }
+
+  // Residue-only sweep: pages the stamp path can no longer reach. Read-only
+  // on a dry-run (nothing is written there); the writer's own recognizer
+  // decides, so only this repair's exact bytes are ever put back. A page the
+  // stamp loop just visited is skipped — its self-dirt is the stamp's own
+  // append, not residue.
+  if (!dryRun && !summary.aborted) {
+    const residuePages = await listResidueOnlyPagesForSource(engine, opts.sourceId);
+    for (const slug of residuePages) {
+      if (bySlug.has(slug)) continue;
+      if (isAborted(opts.signal)) { summary.aborted = true; break; }
+      if (pages++ >= (opts.maxPages ?? DEFAULT_MAX_PAGES)) break;
+      const r = await healResidueOnlyPage(engine, { sourceId: opts.sourceId, slug }, { lockTimeoutMs: opts.lockTimeoutMs });
+      if (r.outcome === 'clean' || r.outcome === 'skipped') continue;
+      summary.residuePagesChecked += 1;
+      if (r.outcome === 'healed') summary.residuePagesHealed += 1;
     }
   }
 

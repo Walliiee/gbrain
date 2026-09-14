@@ -1314,6 +1314,222 @@ describe('finding 5 (review 2) — a source registered in a git SUBDIRECTORY', (
   });
 });
 
+// ── Codex acceptance of 2d5c08f90 (2026-09-14 final): five reproduced findings ──
+
+describe('acceptance finding 1 — an unreadable COMMIT outcome is indeterminate: the fenced file is never restored over a possibly committed stamp', () => {
+  const failures = () => {
+    const p = join(home, '.gbrain', 'facts.write_failures.jsonl');
+    return existsSync(p) ? readFileSync(p, 'utf-8') : '';
+  };
+
+  test('COMMIT landed, acknowledgement lost, verification unavailable: file left fenced, stamp stands, a sync-equivalent refresh + reconcile deletes nothing', async () => {
+    const a = await seed('Founded Acme');
+    const s = await run({
+      afterCommit: () => { throw new Error('acknowledgement lost'); },
+      beforeVerifyLanded: () => { throw new Error('verification unavailable'); },
+    });
+    expect(s.skippedByReason.error).toBe(1);
+    expect(s.skippedDetails[0]).toContain('commit outcome unknown');
+    expect(s.skippedDetails[0]).toContain('file left fenced');
+    expect(failures()).toContain('stamp_commit_outcome_unknown_file_left_fenced');
+    // The transaction had committed: row stamped, DB body fenced — and the
+    // file, the only backing of that stamp, still carries the fence.
+    expect((await factRows()).find(r => r.id === a)!.row_num).toBe(1);
+    expect((await dbFence()).facts.map(f => f.claim)).toEqual(['Founded Acme']);
+    expect(diskFence().facts.map(f => [f.rowNum, f.claim])).toEqual([[1, 'Founded Acme']]);
+    // What a sync + the reconcile do next: nothing is deleted, nothing inserted.
+    await syncBody();
+    const r = await reconcile();
+    expect(r.factsDeleted).toBe(0);
+    expect(r.factsInserted).toBe(0);
+    expect((await factRows()).find(r => r.id === a)!.row_num).toBe(1);
+    // Nothing eligible remains; the page is consistent (self-dirty until committed).
+    const s2 = await run();
+    expect(s2.rowsEligible).toBe(0);
+    expect(git(repo, 'status', '--porcelain').trimEnd()).toBe(` M ${ALICE_MD}`);
+  });
+
+  test('COMMIT landed, acknowledgement lost, verification readable: reported stamped, file kept', async () => {
+    const a = await seed('Founded Acme');
+    const s = await run({ afterCommit: () => { throw new Error('acknowledgement lost'); } });
+    expect(s).toMatchObject({ rowsStamped: 1, pagesSkipped: 0, rowsRemaining: 0 });
+    expect((await factRows()).find(r => r.id === a)!.row_num).toBe(1);
+    expect(diskFence().facts).toHaveLength(1);
+  });
+
+  test('COMMIT rolled back, verification unavailable: still indeterminate — file left fenced, nothing restored; the next run recognises its own residue, re-plans and stamps', async () => {
+    const a = await seed('Founded Acme');
+    const s1 = await run({
+      beforeCommit: () => { throw new Error('crash before COMMIT'); },
+      beforeVerifyLanded: () => { throw new Error('verification unavailable'); },
+    });
+    expect(s1.skippedByReason.error).toBe(1);
+    expect(s1.skippedDetails[0]).toContain('commit outcome unknown');
+    expect((await factRows()).find(r => r.id === a)!.row_num).toBeNull();     // rolled back
+    expect((await dbFence()).facts).toEqual([]);
+    expect(diskFence().facts).toHaveLength(1);                                // left in place
+    const s2 = await run();
+    expect(s2).toMatchObject({ rowsStamped: 1, rowsAppended: 1, pagesSkipped: 0 });
+    expect(s2.skippedDetails).toEqual([]);
+    expect((await factRows()).find(r => r.id === a)!.row_num).toBe(1);
+    expect(diskFence().facts).toHaveLength(1);
+  });
+
+  test('COMMIT rolled back, verification readable: the preimage is restored (unchanged contract)', async () => {
+    await seed('Founded Acme');
+    const s1 = await run({ beforeCommit: () => { throw new Error('crash before COMMIT'); } });
+    expect(s1.skippedByReason.error).toBe(1);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect(git(repo, 'status', '--porcelain', '--', ALICE_MD)).toBe('');
+  });
+});
+
+describe('acceptance finding 2 — crash recovery recognises only this repair\'s exact bytes, never a human addition that shares the key', () => {
+  const plant = (row: Partial<Parameters<typeof upsertFactRow>[1]>): string => {
+    const body = upsertFactRow(ALICE_BODY, {
+      rowNum: 1, claim: 'Founded Acme', kind: 'fact', confidence: 0.9, visibility: 'private',
+      notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page', ...row,
+    }).body;
+    writeFileSync(join(repo, ALICE_MD), body, 'utf-8');
+    return body;
+  };
+
+  test('an uncommitted row with the legacy claim/source but a human note and typed columns is NOT residue: refused file_uncommitted, every byte kept', async () => {
+    await seed('Founded Acme');
+    const body = plant({ context: 'human note from the board call', claimMetric: 'mrr', claimValue: 60000, claimUnit: 'USD', claimPeriod: 'monthly' });
+    const s = await run();
+    expect(s.skippedByReason.file_uncommitted).toBe(1);
+    expect(s.rowsStamped).toBe(0);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
+    expect(diskFence().facts[0]).toMatchObject({ context: 'human note from the board call', claimMetric: 'mrr', claimValue: 60000, claimUnit: 'USD', claimPeriod: 'monthly' });
+    expect((await factRows())[0]!.row_num).toBeNull();
+    expect((await dbFence()).facts).toEqual([]);
+  });
+
+  test('a different date, confidence or provenance detail on the uncommitted row is not residue either', async () => {
+    await seed('Founded Acme');
+    for (const variant of [{ validFrom: '2025-01-01' }, { confidence: 0.5 }, { validUntil: '2026-12-31' }] as const) {
+      const body = plant(variant);
+      const s = await run();
+      expect(s.skippedByReason.file_uncommitted).toBe(1);
+      expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
+      expect((await factRows())[0]!.row_num).toBeNull();
+    }
+  });
+
+  test('the exact bytes this repair renders ARE residue: restored and re-planned (control)', async () => {
+    await seed('Founded Acme');
+    plant({});
+    const s = await run();
+    expect(s).toMatchObject({ rowsStamped: 1, rowsAppended: 1, pagesSkipped: 0 });
+    expect(diskFence().facts.map(f => [f.rowNum, f.claim])).toEqual([[1, 'Founded Acme']]);
+  });
+});
+
+describe('acceptance finding 3 — residue on a page whose ONLY never-fenced row was forgotten: the residue-only sweep restores the preimage before the reconcile', () => {
+  const plantResidue = () => {
+    const body = upsertFactRow(ALICE_BODY, {
+      rowNum: 1, claim: 'Founded Acme', kind: 'fact', confidence: 0.9, visibility: 'private',
+      notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
+    }).body;
+    writeFileSync(join(repo, ALICE_MD), body, 'utf-8');
+    return body;
+  };
+  const noActiveCopy = async () => {
+    const rows = await factRows();
+    expect(rows.filter(r => r.fact === 'Founded Acme')).toHaveLength(1);
+    expect(rows[0]!.expired_at).not.toBeNull();
+    expect(rows[0]!.row_num).toBeNull();
+  };
+
+  test('forgotten after the crash, no sync yet: the sweep runs with the guard unarmed, restores HEAD, the reconcile inserts nothing', async () => {
+    const a = await seed('Founded Acme');
+    plantResidue();
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'after the crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    expect(await countLegacyRowsForSource(engine, SRC)).toBe(0);              // the guard would not arm
+    const r = await reconcile();
+    expect(r.guardTriggered).toBe(false);
+    expect(r.legacyRepair).toMatchObject({ rowsEligible: 0, residuePagesChecked: 1, residuePagesHealed: 1 });
+    expect(r.warnings).toContainEqual(expect.stringContaining('restored the committed preimage'));
+    expect(r.factsInserted).toBe(0);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect(git(repo, 'status', '--porcelain', '--', ALICE_MD)).toBe('');
+    expect((await dbFence()).facts).toEqual([]);
+    await noActiveCopy();
+    // Next cycle: clean page, quiet run.
+    const r2 = await reconcile();
+    expect(r2.factsInserted).toBe(0);
+    expect(r2.legacyRepair).toBeUndefined();
+    await noActiveCopy();
+  });
+
+  test('forgotten after the crash AND a sync already imported the residue into the cache: the sweep restores file AND cache, the reconcile still inserts nothing', async () => {
+    const a = await seed('Founded Acme');
+    plantResidue();
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'after the crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    await syncBody();                                                         // the worst ordering
+    expect((await dbFence()).facts).toHaveLength(1);
+    const r = await reconcile();
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1 });
+    expect(r.factsInserted).toBe(0);
+    expect(r.factsDeleted).toBe(0);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect((await dbFence()).facts).toEqual([]);
+    expect((await engine.getPage(ALICE, { sourceId: SRC }))!.content_hash).toBe('synced');   // hash kept: the next sync re-imports
+    await noActiveCopy();
+    // A later sync of the restored file changes nothing.
+    await syncBody();
+    const r2 = await reconcile();
+    expect(r2.factsInserted).toBe(0);
+    await noActiveCopy();
+  });
+
+  test('a residue-only page carrying a HUMAN edit is left alone by the sweep (checked, not healed)', async () => {
+    const a = await seed('Founded Acme');
+    const theirs = plantResidue() + '\nA paragraph a human added.\n';
+    writeFileSync(join(repo, ALICE_MD), theirs, 'utf-8');
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'after the crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    const r = await reconcile();
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
+  });
+
+  test('a residue-only page whose file is clean costs nothing: not counted, summary omitted', async () => {
+    const a = await seed('Founded Acme');
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'plain forget' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    const r = await reconcile();
+    expect(r.legacyRepair).toBeUndefined();
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+  });
+
+  test('a dry-run never sweeps', async () => {
+    const a = await seed('Founded Acme');
+    const body = plantResidue();
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'after the crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    const r = await reconcile({ dryRun: true });
+    expect(r.legacyRepair).toBeUndefined();
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
+  });
+});
+
+describe('acceptance finding 5 — existing-fence reuse revalidates the file before the stamp', () => {
+  test('a foreign edit that removes the matching fence between the plan and the rename: refused concurrent_edit, nothing stamped, the edit stands, the DB body rolled back', async () => {
+    const { body } = upsertFactRow(ALICE_BODY, {
+      rowNum: 1, claim: 'Founded Acme', kind: 'fact', confidence: 0.9, visibility: 'private',
+      notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
+    });
+    writeFileSync(join(repo, ALICE_MD), body, 'utf-8'); commitAll('fence');
+    await syncBody();
+    await seed('Founded Acme');
+    const s = await run({ beforeRename: () => { writeFileSync(join(repo, ALICE_MD), ALICE_BODY, 'utf-8'); } });
+    expect(s.skippedByReason.concurrent_edit).toBe(1);
+    expect(s.rowsStamped).toBe(0);
+    expect((await factRows())[0]!.row_num).toBeNull();
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect((await dbFence()).facts).toEqual(parseFactsFence(body).facts);
+  });
+});
+
 describe('(d) stale-save reproducer — reported as observed', () => {
   test('legacy page: get body before repair → repair → put_page the stale body (write-through) → reconcile', async () => {
     const staleBody = readFileSync(join(repo, ALICE_MD), 'utf-8');

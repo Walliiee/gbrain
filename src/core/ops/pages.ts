@@ -14,6 +14,7 @@ import { importFromContent } from '../import-file.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { writePageThrough, deletePageThrough, resolvePageWriteTarget, type WriteThroughResult } from '../write-through.ts';
 import { acquirePageLock, type PageLockHandle } from '../page-lock.ts';
+import { validateSlug } from '../utils.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
 // #3190: pack-aware link typing on the put_page auto-link path.
 import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
@@ -469,8 +470,13 @@ const put_page: Operation = {
     }
     // Page lock FIRST, then the DB write, then the disk write-through, all
     // under one holder (see lockPageForWrite). A busy page refuses here,
-    // before anything is written.
-    const pageLock = await lockPageForWrite(slug, 'put_page');
+    // before anything is written. Lock the slug the row will actually be
+    // stored under: importFromContent normalizes through validateSlug (the
+    // engines' shared chokepoint — lowercasing, including Unicode case
+    // folds), so locking the raw input would let `people/Ⅰ` slip past a
+    // holder of `people/ⅰ` (review finding 4).
+    const targetSlug = validateSlug(slug);
+    const pageLock = await lockPageForWrite(targetSlug, 'put_page');
     let result!: Awaited<ReturnType<typeof importFromContent>>;
     let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'subagent_sandbox' | 'dry_run' }) | undefined;
     try {
@@ -507,7 +513,7 @@ const put_page: Operation = {
     // put_page, and otherwise have write-through rewrite the victim's file
     // with falsified provenance. Dedup returns status 'skipped' without
     // touching the DB, so throwing here leaves nothing to roll back.
-    if (result.slug && result.slug !== slug) {
+    if (result.slug && result.slug !== targetSlug) {
       // Deliberately does NOT name the resolved slug: it belongs to a page
       // outside the fence, and echoing it would turn frontmatter-id guessing
       // into a slug-enumeration oracle.
@@ -578,9 +584,9 @@ const put_page: Operation = {
       // Shared canonical write-through (also used by `gbrain brainstorm/lsd
       // --save`). Renders the file from the saved DB row and writes it
       // atomically; never throws (failures land in skipped/error). The lock
-      // taken above covers the requested slug; a dedup hit that resolved to
-      // ANOTHER in-fence slug (status 'skipped', nothing written to the DB)
-      // lets the helper take that slug's own lock.
+      // taken above covers the normalized target slug; a dedup hit that
+      // resolved to ANOTHER in-fence slug (status 'skipped', nothing written
+      // to the DB) lets the helper take that slug's own lock.
       writeThrough = await writePageThrough(ctx.engine, result.slug, {
         sourceId,
         frontmatterOverrides: {
@@ -589,7 +595,7 @@ const put_page: Operation = {
           source_kind: provenanceVia,
         },
         logger: ctx.logger,
-        holdsPageLock: result.slug === slug,
+        holdsPageLock: result.slug === targetSlug,
       });
     } else if (isSandboxSubagent) {
       writeThrough = { written: false, skipped: 'subagent_sandbox' };
@@ -607,13 +613,15 @@ const put_page: Operation = {
     // repo (missing dir, sibling-source collision, escaped path, case-fold
     // clash, unreadable row) — means a file was supposed to exist and
     // doesn't, so put_page must not report success. `page_lock_timeout` can
-    // no longer reach here for the requested slug: the lock is held from
-    // before the DB write (lockPageForWrite), so a busy page refuses before
-    // anything is committed instead of acknowledging an undurable save. It
-    // can still come back for a dedup hit on ANOTHER slug, where nothing was
-    // written to the DB (status 'skipped') and the other page's file already
-    // matches its row — reported, not fatal.
-    const dedupOtherSlugBusy = writeThrough?.skipped === 'page_lock_timeout' && result.slug !== slug;
+    // no longer reach here for the target slug: the lock is held from before
+    // the DB write (lockPageForWrite), so a busy page refuses before anything
+    // is committed instead of acknowledging an undurable save. It can still
+    // come back for a GENUINE dedup hit on ANOTHER slug — status 'skipped',
+    // i.e. importFromContent wrote nothing — where the other page's file
+    // already matches its row: reported, not fatal. Any other changed-slug
+    // outcome is a real write on a page this call does not hold, and fails.
+    const dedupOtherSlugBusy = writeThrough?.skipped === 'page_lock_timeout'
+      && result.status === 'skipped' && result.slug !== targetSlug;
     if (writeThrough && !writeThrough.written
       && writeThrough.skipped !== 'no_repo_configured'
       && writeThrough.skipped !== 'disabled_by_config'
