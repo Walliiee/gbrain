@@ -771,6 +771,12 @@ export async function stampLegacyFactsToFence(
     if (r.superseded_by != null) {
       return skip(slug, 'unexpressible_columns', `id ${r.id}: superseded_by=${r.superseded_by} on an active row has no fence form`);
     }
+    // #1928: `cli:`-origin conversation facts are never fence-owned — the
+    // reconcile's listExistingFactsForPage excludes them, so a stamped one
+    // would be re-inserted against its own row_num (idx_facts_fence_key).
+    if ((r.source ?? '').startsWith('cli:')) {
+      return skip(slug, 'unexpressible_columns', `id ${r.id}: source=${r.source} is conversation provenance, not fence-owned`);
+    }
     const view = fenceRoundTrip(r);
     if (!view) return skip(slug, 'fence_parse_failed', `id ${r.id}: row does not survive a fence round-trip: ${r.fact.slice(0, 60)}`);
     views.set(r.id, view);

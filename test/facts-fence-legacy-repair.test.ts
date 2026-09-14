@@ -706,6 +706,14 @@ describe('finding 5 — typed metadata rides into the fence', () => {
     expect(db[0]).toEqual({ claim_metric: 'mrr', claim_value: 50000, claim_unit: 'USD', claim_period: 'monthly' });
   });
 
+  test('a cli:-provenance row is not fence-owned (#1928): refused as unexpressible_columns, never stamped', async () => {
+    await seed('Said in conversation', ALICE, SRC, 'cli:session-1');
+    const s = await run();
+    expect(s.skippedByReason.unexpressible_columns).toBe(1);
+    expect((await factRows()).every(r => r.row_num === null)).toBe(true);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+  });
+
   test('an ACTIVE row carrying superseded_by has no fence form: refused as unexpressible_columns', async () => {
     const target = await seed('Newer claim');
     const older = await seed('Older claim');
