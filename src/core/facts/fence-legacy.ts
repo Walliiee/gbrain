@@ -8,9 +8,16 @@
  * re-counts from the DB before deciding to halt or proceed.
  *
  * Everything that is a safety property lives in the writer: page lock,
- * containment-checked target, per-FILE git refusal, unique `.tmp` + parse +
- * rename, body mirror, verify-inside-the-stamp-transaction, duplicate-key
- * refusal. This file owns only: the eligibility query (the guard's own
+ * containment-checked target, per-FILE git refusal (tracked at HEAD, clean),
+ * unique `.tmp` + parse + rename, body mirror, verify-inside-the-stamp-
+ * transaction with the page row and fact rows locked, duplicate-key refusal.
+ * The SELECT below carries every column the fence can express (typed-claim
+ * columns included) plus `superseded_by`, which the writer refuses on an
+ * active row. Columns the fence cannot express — `embedding`, `source_session`,
+ * `created_at`, `consolidated_at`/`consolidated_into`, `event_type`,
+ * `dimension`, `value`, `value_hash`, `dim_status` — stay on the row through
+ * the stamp (it is an UPDATE) and are subject to the same wipe + reinsert
+ * every fence-owned row is. This file owns only: the eligibility query (the guard's own
  * predicate, so counted-there and repaired-here cannot diverge), grouping,
  * the per-source summary the halt reports, and a kill switch.
  *
@@ -103,7 +110,8 @@ const ELIGIBLE_WHERE = `
 export async function listLegacyRowsForSource(engine: BrainEngine, sourceId: string): Promise<LegacyFactRow[]> {
   return engine.executeRaw<LegacyFactRow>(
     `SELECT f.id::text AS id, f.source_id, f.entity_slug, f.fact, f.kind, f.visibility,
-            f.notability, f.context, f.valid_from, f.valid_until, f.source, f.confidence
+            f.notability, f.context, f.valid_from, f.valid_until, f.source, f.confidence,
+            f.claim_metric, f.claim_value, f.claim_unit, f.claim_period, f.superseded_by
        FROM facts f${ELIGIBLE_WHERE}
       ORDER BY f.entity_slug, f.id`,
     [sourceId],

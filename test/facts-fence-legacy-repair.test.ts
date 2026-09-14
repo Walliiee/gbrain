@@ -21,7 +21,8 @@
  *      uncommitted changes are refused so one always exists.
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -31,6 +32,10 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { parseFactsFence, upsertFactRow } from '../src/core/facts-fence.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
+import { extractFactsFromFenceText } from '../src/core/facts/extract-from-fence.ts';
+import { forgetFactInFence } from '../src/core/facts/forget.ts';
+import { parseMarkdown } from '../src/core/markdown.ts';
+import { operations, type OperationContext } from '../src/core/operations.ts';
 import {
   repairLegacyRowsForSource,
   listLegacyRowsForSource,
@@ -558,5 +563,379 @@ describe('rollback (git-native, no code): un-stamp FIRST, then restore the file'
     const r = await withEnv({ GBRAIN_HOME: home }, () => runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE] }));
     expect(r.factsDeleted).toBe(1);
     expect(await factRows()).toHaveLength(0);
+  });
+});
+
+// ── 2026-09-14 acceptance-review fixes (findings 1–6) ─────────────────────
+
+const putPageOp = operations.find((o) => o.name === 'put_page')!;
+function opCtx(): OperationContext {
+  return {
+    engine: engine as any,
+    config: { engine: 'pglite' } as any,
+    logger: { info() {}, warn() {}, error() {} },
+    dryRun: false,
+    remote: false,
+    sourceId: SRC,
+  } as OperationContext;
+}
+function installFakeDurabilityHook(repoPath: string): void {
+  const hooksDir = join(repoPath, '.git', 'hooks');
+  mkdirSync(hooksDir, { recursive: true });
+  const hookPath = join(hooksDir, 'post-commit');
+  writeFileSync(hookPath, ['#!/usr/bin/env bash', '# gbrain brain-durability post-commit hook (v0.42.44+)', 'exit 0', ''].join('\n'));
+  chmodSync(hookPath, 0o755);
+}
+const reconcile = (extra: Record<string, unknown> = {}) =>
+  withEnv({ GBRAIN_HOME: home }, () => runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE], ...extra }));
+
+describe('finding 3 — a committed preimage, not merely an empty git status', () => {
+  test('a git-IGNORED file that exists on disk is refused: empty status is not a preimage', async () => {
+    writeFileSync(join(repo, '.gitignore'), 'people/alice.md\n', 'utf-8');
+    git(repo, 'rm', '-q', '--cached', ALICE_MD);
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '-q', '-m', 'ignore alice');
+    expect(git(repo, 'status', '--porcelain', '--', ALICE_MD)).toBe('');   // the pre-fix "clean"
+    await seed('Founded Acme');
+    const s = await run();
+    expect(s.skippedByReason.foreign_dirty).toBe(1);
+    expect(s.skippedDetails[0]).toContain('ignored');
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect((await factRows())[0]!.row_num).toBeNull();
+  });
+
+  test('an UNTRACKED file (never added) shows as `??` self-dirt: refused as file_uncommitted', async () => {
+    git(repo, 'rm', '-q', '--cached', ALICE_MD);
+    git(repo, 'commit', '-q', '-m', 'untrack alice');
+    await seed('Founded Acme');
+    const s = await run();
+    expect(s.skippedByReason.file_uncommitted).toBe(1);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect((await factRows())[0]!.row_num).toBeNull();
+  });
+
+  test('a file staged but never committed has no HEAD blob: refused as file_uncommitted', async () => {
+    writeFileSync(join(repo, 'people/bob.md'), '---\ntype: person\ntitle: Bob\n---\n\n# Bob\n', 'utf-8');
+    git(repo, 'add', 'people/bob.md');
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline) VALUES ('people/bob', $1, 'person', 'Bob', '# Bob', '')`, [SRC]);
+    await seed('Lives in Aarhus', 'people/bob');
+    const s = await run();
+    expect(s.skippedByReason.file_uncommitted).toBe(1);
+    expect((await factRows())[0]!.row_num).toBeNull();
+  });
+});
+
+describe('finding 4 — keys are what the fence reads back (render → parse)', () => {
+  test("same claim with sources '' and 'fence:reconcile' is duplicate_legacy_rows", async () => {
+    await seed('Founded Acme', ALICE, SRC, '');
+    await seed('Founded Acme', ALICE, SRC, 'fence:reconcile');
+    const s = await run();
+    expect(s.skippedByReason.duplicate_legacy_rows).toBe(1);
+    expect((await factRows()).every(r => r.row_num === null)).toBe(true);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+  });
+
+  test('blank and whitespace-only provenance collide too (both read back as fence:reconcile); padded claims collide with trimmed ones', async () => {
+    await seed('Founded Acme', ALICE, SRC, '');
+    await seed('  Founded Acme ', ALICE, SRC, '  ');
+    const s = await run();
+    expect(s.skippedByReason.duplicate_legacy_rows).toBe(1);
+  });
+
+  test('a claim with surrounding whitespace and a `|` round-trips, de-dupes against the on-disk row, and the DB row is canonicalised so the reconcile no-ops', async () => {
+    const claim = '  Prefers async | not meetings  ';
+    const { body } = upsertFactRow(ALICE_BODY, {
+      rowNum: 3, claim: claim.trim(), kind: 'fact', confidence: 0.9, visibility: 'private',
+      notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
+    });
+    writeFileSync(join(repo, ALICE_MD), body, 'utf-8'); commitAll('fence');
+    const id = await seed(claim);
+    const s = await run();
+    expect(s).toMatchObject({ rowsStamped: 1, rowsAppended: 0, pagesSkipped: 0 });
+    const row = (await factRows()).find(r => r.id === id)!;
+    expect(row.row_num).toBe(3);
+    expect(row.fact).toBe('Prefers async | not meetings');
+    expect(diskFence().facts[0]!.claim).toBe('Prefers async | not meetings');
+    const r = await reconcile();
+    expect(r.factsDeleted).toBe(0);
+    expect(r.factsInserted).toBe(0);
+    expect((await factRows()).find(r => r.id === id)!.row_num).toBe(3);
+  });
+
+  test('blank provenance is stamped as fence:reconcile so the reconcile sees one key, not two', async () => {
+    const id = await seed('Founded Acme', ALICE, SRC, '');
+    const s = await run();
+    expect(s.rowsStamped).toBe(1);
+    const src = await engine.executeRaw<{ source: string }>(`SELECT source FROM facts WHERE id = $1`, [id]);
+    expect(src[0]!.source).toBe('fence:reconcile');
+    const r = await reconcile();
+    expect(r.factsDeleted).toBe(0);
+    expect(r.factsInserted).toBe(0);
+    expect(await factRows()).toHaveLength(1);
+  });
+
+  test('a claim that would read back as strikethrough is refused, never stamped as an inactive row', async () => {
+    await seed('~~Founded Acme~~');
+    const s = await run();
+    expect(s.skippedByReason.fence_parse_failed).toBe(1);
+    expect((await factRows())[0]!.row_num).toBeNull();
+  });
+});
+
+describe('finding 5 — typed metadata rides into the fence', () => {
+  test('claim_metric/value/unit/period stamp, and render → parse → extractFactsFromFenceText yields the same typed values; reconcile no-ops', async () => {
+    const r0 = await engine.executeRaw<{ id: string }>(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence,
+                          claim_metric, claim_value, claim_unit, claim_period)
+       VALUES ($1, $2, 'MRR is 50000', 'fact', 'private', 'medium', '2026-01-02', 'mcp:put_page', 0.9, 'mrr', 50000, 'USD', 'monthly')
+       RETURNING id::text AS id`, [SRC, ALICE]);
+    const id = r0[0]!.id;
+    const s = await run();
+    expect(s.rowsStamped).toBe(1);
+    const df = diskFence();
+    expect(df.warnings).toEqual([]);
+    expect(df.facts[0]).toMatchObject({ claim: 'MRR is 50000', claimMetric: 'mrr', claimValue: 50000, claimUnit: 'USD', claimPeriod: 'monthly' });
+    const extracted = extractFactsFromFenceText(df.facts, ALICE, SRC);
+    expect(extracted[0]).toMatchObject({ claim_metric: 'mrr', claim_value: 50000, claim_unit: 'USD', claim_period: 'monthly' });
+    const r = await reconcile();
+    expect(r.factsDeleted).toBe(0);
+    expect(r.factsInserted).toBe(0);
+    const db = await engine.executeRaw<{ claim_metric: string; claim_value: number; claim_unit: string; claim_period: string }>(
+      `SELECT claim_metric, claim_value::float8 AS claim_value, claim_unit, claim_period FROM facts WHERE id = $1`, [id]);
+    expect(db[0]).toEqual({ claim_metric: 'mrr', claim_value: 50000, claim_unit: 'USD', claim_period: 'monthly' });
+  });
+
+  test('an ACTIVE row carrying superseded_by has no fence form: refused as unexpressible_columns', async () => {
+    const target = await seed('Newer claim');
+    const older = await seed('Older claim');
+    await engine.executeRaw(`UPDATE facts SET superseded_by = $1 WHERE id = $2`, [Number(target), older]);
+    const s = await run();
+    expect(s.skippedByReason.unexpressible_columns).toBe(1);
+    expect((await factRows()).every(r => r.row_num === null)).toBe(true);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+  });
+});
+
+describe('finding 6 — dry-run purity', () => {
+  test('dry-run takes no page lock (lock dir absent), writes nothing, file byte-identical', async () => {
+    await seed('Founded Acme');
+    const before = readFileSync(join(repo, ALICE_MD));
+    const lockDir = join(home, '.gbrain', 'page-locks');
+    expect(existsSync(lockDir)).toBe(false);
+    const s = await run(undefined, { dryRun: true });
+    expect(s).toMatchObject({ dryRun: true, rowsEligible: 1, rowsStamped: 0, rowsAppended: 1, pagesFenced: 1 });
+    expect(existsSync(lockDir)).toBe(false);
+    expect(existsSync(join(home, '.gbrain'))).toBe(false);
+    expect(readFileSync(join(repo, ALICE_MD)).equals(before)).toBe(true);
+    expect(readdirSync(join(repo, 'people'))).toEqual(['alice.md']);
+    expect((await factRows())[0]!.row_num).toBeNull();
+    expect((await dbFence()).facts).toEqual([]);
+  });
+
+  test('dry-run does not reap a stale lock either', async () => {
+    await seed('Founded Acme');
+    const lockDir = join(home, '.gbrain', 'page-locks');
+    mkdirSync(lockDir, { recursive: true });
+    const sha = createHash('sha256').update(ALICE).digest('hex');
+    const stale = join(lockDir, `${sha}.lock`);
+    writeFileSync(stale, '1\n2000-01-01T00:00:00.000Z\ntoken\n');
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    utimesSync(stale, old, old);
+    await run(undefined, { dryRun: true });
+    expect(readFileSync(stale, 'utf-8')).toBe('1\n2000-01-01T00:00:00.000Z\ntoken\n');
+  });
+});
+
+describe('crash proofs (real, inside the transaction)', () => {
+  test('(a) crash mid-stamp after the first UPDATE rolls the whole stamp back; after the commit the next run converges with zero appends on the same row_nums', async () => {
+    await seed('Founded Acme');
+    await seed('Prefers async');
+    const s1 = await run({ afterFirstStampUpdate: () => { throw new Error('injected crash mid-stamp'); } });
+    expect(s1.skippedByReason.error).toBe(1);
+    expect(s1.skippedDetails[0]).toContain('injected crash mid-stamp');
+    // Transaction rolled back: NO row is stamped, not even the first.
+    expect((await factRows()).every(r => r.row_num === null && r.source_markdown_slug === null)).toBe(true);
+    const disk1 = diskFence();
+    expect(disk1.facts).toHaveLength(2);
+    expect((await dbFence()).facts).toHaveLength(2);
+    // The rename already landed, so the file is self-dirty: refused until committed.
+    const s2 = await run();
+    expect(s2.skippedByReason.file_uncommitted).toBe(1);
+    commitAll('morning commit');
+    const s3 = await run();
+    expect(s3).toMatchObject({ rowsStamped: 2, rowsAppended: 0, pagesSkipped: 0, rowsRemaining: 0 });
+    expect(diskFence().facts.map(f => [f.rowNum, f.claim])).toEqual(disk1.facts.map(f => [f.rowNum, f.claim]));
+    expect((await factRows()).map(r => r.row_num).sort()).toEqual(disk1.facts.map(f => f.rowNum).sort());
+  });
+
+  test('(b) hardened repo: crash after rename before mirror/stamp → next run REFUSES (file_uncommitted); nothing stamped; manual commit, then 0 appends', async () => {
+    installFakeDurabilityHook(repo);
+    await seed('Founded Acme');
+    const s1 = await run({ beforeMirror: () => { throw new Error('injected'); } });
+    expect(s1.skippedByReason.error).toBe(1);
+    expect(git(repo, 'status', '--porcelain').trimEnd()).toBe(` M ${ALICE_MD}`);  // no commit fired
+    expect((await factRows())[0]!.row_num).toBeNull();
+    const s2 = await run();
+    expect(s2.skippedByReason.file_uncommitted).toBe(1);
+    expect((await factRows())[0]!.row_num).toBeNull();
+    // Manual-commit dependency: the operator commits; the stamp mode does not self-heal this.
+    commitAll('manual commit');
+    const s3 = await run();
+    expect(s3).toMatchObject({ rowsStamped: 1, rowsAppended: 0, pagesSkipped: 0 });
+    expect((await factRows())[0]!.row_num).toBe(diskFence().facts[0]!.rowNum);
+  });
+
+  test('(c1) a forget on one id between verify and stamp: refused (row_changed), nothing stamped, the forget stands and the reconcile does not resurrect it', async () => {
+    const a = await seed('Founded Acme');
+    await seed('Prefers async');
+    const s = await run({ beforeStamp: async () => {
+      const f = await forgetFactInFence(engine, Number(a), { reason: 'raced' });
+      expect(f).toMatchObject({ ok: true, path: 'legacy_db' });
+    } });
+    expect(s.skippedByReason.row_changed).toBe(1);
+    expect(s.rowsStamped).toBe(0);
+    const rows = await factRows();
+    expect(rows.every(r => r.row_num === null)).toBe(true);
+    expect(rows.find(r => r.id === a)!.expired_at).not.toBeNull();
+    // Fence (file + DB body) carries the claim; the guard is still armed on the other row.
+    const r1 = await reconcile({ repairLegacy: false });
+    expect(r1.guardTriggered).toBe(true);
+    // Commit and let the repair finish the surviving row, then reconcile.
+    commitAll();
+    const s2 = await run();
+    expect(s2.rowsStamped).toBe(1);
+    const r2 = await reconcile();
+    expect(r2.guardTriggered).toBe(false);
+    const after = await factRows();
+    const forgotten = after.find(r => r.id === a)!;
+    expect(forgotten.expired_at).not.toBeNull();
+    expect(forgotten.row_num).toBeNull();
+    // KNOWN, pre-existing contract (#2646, extract-facts.ts listExistingFactsForPage): the fence
+    // still carries the forgotten claim as an ACTIVE row, so the reconcile inserts it as a NEW
+    // fence-owned row. Observed and asserted as-is; the legacy row's expiry itself is never undone.
+    expect(after.filter(r => r.fact === 'Founded Acme' && r.expired_at === null).length).toBe(r2.factsInserted);
+  });
+
+  test('(c2) forget routing re-runs when the row was stamped between its pre-read and its expire: takes the fence path, strikes the fence', async () => {
+    const a = await seed('Founded Acme');
+    // Simulate the interleaving: forget reads the row as legacy, the repair stamps it, forget continues.
+    await run();
+    expect((await factRows())[0]!.row_num).not.toBeNull();
+    const f = await withEnv({ GBRAIN_HOME: home }, () => forgetFactInFence(engine, Number(a), { reason: 'later' }));
+    expect(f).toMatchObject({ ok: true, path: 'fence' });
+    expect(diskFence().facts[0]!.active).toBe(false);
+    expect((await factRows())[0]!.expired_at).not.toBeNull();
+  });
+
+  test('(c3) forget legacy expire is conditional: 0 rows → re-route (unit of the seam)', async () => {
+    // A row that is fence-owned but whose forget pre-read would have routed legacy cannot be
+    // manufactured without a hook; assert the SQL contract directly: the conditional UPDATE
+    // never touches a fence-owned row.
+    const a = await seed('Founded Acme');
+    await run();
+    const r = await engine.executeRaw<{ id: string }>(
+      `UPDATE facts SET expired_at = now() WHERE id = $1 AND expired_at IS NULL AND row_num IS NULL RETURNING id::text AS id`, [Number(a)]);
+    expect(r).toHaveLength(0);
+    expect((await factRows())[0]!.expired_at).toBeNull();
+  });
+
+  test('(c4) a put_page-style fenceless save between verify and stamp: refused (verify_failed), nothing stamped, no resurrection', async () => {
+    await seed('Founded Acme');
+    const s = await run({ beforeStamp: async () => {
+      await engine.putPage(ALICE, { type: 'person', title: 'Alice', compiled_truth: ALICE_DB_BODY, timeline: '' } as any, { sourceId: SRC });
+    } });
+    expect(s.skippedByReason.verify_failed).toBe(1);
+    expect((await factRows())[0]!.row_num).toBeNull();
+    const r = await reconcile({ repairLegacy: false });
+    expect(r.guardTriggered).toBe(true);
+    expect(r.factsDeleted).toBe(0);
+    expect(await factRows()).toHaveLength(1);
+  });
+
+  test('(c5) an edit to the fact text between eligibility read and stamp: refused (row_changed)', async () => {
+    const a = await seed('Founded Acme');
+    const s = await run({ beforeStamp: async () => {
+      await engine.executeRaw(`UPDATE facts SET fact = 'Founded Acme Corp' WHERE id = $1`, [Number(a)]);
+    } });
+    expect(s.skippedByReason.row_changed).toBe(1);
+    expect((await factRows())[0]!.row_num).toBeNull();
+  });
+
+  test('(c6) a competing stamp of the same id: refused (row_changed), the first stamp is kept', async () => {
+    const a = await seed('Founded Acme');
+    const s = await run({ beforeStamp: async () => {
+      await engine.executeRaw(`UPDATE facts SET row_num = 9, source_markdown_slug = $2 WHERE id = $1`, [Number(a), ALICE]);
+    } });
+    expect(s.skippedByReason.row_changed).toBe(1);
+    expect((await factRows())[0]!.row_num).toBe(9);
+  });
+});
+
+describe('(d) stale-save reproducer — reported as observed', () => {
+  test('legacy page: get body before repair → repair → put_page the stale body (write-through) → reconcile', async () => {
+    const staleBody = readFileSync(join(repo, ALICE_MD), 'utf-8');
+    const id = await seed('Founded Acme');
+    await run();
+    commitAll('after repair');
+    expect((await factRows())[0]!.row_num).not.toBeNull();
+
+    const res = await withEnv({ GBRAIN_HOME: home }, () => putPageOp.handler(opCtx(), { slug: ALICE, content: staleBody })) as Record<string, any>;
+    const r = await reconcile();
+    // OBSERVED: the #4872 mirror keeps the OLD content_hash, which is the hash of exactly this
+    // stale body, so put_page reports `skipped` (unchanged), the DB body keeps the fence, and the
+    // write-through re-renders the DB row (fence included) onto disk. The reconcile deletes
+    // nothing and the stamped row survives — but only because no sync has refreshed the hash yet
+    // (see the next test for the post-sync outcome).
+    expect(res.status).toBe('skipped');
+    expect(res.write_through?.written).toBe(true);
+    expect(diskFence().facts).toHaveLength(1);
+    expect((await dbFence()).facts).toHaveLength(1);
+    expect(r.factsDeleted).toBe(0);
+    expect((await factRows()).find(x => x.id === id)?.row_num).toBe(1);
+  });
+
+  test('legacy page AFTER a sync-equivalent hash refresh: the stale save lands and the reconcile deletes the stamped row (same as never-legacy)', async () => {
+    const staleBody = readFileSync(join(repo, ALICE_MD), 'utf-8');
+    const id = await seed('Founded Acme');
+    await run();
+    commitAll('after repair');
+    // What `gbrain sync` does next: re-import the fenced file, refreshing content_hash.
+    const fenced = parseMarkdown(readFileSync(join(repo, ALICE_MD), 'utf-8'), `${ALICE}.md`);
+    await engine.refreshPageBody(ALICE, SRC, fenced.compiled_truth, fenced.timeline, 'post-sync-hash');
+
+    const res = await withEnv({ GBRAIN_HOME: home }, () => putPageOp.handler(opCtx(), { slug: ALICE, content: staleBody })) as Record<string, any>;
+    const r = await reconcile();
+    // OBSERVED: fence removed from BOTH sinks by the stale save; the reconcile deletes the row.
+    expect(res.status).toBe('created_or_updated');
+    expect(diskFence().facts).toHaveLength(0);
+    expect((await dbFence()).facts).toHaveLength(0);
+    expect(r.factsDeleted).toBe(1);
+    expect((await factRows()).find(x => x.id === id)).toBeUndefined();
+  });
+
+  test('never-legacy page: same sequence on rows that were always fence-owned', async () => {
+    const staleBody = readFileSync(join(repo, ALICE_MD), 'utf-8');
+    const { body } = upsertFactRow(ALICE_BODY, {
+      rowNum: 1, claim: 'Founded Acme', kind: 'fact', confidence: 0.9, visibility: 'private',
+      notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
+    });
+    writeFileSync(join(repo, ALICE_MD), body, 'utf-8'); commitAll('fence');
+    const parsed = parseMarkdown(body, `${ALICE}.md`);
+    await engine.refreshPageBody(ALICE, SRC, parsed.compiled_truth, parsed.timeline, 'x');
+    const r0 = await reconcile();
+    expect(r0.factsInserted).toBe(1);
+    const id = (await factRows())[0]!.id;
+    expect((await factRows())[0]!.row_num).toBe(1);
+
+    const res = await withEnv({ GBRAIN_HOME: home }, () => putPageOp.handler(opCtx(), { slug: ALICE, content: staleBody })) as Record<string, any>;
+    const r = await reconcile();
+    // OBSERVED: identical to the post-sync legacy page — the stale save removes the fence from
+    // both sinks and the reconcile deletes the fence-owned row (fence-is-canonical contract).
+    expect(res.status).toBe('created_or_updated');
+    expect(diskFence().facts).toHaveLength(0);
+    expect((await dbFence()).facts).toHaveLength(0);
+    expect(r.factsDeleted).toBe(1);
+    expect((await factRows()).find(x => x.id === id)).toBeUndefined();
   });
 });

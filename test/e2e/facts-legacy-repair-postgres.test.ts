@@ -6,12 +6,13 @@
  * These re-run the engine-touching transitions on a real Postgres: the
  * `engine.transaction` stamp with in-txn re-verify, `ANY($n::int[])` /
  * `ANY($n::text[])` params, `RETURNING id::text`, `refreshPageBody`, the
- * partial UNIQUE index `idx_facts_fence_key`, and the reconcile after repair.
+ * partial UNIQUE index `idx_facts_fence_key`, the `FOR UPDATE` page-row + fact-row
+ * locks inside the stamp transaction, the mid-stamp rollback, and the reconcile after repair.
  *
  * Skipped unless DATABASE_URL names a test database (db-guard).
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -20,6 +21,7 @@ import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { runExtractFacts } from '../../src/core/cycle/extract-facts.ts';
 import { parseFactsFence } from '../../src/core/facts-fence.ts';
 import { repairLegacyRowsForSource, countLegacyRowsForSource } from '../../src/core/facts/fence-legacy.ts';
+import { forgetFactInFence } from '../../src/core/facts/forget.ts';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
 import { withEnv } from '../helpers/with-env.ts';
 
@@ -163,5 +165,56 @@ describe.skipIf(skip)('legacy-fact repair on Postgres', () => {
     expect(r.guardTriggered).toBe(true);
     expect(r.factsDeleted).toBe(0);
     expect(await rows()).toHaveLength(1);
+  });
+
+  test('crash after the first UPDATE inside the stamp transaction rolls every row back; after the commit the next run stamps with 0 appends', async () => {
+    await seed('Founded Acme');
+    await seed('Prefers async');
+    const s1 = await run({ hooks: { afterFirstStampUpdate: () => { throw new Error('injected mid-stamp'); } } });
+    expect(s1.skippedByReason.error).toBe(1);
+    expect((await rows()).every(r => r.row_num === null && r.source_markdown_slug === null)).toBe(true);
+    expect(diskFence().facts).toHaveLength(2);
+    commitAll();
+    const s3 = await run();
+    expect(s3).toMatchObject({ rowsAppended: 0, rowsStamped: 2, rowsRemaining: 0 });
+    expect((await rows()).map(r => r.row_num).sort()).toEqual(diskFence().facts.map(f => f.rowNum).sort());
+  });
+
+  test('a forget between verify and stamp is caught by the locked per-row re-check (row_changed); the forget stands', async () => {
+    const a = await seed('Founded Acme');
+    const s = await run({ hooks: { beforeStamp: async () => {
+      const f = await forgetFactInFence(engine, Number(a), { reason: 'raced' });
+      expect(f).toMatchObject({ ok: true, path: 'legacy_db' });
+    } } });
+    expect(s.skippedByReason.row_changed).toBe(1);
+    const r = await engine.executeRaw<{ row_num: number | null; expired_at: unknown }>(
+      `SELECT row_num, expired_at FROM facts WHERE id = $1`, [Number(a)]);
+    expect(r[0]!.row_num).toBeNull();
+    expect(r[0]!.expired_at).not.toBeNull();
+  });
+
+  test('typed-claim columns ride into the fence and survive the reconcile; canonical fact/source are written on the stamp', async () => {
+    const r0 = await engine.executeRaw<{ id: string }>(
+      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence,
+                          claim_metric, claim_value, claim_unit, claim_period)
+       VALUES ($1, $2, '  MRR is 50000 ', 'fact', 'private', 'medium', '2026-01-02', '', 0.9, 'mrr', 50000, 'USD', 'monthly')
+       RETURNING id::text AS id`, [SRC, ALICE]);
+    const s = await run();
+    expect(s.rowsStamped).toBe(1);
+    expect(diskFence().facts[0]).toMatchObject({ claim: 'MRR is 50000', claimMetric: 'mrr', claimValue: 50000, claimUnit: 'USD', claimPeriod: 'monthly' });
+    const r = await withEnv({ GBRAIN_HOME: home }, () => runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE] }));
+    expect(r.factsDeleted).toBe(0);
+    expect(r.factsInserted).toBe(0);
+    const db = await engine.executeRaw<{ fact: string; source: string; claim_metric: string; claim_value: number }>(
+      `SELECT fact, source, claim_metric, claim_value::float8 AS claim_value FROM facts WHERE id = $1`, [Number(r0[0]!.id)]);
+    expect(db[0]).toEqual({ fact: 'MRR is 50000', source: 'fence:reconcile', claim_metric: 'mrr', claim_value: 50000 });
+  });
+
+  test('dry-run acquires no page lock and writes nothing', async () => {
+    await seed('Founded Acme');
+    const s = await run({ dryRun: true });
+    expect(s).toMatchObject({ dryRun: true, rowsStamped: 0, rowsAppended: 1 });
+    expect(existsSync(join(home, '.gbrain'))).toBe(false);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
   });
 });
