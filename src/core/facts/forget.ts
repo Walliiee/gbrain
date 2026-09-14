@@ -102,6 +102,15 @@ export async function forgetFactInFence(
     worldOnly?: boolean;
   } = {},
 ): Promise<ForgetFactResult> {
+  return forgetFactOnce(engine, factId, opts, true);
+}
+
+async function forgetFactOnce(
+  engine: BrainEngine,
+  factId: number,
+  opts: NonNullable<Parameters<typeof forgetFactInFence>[2]>,
+  rerouteOnce: boolean,
+): Promise<ForgetFactResult> {
   const reason = opts.reason ?? 'forgotten';
 
   const rows = await engine.executeRaw<FactDbRow>(
@@ -138,6 +147,24 @@ export async function forgetFactInFence(
 
   if (!canFence) {
     // Legacy path — DB-only forget. Doesn't survive `gbrain rebuild`.
+    //
+    // Conditional on the row STILL being legacy: the routing above came from
+    // a pre-read, and the legacy-fact repair (fence-write.ts stamp mode) can
+    // stamp this row in between. An unconditional expire would then expire a
+    // fence-owned row without striking its fence, and the reconcile's
+    // expiry-drift path would re-insert it active. Zero rows → the row moved
+    // (stamped, or expired by someone else): re-run the routing once so it
+    // takes the fence path (or reports already_expired).
+    const expired = await engine.executeRaw<{ id: string }>(
+      `UPDATE facts SET expired_at = now()
+        WHERE id = $1 AND expired_at IS NULL AND row_num IS NULL
+        RETURNING id::text AS id`,
+      [factId],
+    );
+    if (expired.length === 1) return { ok: true, path: 'legacy_db', reason };
+    if (rerouteOnce) return forgetFactOnce(engine, factId, opts, false);
+    // Second pass and still not a clean legacy row (row_num set but the
+    // fence columns are incomplete): the pre-fix DB-only expire.
     const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
     return { ok, path: 'legacy_db', reason };
   }
