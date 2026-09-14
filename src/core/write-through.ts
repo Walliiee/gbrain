@@ -88,8 +88,9 @@ export interface WriteThroughResult {
    *     writing would silently clobber the OTHER slug's file (#2831) — refused.
    *   - page_lock_timeout: another writer (facts fence, forget, timeline
    *     splice, legacy-fact stamp, destructive reconcile) held the page lock
-   *     for the whole 5 s wait. The DB row is intact; the next sync or
-   *     write reconciles the file.
+   *     for the whole 5 s wait. Only reachable for callers that do NOT hold
+   *     the lock themselves (`holdsPageLock`); `put_page`/`restore_page` take
+   *     it before their DB write, so for them a busy page refuses up front.
    */
   skipped?: 'disabled_by_config' | 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | 'case_insensitive_collision' | 'page_lock_timeout';
   /** Set when the render/write/rename itself threw (EACCES, ENOTDIR, disk full). */
@@ -102,11 +103,14 @@ export interface WritePageThroughOpts {
   frontmatterOverrides?: Record<string, unknown>;
   logger?: WriteThroughLogger;
   /**
-   * The caller ALREADY holds `withPageLock(slug)` (page-lock.ts). The lock is
-   * a non-re-entrant lockfile, so a nested acquire would wait out the timeout
-   * against itself; pass true to skip acquisition. No current caller
-   * (ops/pages.ts put_page + restore_page, commands/brainstorm.ts,
-   * commands/sync.ts) holds it.
+   * The caller ALREADY holds the page lock for `slug` (page-lock.ts). The
+   * lock is a non-re-entrant lockfile, so a nested acquire would wait out the
+   * timeout against itself; pass true to skip acquisition. `put_page` and
+   * `restore_page` (ops/pages.ts) hold it across their DB write AND this
+   * write-through, so an acknowledged save is durable in both sinks; the
+   * best-effort callers (commands/brainstorm.ts `--save`, commands/sync.ts
+   * re-export of never-committed pages) do not and accept
+   * `page_lock_timeout` as a reported skip.
    */
   holdsPageLock?: boolean;
 }
