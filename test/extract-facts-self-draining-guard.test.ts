@@ -18,6 +18,7 @@ import { withEnv } from './helpers/with-env.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 import { runCycle } from '../src/core/cycle.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
+import type { LegacyStampHooks } from '../src/core/facts/fence-legacy.ts';
 
 let engine: PGLiteEngine;
 let brainDir: string;
@@ -175,28 +176,27 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
     expect(r.legacyRepair).toBeUndefined();
   });
 
-  test('a crash inside the repair leaves the guard armed and loud, never a fabricated success', async () => {
+  test('a crash inside the repair leaves the guard armed and loud, never a fabricated success; nothing is written, so the next run simply finishes', async () => {
     await seed('Founded Acme');
-    const r = await withEnv({ GBRAIN_HOME: home }, () =>
-      runExtractFacts(engine, {
-        sourceId: SRC, brainDir,
-        repairHooks: { beforeStamp: () => { throw new Error('injected'); } },
-      }));
-    expect(r.guardTriggered).toBe(true);
-    expect(r.legacyRowsPending).toBe(1);
-    expect(r.legacyRepair?.skippedByReason.error).toBe(1);
-    // The disk + DB body already carry the fence; the row is NOT fence-owned
-    // yet, so the reconcile did not run and could not have deleted it.
-    expect((await activeRows())[0]!.row_num).toBeNull();
-    expect(r.factsDeleted).toBe(0);
+    for (const seam of ['beforeStamp', 'afterFirstStampUpdate', 'beforeCommit'] as const) {
+      const repairHooks: LegacyStampHooks = {};
+      repairHooks[seam] = () => { throw new Error(`injected at ${seam}`); };
+      const r = await withEnv({ GBRAIN_HOME: home }, () =>
+        runExtractFacts(engine, { sourceId: SRC, brainDir, repairHooks }));
+      expect(r.guardTriggered).toBe(true);
+      expect(r.legacyRowsPending).toBe(1);
+      expect(r.legacyRepair?.skippedByReason.error).toBe(1);
+      expect(r.legacyRepair?.skippedDetails[0]).toContain(`injected at ${seam}`);
+      // The row is NOT fence-owned, so the reconcile did not run and could not
+      // have deleted it — and neither sink carries a fence: the transaction
+      // rolled back and (after the rename) the committed preimage was restored.
+      expect((await activeRows())[0]!.row_num).toBeNull();
+      expect(r.factsDeleted).toBe(0);
+      expect(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8')).toBe(ALICE_BODY);
+      expect(git('status', '--porcelain').trimEnd()).toBe('');
+    }
 
-    // The file now carries our uncommitted fence: refused, named, until it is
-    // committed (the owner's morning commit); then the next run finishes.
-    const r1b = await withEnv({ GBRAIN_HOME: home }, () =>
-      runExtractFacts(engine, { sourceId: SRC, brainDir }));
-    expect(r1b.guardTriggered).toBe(true);
-    expect(r1b.legacyRepair?.skippedByReason.file_uncommitted).toBe(1);
-    git('commit', '-q', '-am', 'morning commit');
+    // No operator step: the next run finishes.
     const r2 = await withEnv({ GBRAIN_HOME: home }, () =>
       runExtractFacts(engine, { sourceId: SRC, brainDir }));
     expect(r2.guardTriggered).toBe(false);

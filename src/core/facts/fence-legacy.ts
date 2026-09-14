@@ -9,25 +9,29 @@
  *
  * Everything that is a safety property lives in the writer: page lock,
  * containment-checked target, per-FILE git refusal (tracked at HEAD, clean),
- * unique `.tmp` + parse + rename, body mirror, verify-inside-the-stamp-
- * transaction with the page row and fact rows locked, duplicate-key refusal.
- * The SELECT below carries every column the fence can express (typed-claim
- * columns included) plus `superseded_by`, which the writer refuses on an
- * active row. Columns the fence cannot express — `embedding`, `source_session`,
- * `created_at`, `consolidated_at`/`consolidated_into`, `event_type`,
- * `dimension`, `value`, `value_hash`, `dim_status` — stay on the row through
- * the stamp (it is an UPDATE) and are subject to the same wipe + reinsert
- * every fence-owned row is. This file owns only: the eligibility query (the guard's own
- * predicate, so counted-there and repaired-here cannot diverge), grouping,
- * the per-source summary the halt reports, and a kill switch.
+ * ONE transaction that locks the page row and every fact row, re-checks each
+ * row on every fence column, mirrors, verifies, stamps and only THEN renames
+ * the file into place (a refusal at any point rolls back with nothing
+ * written; a crashed run's own uncommitted appends are recognised and the
+ * committed preimage restored on the next run), duplicate-key refusal, and a
+ * lossless-reuse rule for rows the fence already carries. The SELECT below
+ * carries every column the fence can express (typed-claim columns included)
+ * plus `superseded_by`, which the writer refuses on an active row. Columns
+ * the fence cannot express — `embedding`, `source_session`, `created_at`,
+ * `consolidated_at`/`consolidated_into`, `event_type`, `dimension`, `value`,
+ * `value_hash`, `dim_status` — stay on the row through the stamp (it is an
+ * UPDATE) and are subject to the same wipe + reinsert every fence-owned row
+ * is. This file owns only: the eligibility query (the guard's own predicate,
+ * so counted-there and repaired-here cannot diverge), grouping, the
+ * per-source summary the halt reports, and a kill switch.
  *
- * Rollback is git-native and has no code here: un-stamp FIRST
- * (`UPDATE facts SET row_num = NULL, source_markdown_slug = NULL WHERE
- * source_id = $1 AND source_markdown_slug = $2 AND id = ANY($3)`), then
- * restore the file from its committed preimage (`git checkout -- <file>` or
- * `git revert` of the path-limited commit), then `gbrain sync --source <id>`.
- * The writer refuses files with uncommitted changes, so a committed preimage
- * always exists for anything it touched. Proven in
+ * Rollback after a COMMITTED stamp is git-native and has no code here:
+ * un-stamp FIRST (`UPDATE facts SET row_num = NULL, source_markdown_slug =
+ * NULL WHERE source_id = $1 AND source_markdown_slug = $2 AND id = ANY($3)`),
+ * then restore the file from its committed preimage (`git checkout -- <file>`
+ * or `git revert` of the path-limited commit), then `gbrain sync --source
+ * <id>`. The writer refuses files with uncommitted changes, so a committed
+ * preimage always exists for anything it touched. Proven in
  * test/facts-fence-legacy-repair.test.ts (un-stamp before fence removal;
  * the reverse order is the deletion window).
  */
@@ -53,6 +57,8 @@ export interface RepairLegacyRowsSummary {
   rowsEligible: number;
   rowsStamped: number;
   rowsAppended: number;
+  /** Existing fence rows rewritten in place to carry fields only the DB row held. */
+  rowsRewritten: number;
   pagesFenced: number;
   pagesSkipped: number;
   /** Pending pages by refusal reason, so the halt can say why. */
@@ -136,7 +142,7 @@ export async function repairLegacyRowsForSource(
 ): Promise<RepairLegacyRowsSummary> {
   const dryRun = opts.dryRun ?? false;
   const summary: RepairLegacyRowsSummary = {
-    rowsEligible: 0, rowsStamped: 0, rowsAppended: 0,
+    rowsEligible: 0, rowsStamped: 0, rowsAppended: 0, rowsRewritten: 0,
     pagesFenced: 0, pagesSkipped: 0,
     skippedByReason: {}, skippedDetails: [],
     rowsRemaining: 0, dryRun, aborted: false,
@@ -163,6 +169,7 @@ export async function repairLegacyRowsForSource(
       summary.pagesFenced += 1;
       summary.rowsStamped += r.stamped;
       summary.rowsAppended += r.appended;
+      summary.rowsRewritten += r.rewritten;
     } else {
       summary.pagesSkipped += 1;
       const reason = r.reason ?? 'error';
