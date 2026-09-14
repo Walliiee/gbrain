@@ -162,6 +162,14 @@ async function refuseReconcileOnStaleCache(
   cachedTimeline: string,
   warnings: string[],
 ): Promise<boolean> {
+  const tombstones = await engine.executeRaw<{ fact: string }>(
+    `SELECT fact FROM facts WHERE source_id = $1 AND entity_slug = $2 AND row_num IS NULL AND expired_at IS NOT NULL`,
+    [sourceId, slug]);
+  const parsed = parseFactsFence(cachedCompiledTruth);
+  if (tombstones.length && (parsed.warnings.length || parsed.facts.some(f => f.active && tombstones.some(t => t.fact.trim() === f.claim.trim())))) {
+    warnings.push(`${slug}: FACTS_RESIDUE_UNRESOLVED: freshly checked tombstones forbid resurrection`);
+    return true;
+  }
   const state = await canonicalCacheState(
     engine,
     slug,
@@ -199,6 +207,10 @@ async function underPageLock<T>(
     return null;
   }
   try {
+    if (isFactRepairDisabled()) {
+      warnings.push(`${slug}: FACTS_REPAIR_DISABLED: reconciliation refused during repair shutdown`);
+      return null;
+    }
     return await fn();
   } finally {
     await handle.release();
@@ -219,16 +231,9 @@ async function underPageLock<T>(
  * wipe every cycle) nor mask a fence row from insertion. Mirrors the
  * preserveExpiredLegacy filter deleteFactsForPage applies on the wipe.
  *
- * Deliberate consequence: if the fence still carries the same
- * (claim, source) as an expired legacy row, the reconcile inserts it
- * as a fresh ACTIVE fence-owned row. That is the fence-is-canonical
- * contract working as documented — legacy DB-only forgets "DO NOT
- * survive rebuild" (see forget.ts header); suppressing the insert
- * would instead create silent fence↔DB divergence, the exact failure
- * mode the empty-fence guard exists to prevent. To durably forget
- * such a claim, forget the fence-owned row (forget_fact now takes the
- * fence path, which strikes the row through in markdown). The expired
- * legacy row survives alongside as the record of the earlier forget.
+ * A matching expired legacy claim is now a block, not permission to
+ * resurrect. Residue discovery and a fresh per-write tombstone check enforce
+ * that stronger contract even when file access or repair is disabled.
  */
 async function listExistingFactsForPage(
   engine: BrainEngine,
@@ -486,6 +491,11 @@ export async function runExtractFacts(
   );
   let legacyCount = parseInt(legacy[0]?.n ?? '0', 10);
   result.legacyRowsPending = legacyCount;
+  if (isFactRepairDisabled()) {
+    result.guardTriggered = true;
+    result.warnings.push('FACTS_REPAIR_DISABLED: repair, phantom redirect and reconciliation are disabled; drain all in-flight writers before rollback.');
+    return result;
+  }
 
   // ── Self-draining guard (2026-09-13) ─────────────────────────────
   // The guard has armed. Before halting, fence the rows it armed on — in
@@ -543,20 +553,14 @@ export async function runExtractFacts(
         legacyCount = repair.rowsRemaining;
         result.legacyRowsPending = legacyCount;
       }
-      if (repair.residuePagesHealed > 0) {
-        result.warnings.push(
-          `extract_facts: restored the committed preimage over a crashed repair's uncommitted fence rows on ` +
-          `${repair.residuePagesHealed} page(s) in source "${sourceId}"`,
-        );
-      }
       if (repair.residuePagesBlocked.length > 0) {
         for (const b of repair.residuePagesBlocked) blockedResidueSlugs.add(b.slug);
         const named = repair.residuePagesBlocked.slice(0, 10)
           .map(b => `${b.slug} (${b.reason}${b.detail ? `: ${b.detail.slice(0, 120)}` : ''})`).join(' | ');
         result.warnings.push(
           `extract_facts: FACTS_RESIDUE_UNRESOLVED: ${repair.residuePagesBlocked.length} page(s) in source "${sourceId}" ` +
-          `still carry a crashed repair's fence rows in the file or the page cache; their fact reconciliation is skipped ` +
-          `until the file is committed or restored (git checkout -- <file>) and gbrain sync has refreshed the page: ${named}`,
+          `have unverified file/cache content; their fact reconciliation and the source phantom pass are skipped ` +
+          `until manual review resolves forgotten claims and gbrain sync refreshes the page: ${named}`,
         );
       }
       if (repair.pagesSkipped > 0) {
@@ -567,6 +571,7 @@ export async function runExtractFacts(
         );
       }
       if (repair.aborted) {
+        repairFailure = 'repair aborted before all candidates were checked';
         result.warnings.push(`extract_facts: legacy repair aborted before finishing source "${sourceId}"`);
       }
     } catch (e) {
@@ -589,6 +594,11 @@ export async function runExtractFacts(
       `files cannot be proven free of a crashed repair's fence rows; their fact reconciliation is skipped until the ` +
       `repair is enabled: ${residuePages.slice(0, 10).join(' | ')}`,
     );
+  }
+
+  if (blockedResidueSlugs.size > 0) {
+    const residueFailure = `unresolved residue on ${blockedResidueSlugs.size} page(s); manual review required before this source can reconcile or redirect`;
+    repairFailure = repairFailure ? `${repairFailure}; ${residueFailure}` : residueFailure;
   }
 
   if (repairFailure !== undefined) {
@@ -657,7 +667,7 @@ export async function runExtractFacts(
   // IS NOT NULL` so a half-redirected page (soft-deleted, .md still on
   // disk) won't be re-redirected.
   let phantomResult: PhantomPassResult = emptyPhantomPassResult();
-  if (opts.brainDir) {
+  if (opts.brainDir && blockedResidueSlugs.size === 0 && !isFactRepairDisabled()) {
     try {
       phantomResult = await runPhantomRedirectPass(
         engine,

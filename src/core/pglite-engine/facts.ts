@@ -150,6 +150,12 @@ export async function insertFacts(
       // call) so it shares this transaction. Delete scoping mirrors
       // deleteFactsForPage exactly (#1928 excludeSourcePrefixes + #2646
       // preserveExpiredLegacy).
+      // Keep original ingestion time for unchanged content. Read from the
+      // rows actually deleted INSIDE this transaction, never a stale snapshot.
+      const creationTimes = new Map<string, string>();
+      const remember = (old: Array<Record<string, unknown>>) => {
+        for (const f of old) creationTimes.set(JSON.stringify([f.fact, f.source]), String(f.created_at));
+      };
       const del = opts?.deleteForPageFirst;
       if (del) {
         const expiredLegacyFilter = del.preserveExpiredLegacy
@@ -158,18 +164,22 @@ export async function insertFacts(
         const prefixes = del.excludeSourcePrefixes;
         if (prefixes && prefixes.length > 0) {
           const patterns = prefixes.map(p => `${p}%`);
-          const r = await tx.query(
+          const r = await tx.query<Record<string, unknown>>(
             `DELETE FROM facts
                WHERE source_id = $1 AND source_markdown_slug = $2
-                 AND NOT (COALESCE(source, '') LIKE ANY($3::text[]))${expiredLegacyFilter}`,
+                 AND NOT (COALESCE(source, '') LIKE ANY($3::text[]))${expiredLegacyFilter}
+               RETURNING fact, source, created_at::text AS created_at`,
             [ctx.source_id, del.slug, patterns],
           );
+          remember(r.rows);
           deleted = r.affectedRows ?? 0;
         } else {
-          const r = await tx.query(
-            `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug = $2${expiredLegacyFilter}`,
+          const r = await tx.query<Record<string, unknown>>(
+            `DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug = $2${expiredLegacyFilter}
+               RETURNING fact, source, created_at::text AS created_at`,
             [ctx.source_id, del.slug],
           );
+          remember(r.rows);
           deleted = r.affectedRows ?? 0;
         }
       }
@@ -247,7 +257,11 @@ export async function insertFacts(
             ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, expiredAt, input.source, sourceSession, confidence, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType]
             : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, expiredAt, input.source, sourceSession, confidence, embedStr, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType],
         );
-        if (ins.rows[0]) out.push(ins.rows[0].id);
+        if (ins.rows[0]) {
+          const created = creationTimes.get(JSON.stringify([input.fact, input.source]));
+          if (created !== undefined) await tx.query('UPDATE facts SET created_at = $1::timestamptz WHERE id = $2', [created, ins.rows[0].id]);
+          out.push(ins.rows[0].id);
+        }
         rowIds.push(ins.rows[0] ? Number(ins.rows[0].id) : null);
       }
 

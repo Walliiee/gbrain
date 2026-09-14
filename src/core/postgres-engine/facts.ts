@@ -160,6 +160,12 @@ export async function insertFacts(
       // the pool (`deps.sql`), a separate self-committing transaction,
       // which is exactly the split this fix removes. Scoping mirrors it
       // exactly (#1928 excludeSourcePrefixes + #2646 preserveExpiredLegacy).
+      // Keep original ingestion time for unchanged content. Read from the
+      // rows actually deleted INSIDE this transaction, never a stale snapshot.
+      const creationTimes = new Map<string, string>();
+      const remember = (old: Array<Record<string, unknown>>) => {
+        for (const f of old) creationTimes.set(JSON.stringify([f.fact, f.source]), String(f.created_at));
+      };
       const del = opts?.deleteForPageFirst;
       if (del) {
         const expiredLegacyFilter = del.preserveExpiredLegacy
@@ -174,13 +180,17 @@ export async function insertFacts(
               AND source_markdown_slug = ${del.slug}
               AND NOT (COALESCE(source, '') LIKE ANY(${patterns}))
               ${expiredLegacyFilter}
+            RETURNING fact, source, created_at::text AS created_at
           `;
+          remember(r);
           deleted = r.count ?? 0;
         } else {
           const r = await tx`
             DELETE FROM facts
             WHERE source_id = ${ctx.source_id} AND source_markdown_slug = ${del.slug} ${expiredLegacyFilter}
+            RETURNING fact, source, created_at::text AS created_at
           `;
+          remember(r);
           deleted = r.count ?? 0;
         }
       }
@@ -233,7 +243,11 @@ export async function insertFacts(
           DO NOTHING
           RETURNING id
         `;
-        if (ins[0]) out.push(Number(ins[0].id));
+        if (ins[0]) {
+          const created = creationTimes.get(JSON.stringify([input.fact, input.source]));
+          if (created !== undefined) await tx`UPDATE facts SET created_at = ${created}::timestamptz WHERE id = ${ins[0].id}`;
+          out.push(Number(ins[0].id));
+        }
         rowIds.push(ins[0] ? Number(ins[0].id) : null);
       }
 

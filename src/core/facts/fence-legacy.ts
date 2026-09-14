@@ -1,47 +1,18 @@
 /**
- * Legacy-fact repair during maintenance — the thin caller.
+ * Thin source-scoped legacy repair caller. The native writer performs all
+ * validation and transactional stamping. Repair can append through a pinned
+ * file descriptor or reuse a complete committed fence; it cannot rewrite,
+ * commit, heal or restore files. Every newly discovered residue-only page is
+ * inspected, including previous eligibility candidates and unavailable paths.
+ * Unknown/dirty residue blocks the source before redirection/reconciliation.
  *
- * `runExtractFacts` halts a source while `row_num IS NULL` rows whose entity
- * page is live remain (the v0.32.2 empty-fence guard). This module drains
- * exactly those rows, page by page, through the native fence writer's stamp
- * mode (`stampLegacyFactsToFence` in fence-write.ts), then the guard
- * re-counts from the DB before deciding to halt or proceed.
- *
- * Everything that is a safety property lives in the writer: page lock,
- * containment-checked target, per-FILE git refusal (tracked at HEAD, clean),
- * ONE transaction that locks the page row and every fact row, re-checks each
- * row on every fence column, mirrors, verifies, stamps and only THEN renames
- * the file into place (a refusal at any point rolls back with nothing
- * written; a crashed run's own uncommitted appends are recognised and the
- * committed preimage restored on the next run), duplicate-key refusal, and a
- * lossless-reuse rule for rows the fence already carries. The SELECT below
- * carries every column the fence can express (typed-claim columns included)
- * plus `superseded_by`, which the writer refuses on an active row. Columns
- * the fence cannot express — `embedding`, `source_session`, `created_at`,
- * `consolidated_at`/`consolidated_into`, `event_type`, `dimension`, `value`,
- * `value_hash`, `dim_status` — stay on the row through the stamp (it is an
- * UPDATE) and are subject to the same wipe + reinsert every fence-owned row
- * is. This file owns only: the eligibility query (the guard's own predicate,
- * so counted-there and repaired-here cannot diverge), grouping, the
- * residue-only sweep over pages whose never-fenced rows have ALL been
- * forgotten (the stamp path never visits them; the writer's own recognizer
- * decides what is residue, and a page it cannot prove safe is handed back
- * as `residuePagesBlocked` for the reconcile to leave alone), the per-source
- * summary the halt reports, and a kill switch.
- *
- * Rollback after a COMMITTED stamp is git-native and has no code here:
- * un-stamp FIRST (`UPDATE facts SET row_num = NULL, source_markdown_slug =
- * NULL WHERE source_id = $1 AND source_markdown_slug = $2 AND id = ANY($3)`),
- * then restore the file from its committed preimage (`git checkout -- <file>`
- * or `git revert` of the path-limited commit), then `gbrain sync --source
- * <id>`. The writer refuses files with uncommitted changes, so a committed
- * preimage always exists for anything it touched. Proven in
- * test/facts-fence-legacy-repair.test.ts (un-stamp before fence removal;
- * the reverse order is the deletion window).
+ * No online rollback. Stop/disable ALL producers and drain them before any
+ * rollback SQL or manual file merge; see docs/architecture/fact-repair.md.
  */
 
 import type { BrainEngine } from '../engine.ts';
 import { isAborted } from '../abort-check.ts';
+import { isFactRepairDisabled } from './repair-policy.ts';
 import {
   stampLegacyFactsToFence,
   healResidueOnlyPage,
@@ -74,22 +45,13 @@ export interface RepairLegacyRowsSummary {
   skippedDetails: string[];
   /** Legacy rows still eligible after the pass — re-counted, not derived. */
   rowsRemaining: number;
-  /**
-   * Residue-only sweep (review finding 3): pages whose never-fenced rows have
-   * ALL been forgotten, checked for a crashed run's uncommitted appends.
-   * `residuePagesChecked` counts pages with a self-dirty file that were
-   * examined; `residuePagesHealed` those whose dirt was exactly this repair's
-   * residue and were put back to their committed preimage.
-   */
+  /** Read-only inspection attempts, including unavailable targets. */
   residuePagesChecked: number;
+  /** Compatibility counter; always zero. Automatic healing was removed. */
   residuePagesHealed: number;
-  /**
-   * Residue-only pages the sweep could NOT prove safe: a self-dirty file that
-   * is not this repair's exact residue (`not_residue`), a restored file whose
-   * cache still carries another body (`cache_unsafe`), a lock or a throw
-   * (`error`), or a page the per-pass cap left unvisited (`unswept`). The
-   * reconcile skips these slugs; a later sync, commit or restore clears them.
-   */
+  /** Unknown, dirty, unavailable, unsafe-cache or unvisited residue candidates.
+   * Any block halts this source before BOTH redirection and reconciliation.
+   * A commit alone cannot make a forgotten active claim safe to reinsert. */
   residuePagesBlocked: Array<{ slug: string; reason: Exclude<ResidueSweepOutcome, 'healed' | 'clean' | 'skipped'> | 'unswept'; detail?: string }>;
   /**
    * Set when a repair-WIDE step threw — listing the eligible rows, listing the
@@ -123,10 +85,7 @@ export interface RepairLegacyRowsOpts {
  * `GBRAIN_FACT_REPAIR=off` disables the in-cycle repair without a deploy; the
  * phase then halts exactly as before this module existed.
  */
-export function isFactRepairDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = (env.GBRAIN_FACT_REPAIR ?? '').trim().toLowerCase();
-  return v === 'off' || v === '0' || v === 'false' || v === 'disabled';
-}
+export { isFactRepairDisabled } from './repair-policy.ts';
 
 /**
  * The guard's predicate, verbatim: row never fenced, entity page live in THIS
@@ -154,7 +113,8 @@ export async function listLegacyRowsForSource(engine: BrainEngine, sourceId: str
   return engine.executeRaw<LegacyFactRow>(
     `SELECT f.id::text AS id, f.source_id, f.entity_slug, f.fact, f.kind, f.visibility,
             f.notability, f.context, ${fenceDateSql('f.valid_from')} AS valid_from, ${fenceDateSql('f.valid_until')} AS valid_until,
-            f.source, f.confidence, f.claim_metric, f.claim_value, f.claim_unit, f.claim_period, f.superseded_by
+            f.source, f.confidence, f.claim_metric, f.claim_value::text AS claim_value,
+            f.claim_unit, f.claim_period, f.superseded_by, to_jsonb(f)::text AS snapshot
        FROM facts f${ELIGIBLE_WHERE}
       ORDER BY f.entity_slug, f.id`,
     [sourceId],
@@ -171,7 +131,7 @@ export async function countLegacyRowsForSource(engine: BrainEngine, sourceId: st
  * forgotten (soft-expired, `row_num IS NULL`) and no eligible row: the guard
  * does not arm on them and the stamp path never visits them, yet a crashed
  * run may have left its appends on their file (review finding 3). Live page,
- * source with a local_path — the same fenceability terms as the guard.
+ * regardless of source.local_path; losing file access cannot erase a tombstone.
  */
 export async function listResidueOnlyPagesForSource(engine: BrainEngine, sourceId: string): Promise<string[]> {
   const rows = await engine.executeRaw<{ entity_slug: string }>(
@@ -186,11 +146,6 @@ export async function listResidueOnlyPagesForSource(engine: BrainEngine, sourceI
            WHERE p.source_id = f.source_id
              AND p.slug = f.entity_slug
              AND p.deleted_at IS NULL
-        )
-        AND EXISTS (
-          SELECT 1 FROM sources s
-           WHERE s.id = f.source_id
-             AND s.local_path IS NOT NULL
         )
         AND NOT EXISTS (
           SELECT 1 FROM facts e
@@ -238,6 +193,8 @@ export async function repairLegacyRowsForSource(
     return summary;
   };
 
+  if (isFactRepairDisabled()) return fail('disabled', 'GBRAIN_FACT_REPAIR disables repair and reconciliation; drain all writers before rollback');
+
   let rows: LegacyFactRow[];
   try {
     rows = await listLegacyRowsForSource(engine, opts.sourceId);
@@ -274,13 +231,9 @@ export async function repairLegacyRowsForSource(
     }
   }
 
-  // Residue-only sweep: pages the stamp path can no longer reach. Read-only
-  // on a dry-run (nothing is written there); the writer's own recognizer
-  // decides, so only this repair's exact bytes are ever put back. A page the
-  // stamp loop just visited is skipped — its self-dirt is the stamp's own
-  // append, not residue. Every page the sweep cannot prove safe — including
-  // one the cap left unvisited — is handed back blocked, never silently
-  // left for the reconcile.
+  // Re-query after ALL stamp attempts. Earlier eligibility membership does
+  // not prove safety: a concurrent forget can make that page residue-only.
+  // Inspection is read-only; dirty or unavailable content is never healed.
   if (!dryRun && !summary.aborted) {
     let residuePages: string[];
     try {
@@ -290,17 +243,15 @@ export async function repairLegacyRowsForSource(
       return fail('listing residue-only pages', err);
     }
     for (const slug of residuePages) {
-      if (bySlug.has(slug)) continue;
       if (isAborted(opts.signal)) { summary.aborted = true; break; }
       if (pages++ >= (opts.maxPages ?? DEFAULT_MAX_PAGES)) {
         summary.residuePagesBlocked.push({ slug, reason: 'unswept', detail: 'per-pass page cap reached' });
         continue;
       }
       const r = await healResidueOnlyPage(engine, { sourceId: opts.sourceId, slug }, { lockTimeoutMs: opts.lockTimeoutMs });
-      if (r.outcome === 'clean' || r.outcome === 'skipped') continue;
-      if (r.outcome !== 'error') summary.residuePagesChecked += 1;
-      if (r.outcome === 'healed') summary.residuePagesHealed += 1;
-      else summary.residuePagesBlocked.push({ slug, reason: r.outcome, detail: r.detail });
+      if (r.outcome === 'clean') continue;
+      summary.residuePagesChecked += 1;
+      summary.residuePagesBlocked.push({ slug, reason: r.outcome === 'skipped' || r.outcome === 'healed' ? 'unswept' : r.outcome, detail: r.detail });
     }
   }
 

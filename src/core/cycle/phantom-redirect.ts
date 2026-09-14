@@ -55,6 +55,7 @@ import {
 import { parseMarkdown, splitBody, serializeMarkdown } from '../markdown.ts';
 import { tryAcquireDbLock, syncLockId, type DbLockHandle } from '../db-lock.ts';
 import { isAborted } from '../abort-check.ts';
+import { isFactRepairDisabled } from '../facts/repair-policy.ts';
 import { logPhantomEvent, type PhantomOutcome } from '../facts/phantom-audit.ts';
 
 /** Tagged-union outcome of a single phantom-redirect attempt. */
@@ -411,6 +412,17 @@ export async function tryRedirectPhantom(
 
   // D10: dry-run preview — no FS / DB / audit writes.
   if (dryRun) return { outcome: 'redirected', canonical };
+
+  // A destination with unreviewed legacy history is as unsafe as the
+  // phantom. Never materialize, append, move or delete anything on this route.
+  const unresolved = await engine.executeRaw<{ id: string }>(
+    `SELECT id::text AS id FROM facts WHERE source_id = $1 AND row_num IS NULL
+      AND (entity_slug = $2 OR entity_slug = $3) LIMIT 1`,
+    [sourceId, page.slug, canonical]);
+  if (isFactRepairDisabled() || unresolved.length > 0) {
+    logPhantomEvent({ phantom_slug: page.slug, outcome: 'drift', source_id: sourceId });
+    return { outcome: 'drift', canonical };
+  }
 
   // ─── Commit phase (codex #3/#4/#6/#7) ─────────────────────────────
   const canonicalPath = path.join(brainDir, `${canonical}.md`);

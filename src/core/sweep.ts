@@ -201,6 +201,11 @@ export async function runMaintenanceSweep(
           });
           report.factsReconciled = r.factsInserted;
           if (r.guardTriggered) skip('facts_fence_guard');
+          if (r.warnings.length) {
+            skip('facts_fence_degraded');
+            for (const warning of r.warnings) log(`[sweep] ${warning}`);
+          }
+          for (const _block of r.legacyRepair?.residuePagesBlocked ?? []) skip('facts_fence_residue_blocked');
           if (budgetController.signal.aborted) skip('budget_exhausted:facts_fence');
         }
       }
