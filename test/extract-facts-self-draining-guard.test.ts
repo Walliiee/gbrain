@@ -159,13 +159,29 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
     expect((await activeRows())[0]!.row_num).toBeNull();
   });
 
-  test('no brainDir (no disk access) → no repair, halt as before', async () => {
+  test('no brainDir: the repair still runs — files resolve from sources.local_path; brainDir gates only the phantom pass (2026-09-14 round 6 contract correction)', async () => {
+    // Until round 6 this test pinned "no brainDir (no disk access) → no
+    // repair, halt as before". That contract was wrong: brainDir was only
+    // ever a proxy for "has disk access", the repair reads
+    // `sources.local_path`, and the proxy left a direct call reconciling
+    // UNPROTECTED — with the source's only never-fenced row forgotten after
+    // a crashed repair the guard was unarmed, the residue sweep never ran,
+    // and the forgotten claim was re-inserted from the residue (pinned in
+    // test/facts-fence-legacy-repair.test.ts, acceptance round 6). A
+    // headless caller now gets exactly the cycle's and the sweep's repair.
     await seed('Founded Acme');
     const r = await withEnv({ GBRAIN_HOME: home }, () =>
       runExtractFacts(engine, { sourceId: SRC }));
-    expect(r.guardTriggered).toBe(true);
-    expect(r.legacyRepair).toBeUndefined();
-    expect(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8')).toBe(ALICE_BODY);
+    expect(r.guardTriggered).toBe(false);
+    expect(r.legacyRowsPending).toBe(0);
+    expect(r.legacyRowsRepaired).toBe(1);
+    expect(r.legacyRepair).toMatchObject({ rowsEligible: 1, rowsStamped: 1, pagesFenced: 1, rowsRemaining: 0 });
+    expect(r.phantomsScanned).toBe(0);                                          // still no phantom pass without a brainDir
+    const rows = await activeRows();
+    expect(rows.map(x => x.fact)).toEqual(['Founded Acme']);
+    expect(rows[0]!.row_num).not.toBeNull();
+    const disk = parseFactsFence(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8'));
+    expect(disk.facts.map(f => f.claim)).toEqual(['Founded Acme']);
   });
 
   test('repairLegacy: false opts out explicitly even with disk access', async () => {

@@ -260,7 +260,8 @@ export interface ExtractFactsOpts {
    * to canonical pages and to unlink phantom `.md` files. When omitted,
    * the phantom-redirect pass is skipped (callers like `gbrain dream`
    * that don't have a brainDir, e.g. headless eval runs, still get the
-   * standard fence-reconcile loop).
+   * standard fence-reconcile loop — with the legacy repair and its residue
+   * protection, which never depended on brainDir; see `repairLegacy`).
    */
   brainDir?: string;
   /**
@@ -272,14 +273,21 @@ export interface ExtractFactsOpts {
   signal?: AbortSignal;
   /**
    * 2026-09-13: self-draining guard. When the guard counts legacy rows and
-   * this run has disk access (`brainDir` set) and is not a dry-run, stamp
-   * them onto their pages through the native fence writer
-   * (fence-write.ts `stampLegacyFactsToFence`) and re-count before deciding
-   * to halt. Defaults to `brainDir !== undefined`; pass `false` to keep the
-   * pure halt, or `true` to enable it without a brainDir — the repair and
-   * its residue protection resolve files from `sources.local_path`, which is
-   * how the maintenance sweep (no brainDir, no phantom pass) gets the same
-   * protection as the cycle. `GBRAIN_FACT_REPAIR=off` also disables it.
+   * this run is not a dry-run, stamp them onto their pages through the
+   * native fence writer (fence-write.ts `stampLegacyFactsToFence`) and
+   * re-count before deciding to halt; with the guard unarmed, sweep the
+   * pages whose never-fenced rows have all been forgotten for a crashed
+   * run's residue before reconciling them. Defaults to `true` for EVERY
+   * caller: the repair and its residue protection resolve files from
+   * `sources.local_path`, never from `brainDir` (which gates only the
+   * phantom pass), so a headless call is protected exactly like the cycle
+   * and the maintenance sweep (2026-09-14 acceptance round 6 — the old
+   * `brainDir !== undefined` default left a direct call reconciling
+   * unprotected, and a forgotten claim came back through it). Pass `false`
+   * (or set `GBRAIN_FACT_REPAIR=off`) to keep the pure halt: legacy rows
+   * still halt the phase, and a page carrying forgotten never-fenced rows is
+   * then BLOCKED from the reconcile (`FACTS_RESIDUE_UNSWEPT`) instead of
+   * swept — never reconciled unprotected.
    */
   repairLegacy?: boolean;
   /** Test-only crash seams for the repair. */
@@ -484,18 +492,23 @@ export async function runExtractFacts(
   // THIS source, page by page, under the page lock, refusing per file —
   // and re-count. Zero afterwards means the reconcile below runs in the
   // same phase; anything left halts exactly as before, with the refusals
-  // named. Runs only with disk access and never on a dry-run; the
-  // `GBRAIN_FACT_REPAIR=off` kill switch restores the pure halt without
-  // a deploy. Safety properties live in the writer's stamp mode
-  // (fence-write.ts); the caller is src/core/facts/fence-legacy.ts.
-  const repairEnabled = (opts.repairLegacy ?? opts.brainDir !== undefined) && !isFactRepairDisabled();
+  // named. Never runs on a dry-run; the `GBRAIN_FACT_REPAIR=off` kill
+  // switch restores the pure halt without a deploy. The repair resolves its
+  // files from `sources.local_path`, so it needs no brainDir — every entry
+  // point (cycle, maintenance sweep, a direct call) gets it by default.
+  // Safety properties live in the writer's stamp mode (fence-write.ts); the
+  // caller is src/core/facts/fence-legacy.ts.
+  const repairEnabled = (opts.repairLegacy ?? true) && !isFactRepairDisabled();
   // The repair also runs when the guard is NOT armed but a page still carries
   // forgotten never-fenced rows (review finding 3): a crashed run's residue on
   // such a page would otherwise be imported by the next sync and re-inserted
   // by the reconcile below, with no eligible row left to bring the repair back.
-  const residuePagesPending = repairEnabled && !opts.dryRun && legacyCount === 0
-    ? (await listResidueOnlyPagesForSource(engine, sourceId)).length > 0
-    : false;
+  // Listed whether or not the repair is enabled: with it off, those pages are
+  // blocked from the reconcile below instead of swept.
+  const residuePages = !opts.dryRun && legacyCount === 0
+    ? await listResidueOnlyPagesForSource(engine, sourceId)
+    : [];
+  const residuePagesPending = residuePages.length > 0;
   // Residue-only pages the sweep could not prove safe (file still carrying
   // uncommitted fence rows that are not exactly a crashed repair's, or a cache
   // not yet back to the file's body): the reconcile below leaves them alone,
@@ -562,6 +575,20 @@ export async function runExtractFacts(
       // to block".
       repairFailure = e instanceof Error ? e.message : String(e);
     }
+  } else if (residuePagesPending && !opts.dryRun) {
+    // The repair is off (`repairLegacy: false` or GBRAIN_FACT_REPAIR=off)
+    // and pages carry forgotten never-fenced rows. Nothing has proven their
+    // files or cache free of a crashed repair's fence rows, so the reconcile
+    // leaves every one of them alone — fail closed, named, never reconciled
+    // unprotected (2026-09-14 acceptance round 6). With the guard armed the
+    // phase halts below before any reconcile, as it always did.
+    for (const slug of residuePages) blockedResidueSlugs.add(slug);
+    result.warnings.push(
+      `extract_facts: FACTS_RESIDUE_UNSWEPT: ${residuePages.length} page(s) in source "${sourceId}" carry forgotten ` +
+      `never-fenced rows and the legacy repair is disabled (repairLegacy: false or GBRAIN_FACT_REPAIR=off), so their ` +
+      `files cannot be proven free of a crashed repair's fence rows; their fact reconciliation is skipped until the ` +
+      `repair is enabled: ${residuePages.slice(0, 10).join(' | ')}`,
+    );
   }
 
   if (repairFailure !== undefined) {

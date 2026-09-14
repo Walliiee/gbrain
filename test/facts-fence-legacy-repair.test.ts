@@ -2063,6 +2063,161 @@ describe('acceptance round 5 (2026-09-14) — only a PROVEN clean file reads as 
   });
 });
 
+describe('acceptance round 6 (2026-09-14) — clean is a byte proof against HEAD, and no entry point reconciles unprotected', () => {
+  // P1 (reviewer, reproduced by the parent with plain git): the sweep's
+  // `proven()` read "empty `git status` + tracked at HEAD" as clean and never
+  // compared the file's bytes to the committed blob. `git update-index
+  // --assume-unchanged` and `--skip-worktree` keep status EMPTY for a tracked
+  // path whose working bytes differ, so a residue-carrying file was called
+  // clean, the sweep supplied no block, and the forgotten claim came back.
+  // The proof is now content-based (`gitCleanAtHead`: `git hash-object
+  // <file>` must equal the blob at `HEAD:./<file>`); status is only the
+  // pre-filter. Bytes that differ behind an empty status are the file's own
+  // dirt and go to the recognizer, which heals exactly a crashed run's
+  // appends and refuses anything else. The stamp path uses the same proof.
+  // P1: a direct `runExtractFacts` with neither `brainDir` nor `repairLegacy`
+  // reconciled unprotected — the repair now defaults on for every caller, and
+  // an explicit opt-out BLOCKS residue candidates instead of reconciling them.
+  const plantResidue = () => {
+    const body = upsertFactRow(ALICE_BODY, {
+      rowNum: 1, claim: 'Founded Acme', kind: 'fact', confidence: 0.9, visibility: 'private',
+      notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
+    }).body;
+    writeFileSync(join(repo, ALICE_MD), body, 'utf-8');
+    return body;
+  };
+  const noActiveCopy = async () => {
+    const rows = await factRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.expired_at).not.toBeNull();
+    expect(rows[0]!.row_num).toBeNull();
+  };
+  /** Residue planted, its only row forgotten, the residue already synced into the cache: the worst ordering. */
+  const forgottenResidueInCache = async (): Promise<string> => {
+    const a = await seed('Founded Acme');
+    const body = plantResidue();
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'forgotten after the crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    await syncBody();
+    expect((await dbFence()).facts).toHaveLength(1);
+    return body;
+  };
+  const statusIsEmpty = () =>
+    expect(git(repo, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ALICE_MD)).toBe('');
+  const headBlob = () => git(repo, 'show', `HEAD:./${ALICE_MD}`);
+
+  for (const flag of ['--assume-unchanged', '--skip-worktree'] as const) {
+    test(`P1: ${flag} hides a crashed repair's residue from git status — the sweep proves the bytes against HEAD anyway, heals, and the reconcile inserts nothing`, async () => {
+      const residue = await forgottenResidueInCache();
+      git(repo, 'update-index', flag, '--', ALICE_MD);
+      statusIsEmpty();                                                          // the misleading shape, verbatim
+      expect(git(repo, 'ls-files', '--error-unmatch', '--', ALICE_MD).trim()).toBe(ALICE_MD);
+      expect(headBlob()).toBe(ALICE_BODY);
+      expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);        // ...while the disk differs from HEAD
+      const r = await reconcile();
+      expect(r.factsInserted).toBe(0);
+      expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1, residuePagesBlocked: [] });
+      expect(r.warnings).toContainEqual(expect.stringContaining('restored the committed preimage'));
+      expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+      expect((await dbFence()).facts).toEqual([]);
+      await noActiveCopy();
+      // The index bit is the operator's and stays; the file simply IS HEAD now.
+      const r2 = await reconcile();
+      expect(r2.factsInserted).toBe(0);
+      expect(r2.legacyRepair).toBeUndefined();
+      await noActiveCopy();
+    });
+  }
+
+  test('P1: bytes that differ from HEAD behind an empty status but are NOT residue (a human paragraph under --assume-unchanged) are blocked not_residue, every byte kept, nothing inserted', async () => {
+    const a = await seed('Founded Acme');
+    const theirs = plantResidue() + '\nA paragraph a human added.\n';
+    writeFileSync(join(repo, ALICE_MD), theirs, 'utf-8');
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'forgotten after the crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    await syncBody();
+    git(repo, 'update-index', '--assume-unchanged', '--', ALICE_MD);
+    statusIsEmpty();
+    const r = await reconcile();
+    expect(r.factsInserted).toBe(0);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: undefined }]);
+    expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
+    await noActiveCopy();
+  });
+
+  test('P1 (stamp path, same proof): an --assume-unchanged file carrying an uncommitted human edit is refused file_uncommitted — never stamped over', async () => {
+    await seed('Founded Acme');
+    const theirs = ALICE_BODY + '\nA paragraph a human added but never committed.\n';
+    writeFileSync(join(repo, ALICE_MD), theirs, 'utf-8');
+    await syncBody();                                                            // a sync imported the working tree, as production does
+    git(repo, 'update-index', '--assume-unchanged', '--', ALICE_MD);
+    statusIsEmpty();
+    const s = await run();
+    expect(s.rowsStamped).toBe(0);
+    expect(s.skippedByReason.file_uncommitted).toBe(1);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
+    expect(headBlob()).toBe(ALICE_BODY);
+    expect((await factRows())[0]!.row_num).toBeNull();
+  });
+
+  test('control: a tracked file whose bytes ARE the committed blob is clean, even with --assume-unchanged set — nothing to heal, nothing blocked, quiet run', async () => {
+    const a = await seed('Founded Acme');
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'plain forget' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    git(repo, 'update-index', '--assume-unchanged', '--', ALICE_MD);
+    const r = await reconcile();
+    expect(r.factsInserted).toBe(0);
+    expect(r.legacyRepair).toBeUndefined();
+    expect(r.warnings.filter(w => w.includes('RESIDUE'))).toEqual([]);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+  });
+
+  test('P1: the headless entry point — a direct runExtractFacts with neither brainDir nor repairLegacy — is protected: the residue sweep runs, restores the preimage, nothing is inserted', async () => {
+    await forgottenResidueInCache();
+    const r = await withEnv({ GBRAIN_HOME: home }, () => runExtractFacts(engine, { sourceId: SRC, slugs: [ALICE] }));
+    expect(r.guardTriggered).toBe(false);
+    expect(r.factsInserted).toBe(0);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1 });
+    expect(r.warnings).toContainEqual(expect.stringContaining('restored the committed preimage'));
+    expect(r.phantomsScanned).toBe(0);                                          // brainDir still gates only the phantom pass
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect((await dbFence()).facts).toEqual([]);
+    await noActiveCopy();
+  });
+
+  const optedOut = (label: string, extra: Record<string, unknown>, env: Record<string, string>) =>
+    test(`P1: with the repair opted out (${label}) a residue-only page is BLOCKED from the reconcile (FACTS_RESIDUE_UNSWEPT) — never reconciled unprotected; the next enabled run heals it`, async () => {
+      const residue = await forgottenResidueInCache();
+      const r = await withEnv({ GBRAIN_HOME: home, ...env }, () =>
+        runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE], ...extra }));
+      expect(r.guardTriggered).toBe(false);
+      expect(r.factsInserted).toBe(0);
+      expect(r.legacyRepair).toBeUndefined();                                   // the opt-out ran nothing
+      expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNSWEPT'));
+      expect(r.warnings).toContainEqual(expect.stringContaining(ALICE));
+      expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);        // and wrote nothing
+      expect((await dbFence()).facts).toHaveLength(1);
+      await noActiveCopy();
+      const r2 = await reconcile();
+      expect(r2.factsInserted).toBe(0);
+      expect(r2.legacyRepair).toMatchObject({ residuePagesHealed: 1 });
+      expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+      await noActiveCopy();
+    });
+  optedOut('repairLegacy: false', { repairLegacy: false }, {});
+  optedOut('GBRAIN_FACT_REPAIR=off', {}, { GBRAIN_FACT_REPAIR: 'off' });
+
+  test('opt-out with the guard armed still halts before any reconcile (unchanged): legacy rows pending, nothing written, no residue warning needed', async () => {
+    await seed('Founded Acme');
+    const r = await withEnv({ GBRAIN_HOME: home }, () =>
+      runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE], repairLegacy: false }));
+    expect(r.guardTriggered).toBe(true);
+    expect(r.legacyRowsPending).toBe(1);
+    expect(r.factsInserted).toBe(0);
+    expect(r.warnings.filter(w => w.includes('FACTS_RESIDUE_UNSWEPT'))).toEqual([]);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+  });
+});
+
 describe('acceptance round 3 (2026-09-14) — calendar days are the UTC day the API wrote, whatever the DB session zone', () => {
   // The normal input path: the fence mapper / `remember` bind UTC-midnight
   // Dates. Rendering the SESSION's day (the 2d5c08f90 form) shifts these back

@@ -156,12 +156,14 @@ describe('runMaintenanceSweep — facts-fence reconciliation [CX2-4]', () => {
 
 describe('runMaintenanceSweep — the fence pass carries the cycle\'s residue protection for a source with a local_path', () => {
   // Codex acceptance round 4, P1: the extractor's legacy repair + residue-only
-  // sweep are gated on `repairLegacy ?? brainDir !== undefined`, and the sweep
-  // passed neither — so a page the cycle had just halted on (a crashed
+  // sweep were gated on `repairLegacy ?? brainDir !== undefined`, and the
+  // sweep passed neither — so a page the cycle had just halted on (a crashed
   // repair's fence rows still in the file and the cache, their DB row since
   // forgotten) was reconciled by the next idle sweep and the forgotten claim
-  // re-inserted. The sweep now resolves `sources.local_path` and enables the
-  // repair for a source that has one.
+  // re-inserted. Round 4 opted the sweep in explicitly; round 6 (2026-09-14)
+  // made the repair the default for EVERY caller (it resolves files from
+  // `sources.local_path`, never from brainDir), so the sweep no longer opts
+  // in and these tests pin that the default alone protects it.
   const SRC = 'wiki';
   const ALICE = 'people/alice';
   const ALICE_MD = 'people/alice.md';

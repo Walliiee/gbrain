@@ -282,6 +282,62 @@ function gitHeadBlob(repoPath: string, filePath: string): string | null {
   return null;
 }
 
+/**
+ * The POSITIVE proof that the working file IS its committed preimage: the
+ * bytes on disk hash (`git hash-object`, attributes applied exactly as `git
+ * add` would) to the blob HEAD holds for the path. An empty `git status` is
+ * not that proof — `update-index --assume-unchanged` and `--skip-worktree`
+ * make status (and `git diff`) report NOTHING for a tracked path whose
+ * working bytes differ, and every status-based proof read such a file,
+ * residue and all, as clean. Only a hash match is `clean`; `differs` is a
+ * tracked file whose bytes are something else; the other values are
+ * `gitTrackedAtHead`'s own reasons there is no preimage to prove against,
+ * or `unknown` when git could not be asked at some step (never clean).
+ */
+type FactFenceCleanProof = 'clean' | 'differs' | Exclude<FactFenceTrackedState, 'tracked'>;
+
+function gitCleanAtHead(repoPath: string, filePath: string): FactFenceCleanProof {
+  const tracked = gitTrackedAtHead(repoPath, filePath);
+  if (tracked !== 'tracked') return tracked;
+  const rel = relative(repoPath, filePath);
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return 'unknown';
+  let headOid: string | null = null;
+  for (const form of pathspecForms(rel)) {
+    try {
+      headOid = execFileSync('git', ['-C', repoPath, 'rev-parse', '--verify', '-q', `HEAD:./${form.replaceAll('\\', '/')}`], GIT_OPTS).trim();
+      break;
+    } catch {
+      // not under this form; try the next
+    }
+  }
+  if (!headOid) return 'unknown';
+  try {
+    const workOid = execFileSync('git', ['-C', repoPath, 'hash-object', '--', rel], GIT_OPTS).trim();
+    return workOid === headOid ? 'clean' : 'differs';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * Per-FILE git state for the stamp path and the residue-only sweep: `git
+ * status` is only the cheap pre-filter (it still names foreign dirt — an
+ * unmerged or renamed entry — and self-dirt the recognizer should look at);
+ * an empty status is then PROVEN with `gitCleanAtHead`, so `clean` means the
+ * working bytes are the committed blob and nothing else. A tracked file whose
+ * bytes differ while status is empty is the file's own uncommitted change
+ * (`self_dirty`), handed to the recognizer like any other self-dirt: healed
+ * only when it is exactly a crashed run's appends, refused otherwise.
+ */
+type FactFenceFileProof = FactFenceGitPathState | Exclude<FactFenceTrackedState, 'tracked'>;
+
+function provenFileState(repoPath: string, filePath: string): FactFenceFileProof {
+  const state = gitPathState(repoPath, filePath);
+  if (state !== 'clean') return state;
+  const proof = gitCleanAtHead(repoPath, filePath);
+  return proof === 'differs' ? 'self_dirty' : proof;
+}
+
 async function commitFactFenceFile(
   repoPath: string,
   filePath: string,
@@ -1084,10 +1140,11 @@ async function residueCacheIsFile(
 }
 
 /**
- * `clean` is PROVEN: the file is tracked with a blob at HEAD and its status is
- * empty. `error` (lock not acquired, a throw mid-sweep, or a git state that
- * could not be read at all) leaves the page's state unknown; `skipped` means
- * the sweep never looked (write-through off, target unresolvable, file
+ * `clean` is PROVEN: the file is tracked with a blob at HEAD and its working
+ * bytes hash to that blob (`provenFileState`) — never inferred from an empty
+ * status alone. `error` (lock not acquired, a throw mid-sweep, or a git state
+ * that could not be read at all) leaves the page's state unknown; `skipped`
+ * means the sweep never looked (write-through off, target unresolvable, file
  * missing or a symlink). The caller blocks the reconcile on `not_residue`,
  * `cache_unsafe` and `error`.
  */
@@ -1100,13 +1157,17 @@ export type ResidueSweepOutcome = ResidueHealOutcome | 'clean' | 'skipped' | 'er
  * would import the uncommitted residue and the reconcile would re-insert the
  * forgotten claims. Same lock, same target resolution, same recognizer as the
  * stamp path; a clean file or an unresolvable target is a no-op. Only a
- * PROVEN clean file reads as clean — empty status on a file git holds at
- * HEAD. Uncommitted change the parse cannot attribute to the file
- * (`foreign_dirty`), or an empty status on a file with no committed preimage
- * (an ignored path — the shape a source nested in an unrelated repo yields),
- * is handed back `not_residue`; a git that could not be asked (`unknown`, a
- * directory that is not a repository) is `error`. None of those proves the
- * file free of a crashed run's appends. Never throws.
+ * PROVEN clean file reads as clean — a file git holds at HEAD whose working
+ * bytes hash to that blob (`provenFileState`); an empty status is the
+ * pre-filter, not the proof, because `--assume-unchanged` / `--skip-worktree`
+ * keep status empty over changed bytes. Bytes that differ behind an empty
+ * status are the file's own dirt and go to the recognizer, which heals only
+ * a crashed run's exact appends. Uncommitted change the parse cannot
+ * attribute to the file (`foreign_dirty`), or an empty status on a file with
+ * no committed preimage (an ignored path — the shape a source nested in an
+ * unrelated repo yields), is handed back `not_residue`; a git that could not
+ * be asked (`unknown`, a directory that is not a repository) is `error`.
+ * None of those proves the file free of a crashed run's appends. Never throws.
  */
 export async function healResidueOnlyPage(
   engine: BrainEngine,
@@ -1119,13 +1180,15 @@ export async function healResidueOnlyPage(
     state === 'unknown'
       ? { slug, outcome: 'error', detail: 'git state unknown: not a git repository, or git could not be run' }
       : { slug, outcome: 'not_residue', detail: `${state}: ${why}` };
-  // `self_dirty` → recognise; a verdict otherwise.
+  // `self_dirty` → recognise (status-reported dirt, or bytes that differ
+  // from HEAD behind an empty status); a verdict otherwise.
   const proven = (writeRoot: string, filePath: string): 'self_dirty' | Verdict => {
-    const state = gitPathState(writeRoot, filePath);
+    const state = provenFileState(writeRoot, filePath);
     if (state === 'self_dirty') return state;
-    if (state !== 'clean') return unproven(state, 'uncommitted changes the sweep cannot attribute to this repair');
-    const tracked = gitTrackedAtHead(writeRoot, filePath);
-    return tracked === 'tracked' ? { slug, outcome: 'clean' } : unproven(tracked, 'no committed preimage to prove the file against');
+    if (state === 'clean') return { slug, outcome: 'clean' };
+    return unproven(state, state === 'foreign_dirty'
+      ? 'uncommitted changes the sweep cannot attribute to this repair'
+      : 'no committed preimage to prove the file against');
   };
   try {
     if (await isWriteThroughDisabled(engine)) return { slug, outcome: 'skipped', detail: 'write_through_disabled' };
@@ -1224,23 +1287,24 @@ async function stampLegacyFactsToFenceUnguarded(
     try { st = lstatSync(filePath); } catch { return skip(slug, 'file_missing', filePath); }
     if (st.isSymbolicLink() || !st.isFile()) return skip(slug, 'symlink', filePath);
 
-    // Per-FILE git state (the writer's own rule), then a committed preimage:
-    // empty status alone also describes ignored and untracked files.
-    let gitState = gitPathState(writeRoot, filePath);
+    // Per-FILE git state (the writer's own rule), PROVEN: a committed
+    // preimage exists and the working bytes are it. Empty status alone also
+    // describes ignored and untracked files, and an assume-unchanged /
+    // skip-worktree file whose bytes differ — the latter is the file's own
+    // uncommitted change and is refused like any other, never stamped over.
+    let gitState = provenFileState(writeRoot, filePath);
     let healedResidue = false;
     if (gitState === 'self_dirty' && locked) {
       // `cache_unsafe` restored the file too; the stamp transaction's own
       // DB-body-is-the-file check (`verify_failed`) then decides.
       if (await healCrashResidue(engine, sourceId, slug, writeRoot, filePath) !== 'not_residue') {
         healedResidue = true;
-        gitState = gitPathState(writeRoot, filePath);
+        gitState = provenFileState(writeRoot, filePath);
       }
     }
     if (gitState === 'self_dirty') return skip(slug, 'file_uncommitted', filePath);
+    if (gitState === 'untracked' || gitState === 'not_at_head') return skip(slug, 'file_uncommitted', `${gitState}: ${filePath}`);
     if (gitState !== 'clean') return skip(slug, 'foreign_dirty', `${gitState}: ${filePath}`);
-    const tracked = gitTrackedAtHead(writeRoot, filePath);
-    if (tracked === 'untracked' || tracked === 'not_at_head') return skip(slug, 'file_uncommitted', `${tracked}: ${filePath}`);
-    if (tracked !== 'tracked') return skip(slug, 'foreign_dirty', `${tracked}: ${filePath}`);
 
     const preBody = readFileSync(filePath, 'utf-8');
     const pre = parseFactsFence(preBody);
@@ -1461,7 +1525,10 @@ async function stampLegacyFactsToFenceUnguarded(
       let committed = false;
       if (fileChanges && isDurabilityHardened(writeRoot)) {
         await commitFactFenceFile(writeRoot, filePath, slug, sourceId, 'clean');
-        committed = gitPathState(writeRoot, filePath) === 'clean';
+        // Reported durable only when HEAD now holds the written bytes — an
+        // empty status would also follow a commit that never included the
+        // file (a skip-worktree path refuses `git add`).
+        committed = provenFileState(writeRoot, filePath) === 'clean';
       }
       return {
         slug, status: 'stamped', stamped: stampedCount, appended, rewritten, committed,
