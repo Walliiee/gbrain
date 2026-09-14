@@ -567,12 +567,18 @@ const put_page: Operation = {
     // thrown write error, or a guard that REFUSED to write into an existing
     // repo (missing dir, sibling-source collision, escaped path, case-fold
     // clash, unreadable row) — means a file was supposed to exist and
-    // doesn't, so put_page must not report success.
+    // doesn't, so put_page must not report success. `page_lock_timeout` is
+    // the one transient outcome: another writer (fence writer, forget,
+    // legacy-fact stamp, destructive reconcile) held the page lock for the
+    // whole wait. The DB row is durable and the file is reconciled by the
+    // next write-through or sync; failing (and rolling back) the save because
+    // a reconcile happened to hold the lock would lose the caller's content.
     if (writeThrough && !writeThrough.written
       && writeThrough.skipped !== 'no_repo_configured'
       && writeThrough.skipped !== 'disabled_by_config'
       && writeThrough.skipped !== 'subagent_sandbox'
-      && writeThrough.skipped !== 'dry_run') {
+      && writeThrough.skipped !== 'dry_run'
+      && writeThrough.skipped !== 'page_lock_timeout') {
       // Roll back rather than leave an index-only orphan, but only when this
       // call is what created the row: created_at === updated_at is set by
       // the SAME insert statement (the ON CONFLICT UPDATE branch never

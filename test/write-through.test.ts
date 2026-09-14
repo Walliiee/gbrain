@@ -21,6 +21,9 @@ import {
 import { importFromContent } from '../src/core/import-file.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from '../src/core/markdown.ts';
 import { operations, type OperationContext } from '../src/core/operations.ts';
+import { acquirePageLock } from '../src/core/page-lock.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { createHash } from 'node:crypto';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -722,4 +725,77 @@ describe('delete_page / restore_page write-through symmetry (#4022)', () => {
     expect(rest.status).toBe('restored');
     expect(rest.write_through?.skipped).toBe('subagent_sandbox');
   });
+});
+
+describe('writePageThrough — page lock (2026-09-14 review finding 1)', () => {
+  const lockHome = () => path.join(tmpRoot, 'home');
+  const lockFileFor = (slug: string) =>
+    path.join(lockHome(), '.gbrain', 'page-locks', `${createHash('sha256').update(slug).digest('hex')}.lock`);
+
+  test('a held page lock degrades to skipped: page_lock_timeout — no throw, file untouched, DB row intact', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'people/locked';
+    await seedPage(slug);
+    const first = await withEnv({ GBRAIN_HOME: lockHome() }, () => writePageThrough(engine, slug, { sourceId: 'default' }));
+    expect(first.written).toBe(true);
+    const before = fs.readFileSync(first.path!, 'utf8');
+    await engine.putPage(slug, { type: 'note', title: 'T', compiled_truth: '# changed', timeline: '' } as any, { sourceId: 'default' });
+
+    const holder = await withEnv({ GBRAIN_HOME: lockHome() }, () => acquirePageLock(slug));
+    expect(holder).not.toBeNull();
+    try {
+      const t0 = Date.now();
+      const res = await withEnv({ GBRAIN_HOME: lockHome() }, () => writePageThrough(engine, slug, { sourceId: 'default' }));
+      expect(res).toEqual({ written: false, skipped: 'page_lock_timeout' });
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(4_500);
+      expect(fs.readFileSync(first.path!, 'utf8')).toBe(before);
+      expect((await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth).toBe('# changed');
+    } finally {
+      await holder!.release();
+    }
+    // Once released, the same write lands and the lock is released again after it.
+    const after = await withEnv({ GBRAIN_HOME: lockHome() }, () => writePageThrough(engine, slug, { sourceId: 'default' }));
+    expect(after.written).toBe(true);
+    expect(fs.readFileSync(after.path!, 'utf8')).toContain('# changed');
+    expect(fs.existsSync(lockFileFor(slug))).toBe(false);
+  }, 20_000);
+
+  test('holdsPageLock: true skips acquisition (re-entrant callers do not deadlock against themselves)', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'people/reentrant';
+    await seedPage(slug);
+    const holder = await withEnv({ GBRAIN_HOME: lockHome() }, () => acquirePageLock(slug));
+    try {
+      const res = await withEnv({ GBRAIN_HOME: lockHome() }, () =>
+        writePageThrough(engine, slug, { sourceId: 'default', holdsPageLock: true }));
+      expect(res.written).toBe(true);
+      // The caller's lock is still theirs: not released by the write.
+      expect(fs.existsSync(lockFileFor(slug))).toBe(true);
+    } finally {
+      await holder!.release();
+    }
+  });
+
+  test('put_page does not fail or roll back on page_lock_timeout', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const put_page = operations.find((o) => o.name === 'put_page')!;
+    const ctx = {
+      engine: engine as any,
+      config: { engine: 'pglite' } as any,
+      logger: { info() {}, warn() {}, error() {} },
+      dryRun: false, remote: false, sourceId: 'default',
+    } as OperationContext;
+    const slug = 'people/locked-put';
+    const holder = await withEnv({ GBRAIN_HOME: lockHome() }, () => acquirePageLock(slug));
+    try {
+      const res = await withEnv({ GBRAIN_HOME: lockHome() }, () =>
+        put_page.handler(ctx, { slug, content: '---\ntitle: T\ntype: note\n---\n\n# New\n' })) as Record<string, any>;
+      expect(res.status).toBe('created_or_updated');
+      expect(res.write_through).toEqual({ written: false, skipped: 'page_lock_timeout' });
+      expect(await engine.getPage(slug, { sourceId: 'default' })).not.toBeNull();
+      expect(fs.existsSync(path.join(brainDir, `${slug}.md`))).toBe(false);
+    } finally {
+      await holder!.release();
+    }
+  }, 20_000);
 });
