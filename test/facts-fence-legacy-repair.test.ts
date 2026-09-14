@@ -1654,6 +1654,184 @@ describe('acceptance round 3 (2026-09-14) — recovery never overwrites a concur
   });
 });
 
+describe('acceptance round 4 (2026-09-14) — a repair that cannot complete fails closed: no reconcile, nothing resurrected, every block kept', () => {
+  // Codex acceptance round 3, P1: a repair-wide query failure (listing the
+  // eligible rows, listing the residue-only pages, or the final recount) was
+  // caught and read as "nothing to block". With the source's only legacy row
+  // already forgotten, legacyCount stayed 0, blockedResidueSlugs stayed empty,
+  // and the reconcile re-inserted the forgotten claim from the crashed
+  // repair's residue on disk and in the cache. A failed recount even discarded
+  // a `not_residue` block it had already collected. These pin the fix: the
+  // repair returns its partial summary with `failure` set, the phase halts
+  // BEFORE the reconcile (guardTriggered + repairFailed), and the next run
+  // retries.
+  const noActiveCopy = async () => {
+    const rows = await factRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.expired_at).not.toBeNull();
+    expect(rows[0]!.row_num).toBeNull();
+  };
+  /**
+   * Residue as the real writer leaves it: the run dies after the rename and
+   * before COMMIT, cannot verify (indeterminate, so the fenced file stays),
+   * then the sole row is forgotten and a sync imports the file into the cache.
+   */
+  async function forgottenResidueFromRealWriter(humanNote = ''): Promise<string> {
+    const a = await seed('Founded Acme');
+    const crashed = await run({
+      beforeCommit: () => { throw new Error('crash before COMMIT'); },
+      beforeVerifyLanded: () => { throw new Error('verification unavailable'); },
+    });
+    expect(crashed.rowsStamped).toBe(0);
+    expect(diskFence().facts).toHaveLength(1);
+    if (humanNote) writeFileSync(join(repo, ALICE_MD), readFileSync(join(repo, ALICE_MD), 'utf-8') + humanNote, 'utf-8');
+    expect(await forgetFactInFence(engine, Number(a), { reason: 'forget after crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
+    await syncBody();
+    expect(await countLegacyRowsForSource(engine, SRC)).toBe(0);                // the guard does not arm
+    expect((await dbFence()).facts).toHaveLength(1);                            // the cache carries the residue too
+    return readFileSync(join(repo, ALICE_MD), 'utf-8');
+  }
+  /** Throw once from the `nth` executeRaw whose SQL contains `needle`; everything else passes through. */
+  function failOnce(needle: string, nth = 1) {
+    const raw = engine.executeRaw;
+    const state = { seen: 0, injected: false, restore: () => { engine.executeRaw = raw; } };
+    engine.executeRaw = (async function (this: PGLiteEngine, ...args: Parameters<typeof raw>) {
+      if (String(args[0]).includes(needle) && !state.injected && ++state.seen === nth) {
+        state.injected = true;
+        throw new Error(`one-shot ${needle.slice(0, 24)}`);
+      }
+      return raw.apply(this, args);
+    }) as typeof raw;
+    return state;
+  }
+  const haltedRollup = async () => (await engine.executeRaw<{ halt_count: number; round_completed_count: number }>(
+    `SELECT halt_count, round_completed_count FROM extract_rollup_7d WHERE kind = 'facts.fence' AND source_id = $1`, [SRC],
+  ))[0];
+
+  async function expectFailedClosed(r: Awaited<ReturnType<typeof reconcile>>, step: string, residue: string) {
+    expect(r.guardTriggered).toBe(true);
+    expect(r.repairFailed).toContain(step);
+    expect(r.legacyRepair?.failure).toContain(step);
+    expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_REPAIR_INCOMPLETE'));
+    expect(r.warnings).not.toContainEqual(expect.stringContaining('legacy repair failed'));
+    expect(r.factsInserted).toBe(0);
+    expect(r.factsDeleted).toBe(0);
+    expect(r.pagesScanned).toBe(0);                                               // the reconcile never started
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);          // untouched, not restored
+    expect((await dbFence()).facts).toHaveLength(1);
+    await noActiveCopy();
+    expect(await haltedRollup()).toMatchObject({ halt_count: 1, round_completed_count: 0 });
+  }
+
+  test('the initial legacy-list query fails once: halted before the reconcile, no active copy; the next run heals', async () => {
+    const residue = await forgottenResidueFromRealWriter();
+    const seam = failOnce('SELECT f.id::text AS id, f.source_id');
+    let r;
+    try { r = await reconcile(); } finally { seam.restore(); }
+    expect(seam.injected).toBe(true);
+    await expectFailedClosed(r, 'listing eligible legacy rows', residue);
+    expect(r.legacyRepair).toMatchObject({ rowsEligible: 0, residuePagesChecked: 0, residuePagesBlocked: [] });
+    // Next run, no failure: the sweep restores the preimage and nothing is inserted.
+    const r2 = await reconcile();
+    expect(r2.guardTriggered).toBe(false);
+    expect(r2.repairFailed).toBeUndefined();
+    expect(r2.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1, residuePagesBlocked: [] });
+    expect(r2.factsInserted).toBe(0);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect((await dbFence()).facts).toEqual([]);
+    await noActiveCopy();
+  });
+
+  test('the sweep\'s residue-list query fails once (the guard\'s own pre-check passed): halted, no active copy; the next run heals', async () => {
+    const residue = await forgottenResidueFromRealWriter();
+    const seam = failOnce('SELECT DISTINCT f.entity_slug', 2);                    // 1st: residuePagesPending; 2nd: the sweep
+    let r;
+    try { r = await reconcile(); } finally { seam.restore(); }
+    expect(seam.injected).toBe(true);
+    expect(seam.seen).toBe(2);
+    await expectFailedClosed(r, 'listing residue-only pages', residue);
+    const r2 = await reconcile();
+    expect(r2.guardTriggered).toBe(false);
+    expect(r2.legacyRepair).toMatchObject({ residuePagesHealed: 1 });
+    expect(r2.factsInserted).toBe(0);
+    expect((await dbFence()).facts).toEqual([]);
+    await noActiveCopy();
+  });
+
+  test('the final recount fails after a human-edit refusal: the not_residue block already collected is KEPT, halted, the human\'s file untouched', async () => {
+    const residue = await forgottenResidueFromRealWriter('\nHuman note, preserve this.\n');
+    const seam = failOnce('SELECT COUNT(*) AS n FROM facts f');                   // the recount's one-line form; the guard's COUNT is multi-line
+    let r;
+    try { r = await reconcile(); } finally { seam.restore(); }
+    expect(seam.injected).toBe(true);
+    await expectFailedClosed(r, 're-counting eligible legacy rows', residue);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: undefined }]);
+    expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toContain('Human note, preserve this.');
+    // Next run, no failure: still blocked (the human's edit is not residue), still nothing inserted.
+    const r2 = await reconcile();
+    expect(r2.guardTriggered).toBe(false);
+    expect(r2.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: undefined }]);
+    expect(r2.factsInserted).toBe(0);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
+    await noActiveCopy();
+  });
+
+  test('a recount failure AFTER stamps landed keeps the stamp counters: the halt reports what was fenced, nothing is reconciled, the next run is quiet', async () => {
+    await seed('Founded Acme');
+    await seed('Prefers async');
+    const seam = failOnce('SELECT COUNT(*) AS n FROM facts f');
+    let r;
+    try { r = await reconcile(); } finally { seam.restore(); }
+    expect(seam.injected).toBe(true);
+    expect(r.guardTriggered).toBe(true);
+    expect(r.repairFailed).toContain('re-counting eligible legacy rows');
+    expect(r.legacyRowsRepaired).toBe(2);
+    expect(r.legacyRepair).toMatchObject({ rowsEligible: 2, rowsStamped: 2, pagesFenced: 1, failure: expect.stringContaining('re-counting') });
+    expect(r.legacyRowsPending).toBe(2);                                          // the pre-repair count stands: not a fresh recount
+    expect(r.factsInserted).toBe(0);
+    expect((await factRows()).map(x => x.row_num).sort()).toEqual([1, 2]);        // the stamps are real
+    expect(diskFence().facts.map(f => f.claim)).toEqual(['Founded Acme', 'Prefers async']);
+    const r2 = await reconcile();
+    expect(r2.guardTriggered).toBe(false);
+    expect(r2.legacyRepair).toBeUndefined();
+    expect(r2.factsInserted).toBe(0);
+    expect((await factRows()).map(x => x.row_num).sort()).toEqual([1, 2]);
+  });
+
+  test('repairLegacyRowsForSource never throws: each repair-wide query failure returns the partial summary with `failure` set', async () => {
+    await seed('Founded Acme');
+    let seam = failOnce('SELECT f.id::text AS id, f.source_id');
+    let s;
+    try { s = await run(); } finally { seam.restore(); }
+    expect(s).toMatchObject({ rowsEligible: 0, rowsStamped: 0, rowsRemaining: 0, failure: expect.stringContaining('listing eligible legacy rows') });
+    expect((await factRows())[0]!.row_num).toBeNull();
+
+    seam = failOnce('SELECT DISTINCT f.entity_slug');
+    try { s = await run(); } finally { seam.restore(); }
+    expect(s).toMatchObject({ rowsEligible: 1, rowsStamped: 1, pagesFenced: 1, failure: expect.stringContaining('listing residue-only pages') });
+    expect(s.rowsRemaining).toBe(0);                                              // never re-counted: the initial value, not a claim
+    expect((await factRows())[0]!.row_num).toBe(1);
+
+    // A completed pass carries no `failure`.
+    const s3 = await run();
+    expect(s3.failure).toBeUndefined();
+    expect(s3).toMatchObject({ rowsEligible: 0, rowsRemaining: 0 });
+  });
+
+  test('a dry-run never reaches the repair, so a failing query cannot halt it', async () => {
+    const residue = await forgottenResidueFromRealWriter();
+    const seam = failOnce('SELECT f.id::text AS id, f.source_id');
+    let r;
+    try { r = await reconcile({ dryRun: true }); } finally { seam.restore(); }
+    expect(seam.injected).toBe(false);
+    expect(r.guardTriggered).toBe(false);
+    expect(r.repairFailed).toBeUndefined();
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
+  });
+});
+
 describe('acceptance round 3 (2026-09-14) — calendar days are the UTC day the API wrote, whatever the DB session zone', () => {
   // The normal input path: the fence mapper / `remember` bind UTC-midnight
   // Dates. Rendering the SESSION's day (the 2d5c08f90 form) shifts these back

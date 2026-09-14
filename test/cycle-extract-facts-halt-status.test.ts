@@ -144,6 +144,60 @@ describe('extract_facts empty-fence guard → dead phase, not a warning', () => 
     expect(lines.some(l => l.includes('[Halted/FENCE_BACKFILL_PENDING]'))).toBe(true);
   });
 
+  test('2026-09-14: a repair that cannot complete halts the same way — status=fail, class=Halted, code=FACTS_REPAIR_INCOMPLETE, no drain advice, row untouched', async () => {
+    await seedLegacyRow();
+    // The repair's eligible-rows query throws once (a repair-wide failure).
+    // Pre-fix the throw was swallowed as "nothing to block" and the phase
+    // went on to reconcile; now it halts BEFORE the reconcile.
+    const raw = engine.executeRaw;
+    let injected = false;
+    engine.executeRaw = (async function (this: PGLiteEngine, ...args: Parameters<typeof raw>) {
+      if (!injected && String(args[0]).includes('SELECT f.id::text AS id, f.source_id')) {
+        injected = true;
+        throw new Error('one-shot legacy-list failure');
+      }
+      return raw.apply(this, args);
+    }) as typeof raw;
+    let report: CycleReport;
+    try {
+      report = await withEnv({ GBRAIN_HOME: gbrainHome }, () =>
+        runCycle(engine, { brainDir, sourceId: 'wiki', phases: ['extract_facts'] }));
+    } finally {
+      engine.executeRaw = raw;
+    }
+    expect(injected).toBe(true);
+
+    const xf = report.phases.find(p => p.phase === 'extract_facts');
+    expect(xf).toBeDefined();
+    expect(xf!.status).toBe('fail');
+    expect(xf!.details.halted).toBe(true);
+    expect(xf!.details.repair_failed).toContain('listing eligible legacy rows');
+    expect(xf!.summary).toContain('halted');
+    expect(xf!.summary).toContain('did not complete');
+    expect(xf!.error).toBeDefined();
+    expect(xf!.error!.class).toBe('Halted');
+    expect(xf!.error!.code).toBe('FACTS_REPAIR_INCOMPLETE');
+    expect(xf!.error!.message).toContain('"wiki"');
+    // Not the backfill halt: nothing is known to be pending, so the v0.32.2
+    // drain advice would be wrong here.
+    expect(xf!.error!.hint).not.toContain('apply-migrations');
+    expect(xf!.details.warnings).toContainEqual(expect.stringContaining('FACTS_REPAIR_INCOMPLETE'));
+    expect(['ok', 'clean']).not.toContain(report.status);
+
+    const lines = captureHuman(report);
+    expect(lines.some(l => l.includes('[Halted/FACTS_REPAIR_INCOMPLETE]'))).toBe(true);
+    expect(lines.filter(l => l.includes('✗')).some(l => l.includes('extract_facts'))).toBe(true);
+
+    // The legacy row is untouched: the repair never reached it and the
+    // reconcile never ran.
+    const rows = await engine.executeRaw<{ row_num: number | null; expired_at: unknown }>(
+      `SELECT row_num, expired_at FROM facts WHERE source_id = 'wiki'`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].row_num).toBeNull();
+    expect(rows[0].expired_at).toBeNull();
+  });
+
   test('control: with no legacy rows the phase is ok and carries no error', async () => {
     const report = await withEnv({ GBRAIN_HOME: gbrainHome }, () =>
       runCycle(engine, { brainDir, sourceId: 'wiki', phases: ['extract_facts'] }));

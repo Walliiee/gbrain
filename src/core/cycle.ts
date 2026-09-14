@@ -1489,18 +1489,28 @@ async function runPhaseExtractFacts(
     // carry makeErrorFromException classes) while rendering as `✗`. Cycle
     // status is 'partial' either way, so this fails the cycle no harder.
     if (result.guardTriggered) {
+      // 2026-09-14: the in-cycle repair could not complete (a repair-wide
+      // query threw), so the phase halted BEFORE reconciling rather than
+      // read the failure as "nothing to block". Nothing is known to be
+      // pending, so the drain advice below does not apply: the next run
+      // retries. Same dead-phase shape, its own code.
+      const failed = result.repairFailed;
       // A bare `apply-migrations --yes` no-ops once the v0.32.2 ledger
       // entry is complete; the retry marker is what re-runs Phase B.
-      const hint = `gbrain apply-migrations --force-retry 0.32.2 && gbrain apply-migrations --yes --source ${sourceId}`;
+      const hint = failed !== undefined
+        ? 're-run the cycle; if it persists, check DB connectivity (`gbrain doctor`)'
+        : `gbrain apply-migrations --force-retry 0.32.2 && gbrain apply-migrations --yes --source ${sourceId}`;
       return {
         phase: 'extract_facts',
         status: 'fail',
         duration_ms: 0,
-        summary: `extract_facts halted: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill` +
-          (result.legacyRepair ? ` (in-cycle repair stamped ${result.legacyRowsRepaired}, ${result.legacyRepair.pagesSkipped} page(s) refused)` : ''),
+        summary: failed !== undefined
+          ? `extract_facts halted: legacy repair did not complete in source "${sourceId}" (${failed.slice(0, 120)}); reconciliation skipped this run`
+          : `extract_facts halted: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill` +
+            (result.legacyRepair ? ` (in-cycle repair stamped ${result.legacyRowsRepaired}, ${result.legacyRepair.pagesSkipped} page(s) refused)` : ''),
         details: {
           halted: true,
-          legacyRowsPending: result.legacyRowsPending,
+          ...(failed !== undefined ? { repair_failed: failed } : { legacyRowsPending: result.legacyRowsPending }),
           legacy_rows_repaired: result.legacyRowsRepaired,
           legacy_repair: result.legacyRepair,
           hint,
@@ -1508,8 +1518,10 @@ async function runPhaseExtractFacts(
         },
         error: {
           class: 'Halted',
-          code: 'FENCE_BACKFILL_PENDING',
-          message: `phase did not run: ${result.legacyRowsPending} legacy v0.31 fact rows in source "${sourceId}" await the v0.32.2 fence backfill`,
+          code: failed !== undefined ? 'FACTS_REPAIR_INCOMPLETE' : 'FENCE_BACKFILL_PENDING',
+          message: failed !== undefined
+            ? `phase did not run: the legacy fact repair in source "${sourceId}" did not complete (${failed.slice(0, 200)})`
+            : `phase did not run: ${result.legacyRowsPending} legacy v0.31 fact rows in source "${sourceId}" await the v0.32.2 fence backfill`,
           hint,
         },
       };

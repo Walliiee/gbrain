@@ -91,6 +91,16 @@ export interface RepairLegacyRowsSummary {
    * reconcile skips these slugs; a later sync, commit or restore clears them.
    */
   residuePagesBlocked: Array<{ slug: string; reason: Exclude<ResidueSweepOutcome, 'healed' | 'clean' | 'skipped'> | 'unswept'; detail?: string }>;
+  /**
+   * Set when a repair-WIDE step threw — listing the eligible rows, listing the
+   * residue-only pages, or the final recount (the per-page writer calls never
+   * throw; they refuse per page). The summary is then PARTIAL: every counter
+   * and every block collected before the throw is kept, but no page the pass
+   * did not reach is proven safe, and `rowsRemaining` is NOT a fresh count.
+   * The caller must fail closed on it — a repair that could not complete is
+   * not a repair that found nothing to block (Codex acceptance round 3, P1).
+   */
+  failure?: string;
   dryRun: boolean;
   aborted: boolean;
 }
@@ -198,7 +208,9 @@ const DEFAULT_MAX_PAGES = 500;
  * Drain every eligible legacy row in `sourceId`, page by page, then sweep the
  * pages whose never-fenced rows have all been forgotten for a crashed run's
  * uncommitted residue. Never throws: a page the writer refuses is counted
- * under its reason and left for the guard to report. `rowsRemaining` is
+ * under its reason and left for the guard to report, and a repair-wide query
+ * that throws returns the partial summary with `failure` set — the caller
+ * fails closed on it, nothing collected so far is lost. `rowsRemaining` is
  * re-counted after the pass.
  */
 export async function repairLegacyRowsForSource(
@@ -214,7 +226,20 @@ export async function repairLegacyRowsForSource(
     dryRun, aborted: false,
   };
 
-  const rows = await listLegacyRowsForSource(engine, opts.sourceId);
+  // A repair-wide throw ends the pass with what was collected so far; the
+  // caller reads `failure`, never a counter, to decide that this pass proved
+  // nothing about the pages it did not reach.
+  const fail = (step: string, err: unknown): RepairLegacyRowsSummary => {
+    summary.failure = `${step}: ${err instanceof Error ? err.message : String(err)}`;
+    return summary;
+  };
+
+  let rows: LegacyFactRow[];
+  try {
+    rows = await listLegacyRowsForSource(engine, opts.sourceId);
+  } catch (err) {
+    return fail('listing eligible legacy rows', err);
+  }
   summary.rowsEligible = rows.length;
 
   const bySlug = new Map<string, LegacyFactRow[]>();
@@ -253,7 +278,13 @@ export async function repairLegacyRowsForSource(
   // one the cap left unvisited — is handed back blocked, never silently
   // left for the reconcile.
   if (!dryRun && !summary.aborted) {
-    const residuePages = await listResidueOnlyPagesForSource(engine, opts.sourceId);
+    let residuePages: string[];
+    try {
+      residuePages = await listResidueOnlyPagesForSource(engine, opts.sourceId);
+    } catch (err) {
+      // The stamp counters above stand; which pages carry residue is unknown.
+      return fail('listing residue-only pages', err);
+    }
     for (const slug of residuePages) {
       if (bySlug.has(slug)) continue;
       if (isAborted(opts.signal)) { summary.aborted = true; break; }
@@ -269,6 +300,18 @@ export async function repairLegacyRowsForSource(
     }
   }
 
-  summary.rowsRemaining = dryRun ? rows.length : await countLegacyRowsForSource(engine, opts.sourceId);
+  if (dryRun) {
+    summary.rowsRemaining = rows.length;
+    return summary;
+  }
+  try {
+    summary.rowsRemaining = await countLegacyRowsForSource(engine, opts.sourceId);
+  } catch (err) {
+    // Every block and counter collected above stays on the summary; only the
+    // fresh count is missing, and the caller must not treat its absence as
+    // zero. Pre-fix this throw discarded a `not_residue` block that had
+    // already been collected.
+    return fail('re-counting eligible legacy rows', err);
+  }
   return summary;
 }

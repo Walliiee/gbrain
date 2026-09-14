@@ -296,6 +296,15 @@ export interface ExtractFactsResult {
   legacyRowsRepaired: number;
   /** Full repair summary when the repair pass ran (guard armed, disk access, not dry-run). */
   legacyRepair?: RepairLegacyRowsSummary;
+  /**
+   * Set with `guardTriggered` when the repair could not complete (a
+   * repair-wide query threw or the repair itself threw): the phase halted
+   * BEFORE the reconcile, because a page the repair did not reach cannot be
+   * proven free of a crashed repair's fence rows. Distinct from the legacy-
+   * rows-pending halt: the drain advice there does not apply, the next run
+   * simply retries.
+   */
+  repairFailed?: string;
   warnings: string[];
   /** v0.35.5: phantom-redirect pre-pass counts. */
   phantomsScanned: number;
@@ -489,6 +498,16 @@ export async function runExtractFacts(
   // not yet back to the file's body): the reconcile below leaves them alone,
   // otherwise it would insert the forgotten rows from that file or cache.
   const blockedResidueSlugs = new Set<string>();
+  // A repair that could not complete proves nothing about the pages it did
+  // not reach. Codex acceptance round 3, P1: the catch below used to read a
+  // repair-wide throw as "nothing to block" — with the source's only legacy
+  // row already forgotten, legacyCount stayed 0, blockedResidueSlugs stayed
+  // empty, the reconcile ran, and the forgotten claim was re-inserted from
+  // the crashed repair's residue on disk and in the cache. Now any failure
+  // (reported on the summary, or thrown) halts BEFORE the reconcile, exactly
+  // as an armed guard does, naming the failure and keeping every block the
+  // pass did collect.
+  let repairFailure: string | undefined;
   if ((legacyCount > 0 || residuePagesPending) && repairEnabled && !opts.dryRun) {
     try {
       const repair = await repairLegacyRowsForSource(engine, {
@@ -496,12 +515,18 @@ export async function runExtractFacts(
         signal: opts.signal,
         hooks: opts.repairHooks,
       });
+      repairFailure = repair.failure;
       // A sweep that found every candidate page clean is not a repair worth
       // reporting; the summary stays as quiet as a run with nothing to do.
-      if (repair.rowsEligible > 0 || repair.residuePagesChecked > 0 || repair.residuePagesBlocked.length > 0) result.legacyRepair = repair;
+      // A failed one is always reported, partial counters and all.
+      if (repair.rowsEligible > 0 || repair.residuePagesChecked > 0 || repair.residuePagesBlocked.length > 0 || repairFailure !== undefined) result.legacyRepair = repair;
       result.legacyRowsRepaired = repair.rowsStamped;
-      legacyCount = repair.rowsRemaining;
-      result.legacyRowsPending = legacyCount;
+      // `rowsRemaining` is a fresh count only when the pass completed; after a
+      // failure the guard's own pre-repair count stays the last authoritative one.
+      if (repairFailure === undefined) {
+        legacyCount = repair.rowsRemaining;
+        result.legacyRowsPending = legacyCount;
+      }
       if (repair.residuePagesHealed > 0) {
         result.warnings.push(
           `extract_facts: restored the committed preimage over a crashed repair's uncommitted fence rows on ` +
@@ -529,11 +554,32 @@ export async function runExtractFacts(
         result.warnings.push(`extract_facts: legacy repair aborted before finishing source "${sourceId}"`);
       }
     } catch (e) {
-      // The repair never throws by contract; if it does, the guard below
-      // still holds — the rows are untouched and the halt is loud.
-      const msg = e instanceof Error ? e.message : String(e);
-      result.warnings.push(`extract_facts: legacy repair failed: ${msg.slice(0, 200)}`);
+      // The repair never throws by contract; if it does anyway, it is the
+      // same fail-closed halt as a reported failure — never a quiet "nothing
+      // to block".
+      repairFailure = e instanceof Error ? e.message : String(e);
     }
+  }
+
+  if (repairFailure !== undefined) {
+    result.guardTriggered = true;
+    result.repairFailed = repairFailure;
+    result.warnings.push(
+      `extract_facts: FACTS_REPAIR_INCOMPLETE: the legacy repair in source "${sourceId}" did not complete ` +
+      `(${repairFailure.slice(0, 200)}); fact reconciliation for this source is skipped this run because a page ` +
+      `the repair did not reach cannot be proven free of a crashed repair's fence rows. The next run retries.`,
+    );
+    // Booked as a halt, like the guard's own: the phase did not run.
+    if (!opts.dryRun) {
+      await upsertExtractRollup(engine, {
+        kind: 'facts.fence',
+        source_id: sourceId,
+        cost_delta: 0,
+        round_completed_delta: 0,
+        halt_delta: 1,
+      });
+    }
+    return result;
   }
 
   if (legacyCount > 0) {
