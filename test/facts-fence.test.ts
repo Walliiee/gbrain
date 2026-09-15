@@ -635,12 +635,12 @@ Prose here.
       expect(fenceAt).toBeLessThan(out.indexOf('<!-- timeline -->'));
     });
 
-    test('the legacy bare --- + ## Timeline form is deliberately NOT a sentinel (it would false-positive on frontmatter)', () => {
+    test('the legacy bare --- + ## Timeline form is a sentinel below body prose, never a frontmatter false-positive', () => {
       const body = `# Entity\n\nProse.\n\n---\n\n## Timeline\n- 2020: Founded\n`;
       const { body: out } = upsertFactRow(body, newRow);
-      // Not recognized → EOF append (after the timeline text), same as "no sentinel".
-      expect(out.indexOf(FACTS_FENCE_BEGIN)).toBeGreaterThan(out.indexOf('## Timeline'));
-      expect(out.indexOf(FACTS_FENCE_BEGIN)).toBeGreaterThan(out.indexOf('- 2020: Founded'));
+      expect(out.indexOf(FACTS_FENCE_BEGIN)).toBeGreaterThan(out.indexOf('Prose.'));
+      expect(out.indexOf(FACTS_FENCE_BEGIN)).toBeLessThan(out.indexOf('---\n\n## Timeline'));
+      expect(out.endsWith('---\n\n## Timeline\n- 2020: Founded\n')).toBe(true);
     });
 
     test('CRLF body: the sentinel line is recognized and the fence lands above it, tail preserved', () => {
