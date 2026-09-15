@@ -37,7 +37,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import type { BrainEngine } from '../engine.ts';
 import { withPageLock } from '../page-lock.ts';
 import { resolvePageWriteTarget } from '../write-through.ts';
-import { parseFactsFence, renderFactsTable, replaceFactsFenceStream, type ParsedFact } from '../facts-fence.ts';
+import { parseFactsFence, renderFactsTable, replaceOrInsertFactsFence, type ParsedFact } from '../facts-fence.ts';
 
 export interface ForgetFactResult {
   /** True iff the row was found AND a forget was applied (fence or DB). */
@@ -252,7 +252,7 @@ async function forgetFactOnce(
       const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
       return { ok, path: 'legacy_db', reason };
     }
-    const newBody = replaceFactsFenceStream(body, newFence);
+    const newBody = replaceOrInsertFactsFence(body, newFence);
 
     writeFileSync(tmpPath, newBody, 'utf-8');
     const tmpBody = readFileSync(tmpPath, 'utf-8');

@@ -51,7 +51,7 @@ import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { computeCorpusGeneration, loadSourceRow } from './contextual-retrieval-service.ts';
 import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
-import { parseFactsFence, renderFactsTable, replaceFactsFenceStream, restoreHiddenFactRows, factsGapWarning } from './facts-fence.ts';
+import { parseFactsFence, renderFactsTable, replaceOrInsertFactsFence, restoreHiddenFactRows, factsGapWarning } from './facts-fence.ts';
 import { scanFencedBlocks, MAX_FENCES_PER_PAGE } from './fence-scan.ts';
 
 /**
@@ -146,7 +146,7 @@ function mergeHiddenFactRowsIntoBody(
         `the hidden row(s) keep their original numbers.`,
       );
     }
-    const mergedBody = replaceFactsFenceStream(incomingBody, renderFactsTable(merge.merged));
+    const mergedBody = replaceOrInsertFactsFence(incomingBody, renderFactsTable(merge.merged));
     const finalParse = parseFactsFence(mergedBody);
     if (finalParse.warnings.length > 0) {
       throw new Error(`FACTS_FINAL_MERGE_INVALID on ${slug}: ${finalParse.warnings.join('; ')}`);

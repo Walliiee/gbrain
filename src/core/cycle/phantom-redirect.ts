@@ -28,7 +28,7 @@ import {
 import {
   parseFactsFence,
   renderFactsTable,
-  replaceFactsFenceStream,
+  replaceOrInsertFactsFence,
   stripFactsFence,
   type ParsedFact,
 } from '../facts-fence.ts';
@@ -177,7 +177,7 @@ function planPhantomFenceMerge(body: string, phantomFacts: ParsedFact[], dbMax: 
   const newFence = renderFactsTable(merged);
   const updated = merged.length === existing.length
     ? body
-    : replaceFactsFenceStream(body, newFence);
+    : replaceOrInsertFactsFence(body, newFence);
   return { body: updated, rowNumByPhantom };
 }
 

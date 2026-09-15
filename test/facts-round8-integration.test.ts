@@ -182,3 +182,19 @@ test('PRIVACY private facts in both blocks stay off remote and search; inspect l
 test('REPEATED conflicting row number refuses repair, preserves human content, no shadow reconcile',async()=>{
  await pair();const prior=readFileSync(file,'utf8');const duplicate=renderFactsTable([{rowNum:1,claim:'Humancontradictoryrow',kind:'fact',confidence:0.9,visibility:'world',notability:'medium',active:true}]);const human=prior+'\n\n## Facts\n\n'+duplicate+'\n';writeFileSync(file,human);git('add','--',SLUG+'.md');git('commit','-qm','contradictory fixture');await sync();await seed('Laterpending');const r=await extract();console.log('COLLISION_REFUSAL',JSON.stringify({r,preserved:readFileSync(file,'utf8')===human,rows:await rows()}));expect(r.guardTriggered).toBe(true);expect(r.legacyRowsRepaired).toBe(0);expect(readFileSync(file,'utf8')).toBe(human);
 });
+
+test('NATIVE placement helper keeps a newly inserted fence above every timeline sentinel form',()=>{
+ const row={claim:'Beforetimeline',kind:'fact' as const,confidence:0.9,visibility:'world' as const,notability:'medium' as const,validFrom:'2026-01-02',source:'api:fixture'};
+ for(const tail of ['<!--timeline-->\n\n## Timeline\n- event\n','--- timeline ---\n\n## Timeline\n- event\n','---\n\n## History\n- event\n']){
+  const body=ORIGINAL+'\n'+tail;const written=upsertFactRow(body,row).body;const parsed=parseMarkdown(written,'fixture.md');
+  expect(parsed.compiled_truth).toContain('Beforetimeline');expect(parsed.timeline).toContain('- event');expect(parseFactsFence(parsed.compiled_truth).warnings).toEqual([]);
+ }
+});
+
+test('automatic append repair never appends a new fence into the timeline; it refuses the required pre-sentinel rewrite',async()=>{
+ const timelineBody=ORIGINAL+'\n<!--timeline-->\n\n## Timeline\n- keep this event\n';
+ writeFileSync(file,timelineBody);await isolated(()=>importFromContent(engine,SLUG,timelineBody,{sourceId:SOURCE,noEmbed:true}));
+ git('add','--',SLUG+'.md');git('commit','-qm','timeline fixture');await seed('Repairbeforetimeline','world');
+ const repaired=await repair();const written=readFileSync(file,'utf8');const parsed=parseMarkdown(written,`${SLUG}.md`);
+ expect(repaired.rowsStamped).toBe(0);expect(repaired.skippedByReason.file_rewrite_required).toBe(1);expect(written).toBe(timelineBody);expect(parsed.compiled_truth).not.toContain('Repairbeforetimeline');expect(parsed.timeline).not.toContain('Repairbeforetimeline');expect(parsed.timeline).toContain('keep this event');
+});
