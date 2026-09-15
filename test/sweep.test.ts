@@ -227,14 +227,16 @@ describe('runMaintenanceSweep — the fence pass carries the cycle\'s residue pr
     expect(rows[0]).toMatchObject({ row_num: null, expired: true });
   };
 
-  test('a residue-only page is healed by the sweep, not reconciled from its residue: nothing inserted, the preimage restored, cache cleared', async () => {
-    await forgottenResidueFromRealWriter();
+  test('a residue-only page is reported and preserved, never reconciled or auto-healed', async () => {
+    const residue = await forgottenResidueFromRealWriter();
     const r = await sweep();
-    expect(r.factsReconciled).toBe(0);                                          // pre-fix: 1 — the forgotten claim came back
-    expect(r.skipped).toEqual([]);
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(BODY);
-    expect(git('status', '--porcelain=v1', '--', ALICE_MD)).toBe('');
-    expect(parseFactsFence((await engine.getPage(ALICE, { sourceId: SRC }))!.compiled_truth!).facts).toEqual([]);
+    expect(r.factsReconciled).toBe(0);
+    expect(r.skipped).toEqual([
+      { reason: 'facts_fence_guard', count: 1 },
+      { reason: 'facts_fence_degraded', count: 1 },
+      { reason: 'facts_fence_residue_blocked', count: 1 },
+    ]);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
     await noActiveCopy();
   });
 
@@ -253,7 +255,7 @@ describe('runMaintenanceSweep — the fence pass carries the cycle\'s residue pr
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);          // the halt left the residue in place
     const r = await sweep();
     expect(r.factsReconciled).toBe(0);
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(BODY);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
     await noActiveCopy();
   });
 
@@ -276,7 +278,10 @@ describe('runMaintenanceSweep — the fence pass carries the cycle\'s residue pr
     let r2;
     try { r2 = await sweep(); } finally { engine.executeRaw = raw; }
     expect(r2.factsReconciled).toBe(0);
-    expect(r2.skipped).toEqual([{ reason: 'facts_fence_guard', count: 1 }]);
+    expect(r2.skipped).toEqual([
+      { reason: 'facts_fence_guard', count: 1 },
+      { reason: 'facts_fence_degraded', count: 1 },
+    ]);
     await noActiveCopy();
   });
 
@@ -284,7 +289,10 @@ describe('runMaintenanceSweep — the fence pass carries the cycle\'s residue pr
     await forgottenResidueFromRealWriter();
     const r = await withEnv({ GBRAIN_HOME: home, GBRAIN_FACT_REPAIR: 'off' }, () =>
       runMaintenanceSweep(engine, { sourceId: SRC, capabilities: KEYLESS }));
-    expect(r.skipped).toEqual([]);
+    expect(r.skipped).toEqual([
+      { reason: 'facts_fence_guard', count: 1 },
+      { reason: 'facts_fence_degraded', count: 1 },
+    ]);
     expect(parseFactsFence(readFileSync(join(repo, ALICE_MD), 'utf-8')).facts).toHaveLength(1);   // nothing restored
   });
 });

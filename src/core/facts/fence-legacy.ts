@@ -41,10 +41,14 @@ export interface RepairLegacyRowsSummary {
   pagesSkipped: number;
   /** Pending pages by refusal reason, so the halt can say why. */
   skippedByReason: Partial<Record<LegacyStampSkipReason, number>>;
+  /** Structured page-local refusals for selective reconciliation skips. */
+  skippedPages: Array<{ slug: string; reason: LegacyStampSkipReason; detail?: string }>;
   /** `slug (reason: detail)` for the first few refusals. */
   skippedDetails: string[];
   /** Legacy rows still eligible after the pass — re-counted, not derived. */
   rowsRemaining: number;
+  /** Slugs owning the freshly re-counted remaining eligible rows. */
+  remainingPageSlugs: string[];
   /** Read-only inspection attempts, including unavailable targets. */
   residuePagesChecked: number;
   /** Compatibility counter; always zero. Automatic healing was removed. */
@@ -180,8 +184,8 @@ export async function repairLegacyRowsForSource(
   const summary: RepairLegacyRowsSummary = {
     rowsEligible: 0, rowsStamped: 0, rowsAppended: 0, rowsRewritten: 0,
     pagesFenced: 0, pagesSkipped: 0,
-    skippedByReason: {}, skippedDetails: [],
-    rowsRemaining: 0, residuePagesChecked: 0, residuePagesHealed: 0, residuePagesBlocked: [],
+    skippedByReason: {}, skippedDetails: [], skippedPages: [],
+    rowsRemaining: 0, remainingPageSlugs: [], residuePagesChecked: 0, residuePagesHealed: 0, residuePagesBlocked: [],
     dryRun, aborted: false,
   };
 
@@ -225,6 +229,7 @@ export async function repairLegacyRowsForSource(
       summary.pagesSkipped += 1;
       const reason = r.reason ?? 'error';
       summary.skippedByReason[reason] = (summary.skippedByReason[reason] ?? 0) + 1;
+      summary.skippedPages.push({ slug, reason, ...(r.detail ? { detail: r.detail } : {}) });
       if (summary.skippedDetails.length < 10) {
         summary.skippedDetails.push(`${slug} (${reason}${r.detail ? `: ${r.detail.slice(0, 160)}` : ''})`);
       }
@@ -257,10 +262,13 @@ export async function repairLegacyRowsForSource(
 
   if (dryRun) {
     summary.rowsRemaining = rows.length;
+    summary.remainingPageSlugs = Array.from(new Set(rows.map(r => r.entity_slug)));
     return summary;
   }
   try {
-    summary.rowsRemaining = await countLegacyRowsForSource(engine, opts.sourceId);
+    const remaining = await listLegacyRowsForSource(engine, opts.sourceId);
+    summary.rowsRemaining = remaining.length;
+    summary.remainingPageSlugs = Array.from(new Set(remaining.map(r => r.entity_slug)));
   } catch (err) {
     // Every block and counter collected above stays on the summary; only the
     // fresh count is missing, and the caller must not treat its absence as

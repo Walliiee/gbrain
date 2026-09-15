@@ -525,6 +525,9 @@ export async function runExtractFacts(
   // not yet back to the file's body): the reconcile below leaves them alone,
   // otherwise it would insert the forgotten rows from that file or cache.
   const blockedResidueSlugs = new Set<string>();
+  // Pages whose legacy writer returned a definite page-local refusal. They
+  // remain degraded and are skipped, but do not starve unrelated pages.
+  const blockedRepairSlugs = new Set<string>();
   // A repair that could not complete proves nothing about the pages it did
   // not reach. Codex acceptance round 3, P1: the catch below used to read a
   // repair-wide throw as "nothing to block" — with the source's only legacy
@@ -548,6 +551,7 @@ export async function runExtractFacts(
       // A failed one is always reported, partial counters and all.
       if (repair.rowsEligible > 0 || repair.residuePagesChecked > 0 || repair.residuePagesBlocked.length > 0 || repairFailure !== undefined) result.legacyRepair = repair;
       result.legacyRowsRepaired = repair.rowsStamped;
+      for (const page of repair.skippedPages) blockedRepairSlugs.add(page.slug);
       // `rowsRemaining` is a fresh count only when the pass completed; after a
       // failure the guard's own pre-repair count stays the last authoritative one.
       if (repairFailure === undefined) {
@@ -597,6 +601,9 @@ export async function runExtractFacts(
     );
   }
 
+  // Forgotten residue remains source-indeterminate: unlike a writer's
+  // definite page-local refusal, it can represent a crashed publication
+  // whose ownership/cache state is not known. Preserve the source-wide halt.
   if (blockedResidueSlugs.size > 0) {
     const residueFailure = `unresolved residue on ${blockedResidueSlugs.size} page(s); manual review required before this source can reconcile or redirect`;
     repairFailure = repairFailure ? `${repairFailure}; ${residueFailure}` : residueFailure;
@@ -624,12 +631,13 @@ export async function runExtractFacts(
   }
 
   if (legacyCount > 0) {
+    const unknownRemaining = result.legacyRepair?.remainingPageSlugs
+      .filter(slug => !blockedRepairSlugs.has(slug)) ?? [];
     result.guardTriggered = true;
     result.warnings.push(
-      `extract_facts: ${legacyCount} legacy fact rows in source "${sourceId}" remain after repair. ` +
-      `Resolve the named refusal and retry; preserve the file and fact evidence. ` +
-      `Use forget_fact only for facts you intend to forget. The v0.32.2 backfill uses the same safe writer ` +
-      `and cannot bypass a refusal or GBRAIN_FACT_REPAIR=off.`,
+      `extract_facts: ${legacyCount} legacy fact rows in source "${sourceId}" remain after repair; ` +
+      `${blockedRepairSlugs.size} known refused page(s) are skipped while independently healthy pages reconcile. ` +
+      `Resolve the named refusal and retry; preserve the file and fact evidence.`,
     );
     // #3683: book the halt BEFORE the early return. The end-of-run rollup
     // write below is unreachable from this path, so pre-fix a guard-triggered
@@ -646,7 +654,10 @@ export async function runExtractFacts(
         halt_delta: 1,
       });
     }
-    return result;
+    // A fresh recount with every remaining row owned by a known refused page
+    // is determinate. Unknown ownership, a disabled repair, or an incomplete
+    // summary remains source-wide fail-closed.
+    if (unknownRemaining.length > 0 || !result.legacyRepair) return result;
   }
 
   // ── v0.35.5: phantom-redirect pre-pass ──────────────────────────
@@ -659,7 +670,7 @@ export async function runExtractFacts(
   // IS NOT NULL` so a half-redirected page (soft-deleted, .md still on
   // disk) won't be re-redirected.
   let phantomResult: PhantomPassResult = emptyPhantomPassResult();
-  if (opts.brainDir && blockedResidueSlugs.size === 0 && !isFactRepairDisabled()) {
+  if (opts.brainDir && blockedResidueSlugs.size === 0 && blockedRepairSlugs.size === 0 && !isFactRepairDisabled()) {
     try {
       phantomResult = await runPhantomRedirectPass(
         engine,
@@ -721,7 +732,7 @@ export async function runExtractFacts(
     result.pagesScanned += 1;
     // Named in the FACTS_RESIDUE_UNRESOLVED warning above; neither its file
     // nor its cache is proven free of a crashed repair's rows.
-    if (blockedResidueSlugs.has(slug)) continue;
+    if (blockedResidueSlugs.has(slug) || blockedRepairSlugs.has(slug)) continue;
 
     const page = await engine.getPage(slug, { sourceId });
     if (!page) {

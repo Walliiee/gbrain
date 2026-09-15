@@ -19,6 +19,7 @@ import { execFileSync } from 'node:child_process';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { v0_32_2, __setTestEngineOverride, __testing } from '../src/commands/migrations/v0_32_2.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
+import { importFromContent } from '../src/core/import-file.ts';
 
 let engine: PGLiteEngine;
 let brainDir: string;
@@ -37,8 +38,13 @@ afterAll(async () => {
 
 beforeEach(async () => {
   brainDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-test-'));
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (engine as any).db.query('DELETE FROM facts');
+  execFileSync('git', ['-C', brainDir, 'init', '-q']);
+  execFileSync('git', ['-C', brainDir, 'config', 'user.email', 'test@example.invalid']);
+  execFileSync('git', ['-C', brainDir, 'config', 'user.name', 'Fixture']);
+  // Preserve the migration ledger while isolating page/fact fixtures.
+  await engine.executeRaw('DELETE FROM content_chunks');
+  await engine.executeRaw('DELETE FROM pages');
+  await engine.executeRaw('DELETE FROM facts');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await (engine as any).db.query(
     `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
@@ -55,12 +61,29 @@ async function seedLegacyFact(input: {
   source_id?: string;
   visibility?: 'private' | 'world';
   notability?: 'high' | 'medium' | 'low';
-}): Promise<number> {
+}, backingPage = true): Promise<number> {
+  // Round8 compatibility rationale: the safe repair never invents a page and
+  // requires a committed preimage. Give happy-path migration fixtures the
+  // same representable backing page production requires.
+  if (input.entity_slug && backingPage) {
+    const file = join(brainDir, `${input.entity_slug}.md`);
+    if (!existsSync(file)) {
+      mkdirSync(join(file, '..'), { recursive: true });
+      writeFileSync(file, `---\ntype: person\ntitle: Fixture\n---\n\n# Fixture\n`, 'utf8');
+    }
+    if (execFileSync('git', ['-C', brainDir, 'status', '--porcelain', '--', `${input.entity_slug}.md`], { encoding: 'utf8' })) {
+      execFileSync('git', ['-C', brainDir, 'add', '--', `${input.entity_slug}.md`]);
+      execFileSync('git', ['-C', brainDir, 'commit', '-qm', `fixture ${input.entity_slug}`, '--', `${input.entity_slug}.md`]);
+    }
+    await importFromContent(engine, input.entity_slug, readFileSync(file, 'utf8'), {
+      sourceId: input.source_id ?? 'default', noEmbed: true,
+    });
+  }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const r = await (engine as any).db.query(
     `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
                         valid_from, source, confidence)
-     VALUES ($1, $2, $3, 'fact', $4, $5, now(), 'mcp:put_page', 1.0)
+     VALUES ($1, $2, $3, 'fact', $4, $5, '2026-01-02T00:00:00Z', 'mcp:put_page', 1.0)
      RETURNING id`,
     [
       input.source_id ?? 'default',
@@ -95,9 +118,9 @@ describe('phaseASchema', () => {
 
 describe('phaseBFenceFacts — dry-run reporting', () => {
   test('reports counts without writing FS or updating DB', async () => {
-    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Founded Acme' });
-    await seedLegacyFact({ entity_slug: 'people/bob', fact: 'Met at YC W22' });
-    await seedLegacyFact({ entity_slug: null, fact: 'Unparented claim' });
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Founded Acme' }, false);
+    await seedLegacyFact({ entity_slug: 'people/bob', fact: 'Met at YC W22' }, false);
+    await seedLegacyFact({ entity_slug: null, fact: 'Unparented claim' }, false);
 
     const r = await __testing.phaseBFenceFacts(engine, DRY_OPTS);
     expect(r.status).toBe('skipped');
@@ -180,6 +203,12 @@ describe('phaseBFenceFacts — happy path backfill', () => {
     await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Second' });
 
     await __testing.phaseBFenceFacts(engine, OPTS);
+
+    // Round8 compatibility rationale: a second migration run may reuse an
+    // existing fence only after that first publication is a committed
+    // preimage; an uncommitted fence is deliberately ambiguous.
+    execFileSync('git', ['-C', brainDir, 'add', '--', 'people/alice.md']);
+    execFileSync('git', ['-C', brainDir, 'commit', '-qm', 'published first fence', '--', 'people/alice.md']);
 
     // Manually clear one row's row_num to simulate a partial state.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -353,7 +382,7 @@ describe('orchestrator end-to-end', () => {
   });
 
   test('dry-run returns 3 phases all skipped (no FS or DB changes)', async () => {
-    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Should not get fenced' });
+    await seedLegacyFact({ entity_slug: 'people/alice', fact: 'Should not get fenced' }, false);
 
     const result = await v0_32_2.orchestrator(DRY_OPTS);
     expect(result.status).toBe('complete');

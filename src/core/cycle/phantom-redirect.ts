@@ -28,8 +28,8 @@ import {
 import {
   parseFactsFence,
   renderFactsTable,
-  FACTS_FENCE_BEGIN,
-  FACTS_FENCE_END,
+  replaceFactsFenceStream,
+  stripFactsFence,
   type ParsedFact,
 } from '../facts-fence.ts';
 import { parseMarkdown, splitBody, serializeMarkdown } from '../markdown.ts';
@@ -115,38 +115,9 @@ export function emptyPhantomPassResult(): PhantomPassResult {
  */
 export function stripFenceAndFrontmatterAndLeadingH1(body: string): string {
   if (!body) return '';
-  let working = body;
-
-  // 1. Strip the entire `## Facts\n\n<fence>...<fence>` block. We grab
-  //    the `## Facts` heading too (with surrounding blank lines) so the
-  //    section header doesn't count as residue.
-  const beginIdx = working.indexOf(FACTS_FENCE_BEGIN);
-  const endIdx = beginIdx >= 0
-    ? working.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length)
-    : -1;
-  if (beginIdx !== -1 && endIdx !== -1) {
-    // Walk backward from beginIdx to swallow a leading `## Facts\n\n`
-    // (or `## facts\n\n` — case-insensitive markdown headings).
-    let headingStart = beginIdx;
-    // Skip whitespace-only lines before the marker.
-    while (headingStart > 0 && working[headingStart - 1] !== '\n') headingStart--;
-    // Walk back over the blank line(s).
-    while (headingStart > 0) {
-      const prevLineEnd = headingStart - 1;
-      const prevLineStart = working.lastIndexOf('\n', prevLineEnd - 1) + 1;
-      const prevLine = working.slice(prevLineStart, prevLineEnd);
-      if (prevLine.trim() === '') {
-        headingStart = prevLineStart;
-        continue;
-      }
-      if (/^#{1,6}\s+facts\b/i.test(prevLine)) {
-        headingStart = prevLineStart;
-      }
-      break;
-    }
-    working = working.slice(0, headingStart)
-      + working.slice(endIdx + FACTS_FENCE_END.length);
-  }
+  // Strip every physical block, then discard now-empty Facts headings.
+  // Real prose under such a heading remains and still blocks classification.
+  let working = stripFactsFence(body).replace(/^#{1,6}\s+facts\s*$\n?/gim, '');
 
   // 2. Strip the leading H1 (` # text\n` at the very top — phantom stubs
   //    open with `# <slug>`).
@@ -204,11 +175,9 @@ function planPhantomFenceMerge(body: string, phantomFacts: ParsedFact[], dbMax: 
     }
   }
   const newFence = renderFactsTable(merged);
-  const begin = body.indexOf(FACTS_FENCE_BEGIN);
-  const end = body.indexOf(FACTS_FENCE_END, begin + FACTS_FENCE_BEGIN.length);
-  const updated = merged.length === existing.length ? body : begin >= 0 && end >= 0
-    ? body.slice(0, begin) + newFence + body.slice(end + FACTS_FENCE_END.length)
-    : `${body}${body.endsWith('\n') ? '\n' : '\n\n'}## Facts\n\n${newFence}\n`;
+  const updated = merged.length === existing.length
+    ? body
+    : replaceFactsFenceStream(body, newFence);
   return { body: updated, rowNumByPhantom };
 }
 

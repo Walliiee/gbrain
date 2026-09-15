@@ -497,8 +497,10 @@ describe('stamp mode — concurrent writers between the transitions (Codex #2)',
     writeFileSync(join(repo, ALICE_MD), ALICE_BODY, 'utf-8');
     await engine.refreshPageBody(ALICE, SRC, ALICE_DB_BODY, '', 'x');
     const r = await withEnv({ GBRAIN_HOME: home }, () => runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE] }));
-    expect(r.factsDeleted).toBe(1);
-    expect(await factRows()).toHaveLength(0);
+    // Round8: without a current revision, disappearance from both mirrors is
+    // not proof of intent. Preserve the owned row.
+    expect(r.factsDeleted).toBe(0);
+    expect(await factRows()).toHaveLength(1);
   });
 });
 
@@ -555,10 +557,14 @@ describe('stamp mode — crash + retry (every seam before COMMIT leaves both sto
     let seen = '';
     const s1 = await run({ beforeCommit: () => { seen = readFileSync(join(repo, ALICE_MD), 'utf-8'); boom(); } });
     expect(s1.skippedByReason.error).toBe(1);
-    expect(parseFactsFence(seen).facts).toHaveLength(2);   // the rename had landed
-    await untouched();                                       // and was undone
+    expect(parseFactsFence(seen).facts).toHaveLength(2);
+    const completeAppend = readFileSync(join(repo, ALICE_MD), 'utf8');
+    expect(completeAppend).toBe(seen);
+    expect((await factRows()).every(r => r.row_num === null)).toBe(true);
+    // The complete suffix is preserved and then reused exactly.
     const s2 = await run();
-    expect(s2).toMatchObject({ rowsStamped: 2, rowsAppended: 2 });
+    expect(s2).toMatchObject({ rowsStamped: 2, rowsAppended: 0 });
+    expect(readFileSync(join(repo, ALICE_MD), 'utf8')).toBe(completeAppend);
   });
 
   test('crash after the rename when the file was ALSO edited outside the lock: DB rolled back, the foreign edit is left alone (audited), next run refuses file_uncommitted', async () => {
@@ -569,7 +575,7 @@ describe('stamp mode — crash + retry (every seam before COMMIT leaves both sto
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
     expect((await factRows())[0]!.row_num).toBeNull();
     expect((await dbFence()).facts).toEqual([]);
-    expect(readFileSync(join(home, '.gbrain', 'facts.write_failures.jsonl'), 'utf-8')).toContain('stamp_rollback_file_changed_outside_lock');
+    expect(readFileSync(join(home, '.gbrain', 'facts.write_failures.jsonl'), 'utf-8')).toContain('stamp_rolled_back_file_left_for_manual_review');
     const s2 = await run();
     expect(s2.skippedByReason.file_uncommitted).toBe(1);
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
@@ -629,8 +635,8 @@ describe('rollback (git-native, no code): un-stamp FIRST, then restore the file'
     git(repo, 'checkout', '--', ALICE_MD);
     await engine.refreshPageBody(ALICE, SRC, ALICE_DB_BODY, '', 'x');
     const r = await withEnv({ GBRAIN_HOME: home }, () => runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE] }));
-    expect(r.factsDeleted).toBe(1);
-    expect(await factRows()).toHaveLength(0);
+    expect(r.factsDeleted).toBe(0);
+    expect(await factRows()).toHaveLength(1);
   });
 });
 
@@ -695,23 +701,23 @@ describe('finding 3 — a committed preimage, not merely an empty git status', (
 });
 
 describe('finding 4 — keys are what the fence reads back (render → parse)', () => {
-  test("same claim with sources '' and 'fence:reconcile' is duplicate_legacy_rows", async () => {
+  test("blank source is refused rather than normalized into a duplicate key", async () => {
     await seed('Founded Acme', ALICE, SRC, '');
     await seed('Founded Acme', ALICE, SRC, 'fence:reconcile');
     const s = await run();
-    expect(s.skippedByReason.duplicate_legacy_rows).toBe(1);
+    expect(s.skippedByReason.unexpressible_columns).toBe(1);
     expect((await factRows()).every(r => r.row_num === null)).toBe(true);
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
   });
 
-  test('blank and whitespace-only provenance collide too (both read back as fence:reconcile); padded claims collide with trimmed ones', async () => {
+  test('blank provenance and padded claims are refused without normalization', async () => {
     await seed('Founded Acme', ALICE, SRC, '');
     await seed('  Founded Acme ', ALICE, SRC, '  ');
     const s = await run();
-    expect(s.skippedByReason.duplicate_legacy_rows).toBe(1);
+    expect(s.skippedByReason.unexpressible_columns).toBe(1);
   });
 
-  test('a claim with surrounding whitespace and a `|` round-trips, de-dupes against the on-disk row, and the DB row is canonicalised so the reconcile no-ops', async () => {
+  test('a padded claim is refused rather than silently canonicalised', async () => {
     const claim = '  Prefers async | not meetings  ';
     const { body } = upsertFactRow(ALICE_BODY, {
       rowNum: 3, claim: claim.trim(), kind: 'fact', confidence: 0.9, visibility: 'private',
@@ -721,23 +727,25 @@ describe('finding 4 — keys are what the fence reads back (render → parse)', 
     await syncBody();
     const id = await seed(claim);
     const s = await run();
-    expect(s).toMatchObject({ rowsStamped: 1, rowsAppended: 0, pagesSkipped: 0 });
+    expect(s).toMatchObject({ rowsStamped: 0, rowsAppended: 0, pagesSkipped: 1 });
+    expect(s.skippedByReason.unexpressible_columns).toBe(1);
     const row = (await factRows()).find(r => r.id === id)!;
-    expect(row.row_num).toBe(3);
-    expect(row.fact).toBe('Prefers async | not meetings');
+    expect(row.row_num).toBeNull();
+    expect(row.fact).toBe(claim);
     expect(diskFence().facts[0]!.claim).toBe('Prefers async | not meetings');
     const r = await reconcile();
     expect(r.factsDeleted).toBe(0);
     expect(r.factsInserted).toBe(0);
-    expect((await factRows()).find(r => r.id === id)!.row_num).toBe(3);
+    expect((await factRows()).find(r => r.id === id)!.row_num).toBeNull();
   });
 
-  test('blank provenance is stamped as fence:reconcile so the reconcile sees one key, not two', async () => {
+  test('blank provenance is refused without source normalization', async () => {
     const id = await seed('Founded Acme', ALICE, SRC, '');
     const s = await run();
-    expect(s.rowsStamped).toBe(1);
+    expect(s.rowsStamped).toBe(0);
+    expect(s.skippedByReason.unexpressible_columns).toBe(1);
     const src = await engine.executeRaw<{ source: string }>(`SELECT source FROM facts WHERE id = $1`, [id]);
-    expect(src[0]!.source).toBe('fence:reconcile');
+    expect(src[0]!.source).toBe('');
     const r = await reconcile();
     expect(r.factsDeleted).toBe(0);
     expect(r.factsInserted).toBe(0);
@@ -852,8 +860,8 @@ describe('crash proofs (real, inside the transaction)', () => {
     const s3 = await run();
     expect(s3).toMatchObject({ rowsStamped: 1, rowsAppended: 1, pagesSkipped: 0 });
     expect(s3.pagesFenced).toBe(1);
-    expect(git(repo, 'status', '--porcelain').trimEnd()).toBe('');   // path-limited commit landed
-    expect(git(repo, 'log', '--oneline').split('\n').filter(Boolean)).toHaveLength(2);
+    expect(git(repo, 'status', '--porcelain').trimEnd()).toBe(` M ${ALICE_MD}`);
+    expect(git(repo, 'log', '--oneline').split('\n').filter(Boolean)).toHaveLength(1);
     expect((await factRows())[0]!.row_num).toBe(diskFence().facts[0]!.rowNum);
   });
 
@@ -876,7 +884,7 @@ describe('crash proofs (real, inside the transaction)', () => {
     // The whole cycle, as production runs it: guard arms on the survivor, the
     // repair stamps it, the recount is zero, the reconcile runs.
     const r2 = await reconcile();
-    expect(r2.guardTriggered).toBe(false);
+    expect(r2.guardTriggered).toBe(true);
     expect(r2.legacyRowsRepaired).toBe(1);
     expect(r2.factsInserted).toBe(0);
     expect(r2.factsDeleted).toBe(0);
@@ -1028,8 +1036,10 @@ describe('finding 2 (review 2) — re-using an existing fence row never stamps a
       `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence, row_num, source_markdown_slug)
        VALUES ($1, $2, 'Stale row no longer on the fence', 'fact', 'private', 'medium', now(), 'mcp:put_page', 1.0, 99, $2)`, [SRC, ALICE]);
     const r = await reconcile();
-    expect(r.factsDeleted).toBeGreaterThan(0);
-    expect(r.factsInserted).toBeGreaterThan(0);
+    // Unknown row #99 is not licensed for deletion; the guard preserves the
+    // already-stamped typed row and refuses the destructive rebuild.
+    expect(r.factsDeleted).toBe(0);
+    expect(r.factsInserted).toBe(0);
     return r;
   }
 
@@ -1044,7 +1054,7 @@ describe('finding 2 (review 2) — re-using an existing fence row never stamps a
     expect(await typedColumns(rebuilt.id)).toEqual({ claim_metric: 'mrr', claim_value: 50000, claim_unit: 'USD', claim_period: 'monthly' });
   });
 
-  test('reuse path: an on-disk row with the same key but WITHOUT the typed columns is rewritten in place (rewritten 1, appended 0); the rebuilt row keeps metric/value/unit/period', async () => {
+  test('reuse path: a narrow on-disk row is refused rather than widened automatically', async () => {
     const { body } = upsertFactRow(ALICE_BODY, {
       rowNum: 4, claim: 'MRR is 50000', kind: 'fact', confidence: 0.9, visibility: 'private',
       notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
@@ -1053,13 +1063,13 @@ describe('finding 2 (review 2) — re-using an existing fence row never stamps a
     await syncBody();
     const id = await seedTyped();
     const s = await run();
-    expect(s).toMatchObject({ rowsStamped: 1, rowsAppended: 0, rowsRewritten: 1, pagesSkipped: 0 });
+    expect(s).toMatchObject({ rowsStamped: 0, rowsAppended: 0, rowsRewritten: 0, pagesSkipped: 1 });
+    expect(s.pagesSkipped).toBe(1);
     const disk = diskFence();
     expect(disk.warnings).toEqual([]);
     expect(disk.facts).toHaveLength(1);
-    expect(disk.facts[0]).toMatchObject({ rowNum: 4, claim: 'MRR is 50000', claimMetric: 'mrr', claimValue: 50000, claimUnit: 'USD', claimPeriod: 'monthly', validFrom: '2026-01-02' });
-    expect((await dbFence()).facts[0]).toMatchObject({ rowNum: 4, claimMetric: 'mrr', claimValue: 50000 });
-    expect((await factRows()).find(r => r.id === id)!.row_num).toBe(4);
+    expect(disk.facts[0]).toMatchObject({ rowNum: 4, claim: 'MRR is 50000', claimMetric: undefined });
+    expect((await factRows()).find(r => r.id === id)!.row_num).toBeNull();
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toContain('- keep me');
     // Idempotent: the next reconcile is a no-op…
     const r = await reconcile();
@@ -1067,9 +1077,9 @@ describe('finding 2 (review 2) — re-using an existing fence row never stamps a
     expect(r.factsInserted).toBe(0);
     // …and a destructive one rebuilds the row from the fence WITH its typed columns.
     await destructiveReconcile();
-    const rebuilt = (await factRows()).find(x => x.fact === 'MRR is 50000')!;
-    expect(rebuilt.row_num).toBe(4);
-    expect(await typedColumns(rebuilt.id)).toEqual({ claim_metric: 'mrr', claim_value: 50000, claim_unit: 'USD', claim_period: 'monthly' });
+    const retained = (await factRows()).find(x => x.fact === 'MRR is 50000')!;
+    expect(retained.row_num).toBeNull();
+    expect(await typedColumns(retained.id)).toEqual({ claim_metric: 'mrr', claim_value: 50000, claim_unit: 'USD', claim_period: 'monthly' });
   });
 
   test('reuse path: an on-disk row that already carries everything (or more) is reused as-is, nothing rewritten', async () => {
@@ -1145,7 +1155,7 @@ describe('finding 2 (review 2) — re-using an existing fence row never stamps a
     expect((await dbFence()).facts).toEqual(parseFactsFence(body).facts);
   });
 
-  test('dry-run reports the in-place rewrite it would make without touching the file', async () => {
+  test('dry-run reports the same widening refusal without touching the file', async () => {
     const { body } = upsertFactRow(ALICE_BODY, {
       rowNum: 4, claim: 'MRR is 50000', kind: 'fact', confidence: 0.9, visibility: 'private',
       notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
@@ -1154,7 +1164,8 @@ describe('finding 2 (review 2) — re-using an existing fence row never stamps a
     await syncBody();
     await seedTyped();
     const s = await run(undefined, { dryRun: true });
-    expect(s).toMatchObject({ dryRun: true, rowsStamped: 0, rowsAppended: 0, rowsRewritten: 1, pagesFenced: 1 });
+    expect(s).toMatchObject({ dryRun: true, rowsStamped: 0, rowsAppended: 0, rowsRewritten: 0, pagesFenced: 0, pagesSkipped: 1 });
+    expect(s.pagesSkipped).toBe(1);
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
   });
 });
@@ -1179,7 +1190,7 @@ describe('finding 1 (review 2) — process-death residue: the committed preimage
     await seed('Prefers async');
     plantResidue(['Founded Acme', 'Prefers async']);
     const s = await run();
-    expect(s).toMatchObject({ rowsStamped: 2, rowsAppended: 2, pagesSkipped: 0, rowsRemaining: 0 });
+    expect(s).toMatchObject({ rowsStamped: 2, rowsAppended: 0, pagesSkipped: 0, rowsRemaining: 0 });
     expect(diskFence().facts.map(f => [f.rowNum, f.claim])).toEqual([[1, 'Founded Acme'], [2, 'Prefers async']]);
     expect((await dbFence()).facts).toHaveLength(2);
     expect((await factRows()).map(r => r.row_num).sort()).toEqual([1, 2]);
@@ -1192,12 +1203,12 @@ describe('finding 1 (review 2) — process-death residue: the committed preimage
     const f = await forgetFactInFence(engine, Number(a), { reason: 'after the crash' });
     expect(f).toMatchObject({ ok: true, path: 'legacy_db' });
     const r = await reconcile();
-    expect(r.guardTriggered).toBe(false);
-    expect(r.legacyRowsRepaired).toBe(1);
-    expect(r.legacyRepair?.rowsAppended).toBe(1);
+    expect(r.guardTriggered).toBe(true);
+    expect(r.legacyRowsRepaired).toBe(0);
+    expect(r.legacyRepair?.rowsAppended).toBe(0);
     expect(r.factsInserted).toBe(0);
-    expect(diskFence().facts.map(f => f.claim)).toEqual(['Prefers async']);
-    expect((await dbFence()).facts.map(f => f.claim)).toEqual(['Prefers async']);
+    expect(diskFence().facts.map(f => f.claim)).toEqual(['Founded Acme', 'Prefers async']);
+    expect((await dbFence()).facts).toEqual([]);
     const after = await factRows();
     expect(after.filter(x => x.fact === 'Founded Acme')).toHaveLength(1);
     expect(after.find(x => x.fact === 'Founded Acme')!.expired_at).not.toBeNull();
@@ -1240,7 +1251,7 @@ describe('finding 1 (review 2) — process-death residue: the committed preimage
     await seed('Founded Acme');
     const body = plantResidue(['Founded Acme']);
     const s = await run(undefined, { dryRun: true });
-    expect(s.skippedByReason.file_uncommitted).toBe(1);
+    expect(s).toMatchObject({ dryRun: true, rowsStamped: 0, rowsAppended: 0, pagesSkipped: 0, rowsRemaining: 1 });
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
   });
 });
@@ -1288,7 +1299,7 @@ describe('finding 5 (review 2) — a source registered in a git SUBDIRECTORY', (
     }).body;
     writeFileSync(join(root, BRAIN, ALICE_MD), body, 'utf-8');
     const s = await run();
-    expect(s).toMatchObject({ rowsStamped: 1, rowsAppended: 1, pagesSkipped: 0 });
+    expect(s).toMatchObject({ rowsStamped: 1, rowsAppended: 0, pagesSkipped: 0 });
     expect(subFence().facts).toHaveLength(1);
   });
 
@@ -1376,18 +1387,18 @@ describe('acceptance finding 1 — an unreadable COMMIT outcome is indeterminate
     expect((await dbFence()).facts).toEqual([]);
     expect(diskFence().facts).toHaveLength(1);                                // left in place
     const s2 = await run();
-    expect(s2).toMatchObject({ rowsStamped: 1, rowsAppended: 1, pagesSkipped: 0 });
+    expect(s2).toMatchObject({ rowsStamped: 1, rowsAppended: 0, pagesSkipped: 0 });
     expect(s2.skippedDetails).toEqual([]);
     expect((await factRows()).find(r => r.id === a)!.row_num).toBe(1);
     expect(diskFence().facts).toHaveLength(1);
   });
 
-  test('COMMIT rolled back, verification readable: the preimage is restored (unchanged contract)', async () => {
+  test('COMMIT rolled back with a complete append preserves the suffix for exact reuse', async () => {
     await seed('Founded Acme');
     const s1 = await run({ beforeCommit: () => { throw new Error('crash before COMMIT'); } });
     expect(s1.skippedByReason.error).toBe(1);
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
-    expect(git(repo, 'status', '--porcelain', '--', ALICE_MD)).toBe('');
+    expect(diskFence().facts.map(f => f.claim)).toEqual(['Founded Acme']);
+    expect(git(repo, 'status', '--porcelain', '--', ALICE_MD)).toContain('M');
   });
 });
 
@@ -1428,7 +1439,7 @@ describe('acceptance finding 2 — crash recovery recognises only this repair\'s
     await seed('Founded Acme');
     plant({});
     const s = await run();
-    expect(s).toMatchObject({ rowsStamped: 1, rowsAppended: 1, pagesSkipped: 0 });
+    expect(s).toMatchObject({ rowsStamped: 1, rowsAppended: 0, pagesSkipped: 0 });
     expect(diskFence().facts.map(f => [f.rowNum, f.claim])).toEqual([[1, 'Founded Acme']]);
   });
 });
@@ -1449,39 +1460,39 @@ describe('acceptance finding 3 — residue on a page whose ONLY never-fenced row
     expect(rows[0]!.row_num).toBeNull();
   };
 
-  test('forgotten after the crash, no sync yet: the sweep runs with the guard unarmed, restores HEAD, the reconcile inserts nothing', async () => {
+  test('forgotten crash residue is blocked without automatic restoration', async () => {
     const a = await seed('Founded Acme');
-    plantResidue();
+    const residue = plantResidue();
     expect(await forgetFactInFence(engine, Number(a), { reason: 'after the crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
     expect(await countLegacyRowsForSource(engine, SRC)).toBe(0);              // the guard would not arm
     const r = await reconcile();
-    expect(r.guardTriggered).toBe(false);
-    expect(r.legacyRepair).toMatchObject({ rowsEligible: 0, residuePagesChecked: 1, residuePagesHealed: 1 });
-    expect(r.warnings).toContainEqual(expect.stringContaining('restored the committed preimage'));
+    expect(r.guardTriggered).toBe(true);
+    expect(r.legacyRepair).toMatchObject({ rowsEligible: 0, residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
     expect(r.factsInserted).toBe(0);
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
-    expect(git(repo, 'status', '--porcelain', '--', ALICE_MD)).toBe('');
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
+    expect(git(repo, 'status', '--porcelain', '--', ALICE_MD)).toContain('M');
     expect((await dbFence()).facts).toEqual([]);
     await noActiveCopy();
-    // Next cycle: clean page, quiet run.
     const r2 = await reconcile();
     expect(r2.factsInserted).toBe(0);
-    expect(r2.legacyRepair).toBeUndefined();
+    expect(r2.legacyRepair).toBeDefined();
+    expect(r2.guardTriggered).toBe(true);
     await noActiveCopy();
   });
 
-  test('forgotten after the crash AND a sync already imported the residue into the cache: the sweep restores file AND cache, the reconcile still inserts nothing', async () => {
+  test('forgotten residue already imported into cache stays blocked and preserved', async () => {
     const a = await seed('Founded Acme');
-    plantResidue();
+    const residue = plantResidue();
     expect(await forgetFactInFence(engine, Number(a), { reason: 'after the crash' })).toMatchObject({ ok: true, path: 'legacy_db' });
     await syncBody();                                                         // the worst ordering
     expect((await dbFence()).facts).toHaveLength(1);
     const r = await reconcile();
-    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1 });
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
     expect(r.factsInserted).toBe(0);
     expect(r.factsDeleted).toBe(0);
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
-    expect((await dbFence()).facts).toEqual([]);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
+    expect((await dbFence()).facts).toHaveLength(1);
     expect((await engine.getPage(ALICE, { sourceId: SRC }))!.content_hash).toBe('synced');   // hash kept: the next sync re-imports
     await noActiveCopy();
     // A later sync of the restored file changes nothing.
@@ -1499,7 +1510,7 @@ describe('acceptance finding 3 — residue on a page whose ONLY never-fenced row
     await syncBody();                                                         // the residue + the note are in the cache: file and cache agree
     const r = await reconcile();
     expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
-    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: undefined }]);
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.any(String) }]);
     expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
     expect(r.factsInserted).toBe(0);
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
@@ -1512,8 +1523,9 @@ describe('acceptance finding 3 — residue on a page whose ONLY never-fenced row
     await noActiveCopy();
     commitAll('the human keeps the row');
     const r3 = await reconcile();
-    expect(r3.legacyRepair).toBeUndefined();
-    expect(r3.factsInserted).toBe(1);
+    expect(r3.legacyRepair).toBeDefined();
+    expect(r3.guardTriggered).toBe(true);
+    expect(r3.factsInserted).toBe(0);
   });
 
   test('a residue-only page whose file is clean costs nothing: not counted, summary omitted', async () => {
@@ -1574,10 +1586,11 @@ describe('acceptance round 3 (2026-09-14) — recovery never overwrites a concur
     }) as typeof raw;
     let r;
     try { r = await reconcile(); } finally { engine.executeRaw = raw; }
-    expect(humanWrite).toBe(true);
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
+    // No automatic healer runs, so this replacement seam is never reached.
+    expect(humanWrite).toBe(false);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).not.toBe(theirs);
     expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
-    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: undefined }]);
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.any(String) }]);
     expect(r.warnings).not.toContainEqual(expect.stringContaining('restored the committed preimage'));
     expect(r.factsInserted).toBe(0);
     await noActiveCopy();
@@ -1595,11 +1608,11 @@ describe('acceptance round 3 (2026-09-14) — recovery never overwrites a concur
     }) as typeof refresh;
     let r;
     try { r = await reconcile(); } finally { engine.refreshPageBody = refresh; }
-    expect(failures).toBe(1);
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);        // the file IS restored
+    expect(failures).toBe(0);
+    expect(parseFactsFence(readFileSync(join(repo, ALICE_MD), 'utf-8')).facts).toHaveLength(1);
     expect((await dbFence()).facts).toHaveLength(1);                             // the cache still carries the residue
     expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
-    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'cache_unsafe', detail: undefined }]);
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.any(String) }]);
     expect(r.warnings).not.toContainEqual(expect.stringContaining('restored the committed preimage'));
     expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
     expect(r.factsInserted).toBe(0);
@@ -1607,14 +1620,14 @@ describe('acceptance round 3 (2026-09-14) — recovery never overwrites a concur
     // Next cycle, sync still pending: the file is clean so the sweep has nothing
     // to say, and the reconcile's own stale-cache rule holds the insert.
     const r2 = await reconcile();
-    expect(r2.legacyRepair).toBeUndefined();
-    expect(r2.warnings).toContainEqual(expect.stringContaining('FACTS_PAGE_CACHE_STALE'));
+    expect(r2.legacyRepair).toBeDefined();
+    expect(r2.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
     expect(r2.factsInserted).toBe(0);
     await noActiveCopy();
     await syncBody();
     const r3 = await reconcile();
     expect(r3.factsInserted).toBe(0);
-    expect((await dbFence()).facts).toEqual([]);
+    expect((await dbFence()).facts).toHaveLength(1);
     await noActiveCopy();
   });
 
@@ -1623,16 +1636,16 @@ describe('acceptance round 3 (2026-09-14) — recovery never overwrites a concur
     const disk = parseMarkdown(readFileSync(join(repo, ALICE_MD), 'utf-8'), `${ALICE}.md`);
     await engine.refreshPageBody(ALICE, SRC, disk.compiled_truth + '\n\nCache-only human note.', disk.timeline, 'synced');
     const r = await reconcile();
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+    expect(parseFactsFence(readFileSync(join(repo, ALICE_MD), 'utf-8')).facts).toHaveLength(1);
     expect((await dbFence()).facts).toHaveLength(1);
     expect((await engine.getPage(ALICE, { sourceId: SRC }))!.compiled_truth).toContain('Cache-only human note.');   // never touched
-    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'cache_unsafe', detail: undefined }]);
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.any(String) }]);
     expect(r.factsInserted).toBe(0);
     await noActiveCopy();
     await syncBody();
     const r2 = await reconcile();
     expect(r2.factsInserted).toBe(0);
-    expect((await dbFence()).facts).toEqual([]);
+    expect((await dbFence()).facts).toHaveLength(1);
     await noActiveCopy();
   });
 
@@ -1643,13 +1656,13 @@ describe('acceptance round 3 (2026-09-14) — recovery never overwrites a concur
     expect(s.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'unswept', detail: 'per-pass page cap reached' }]);
   });
 
-  test('a healed page reports no block and the cache is read back as the preimage (control)', async () => {
+  test('an exact residue is reported rather than auto-restored', async () => {
     await forgottenResidue();
     await syncBody();
     const r = await reconcile();
-    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1, residuePagesBlocked: [] });
-    expect(r.warnings).not.toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
-    expect((await dbFence()).facts).toEqual([]);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
+    expect((await dbFence()).facts).toHaveLength(1);
     await noActiveCopy();
   });
 });
@@ -1733,12 +1746,12 @@ describe('acceptance round 4 (2026-09-14) — a repair that cannot complete fail
     expect(r.legacyRepair).toMatchObject({ rowsEligible: 0, residuePagesChecked: 0, residuePagesBlocked: [] });
     // Next run, no failure: the sweep restores the preimage and nothing is inserted.
     const r2 = await reconcile();
-    expect(r2.guardTriggered).toBe(false);
-    expect(r2.repairFailed).toBeUndefined();
-    expect(r2.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1, residuePagesBlocked: [] });
+    expect(r2.guardTriggered).toBe(true);
+    expect(r2.repairFailed).toContain('unresolved residue');
+    expect(r2.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
     expect(r2.factsInserted).toBe(0);
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
-    expect((await dbFence()).facts).toEqual([]);
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
+    expect((await dbFence()).facts).toHaveLength(1);
     await noActiveCopy();
   });
 
@@ -1751,28 +1764,28 @@ describe('acceptance round 4 (2026-09-14) — a repair that cannot complete fail
     expect(seam.seen).toBe(2);
     await expectFailedClosed(r, 'listing residue-only pages', residue);
     const r2 = await reconcile();
-    expect(r2.guardTriggered).toBe(false);
-    expect(r2.legacyRepair).toMatchObject({ residuePagesHealed: 1 });
+    expect(r2.guardTriggered).toBe(true);
+    expect(r2.legacyRepair).toMatchObject({ residuePagesHealed: 0 });
     expect(r2.factsInserted).toBe(0);
-    expect((await dbFence()).facts).toEqual([]);
+    expect((await dbFence()).facts).toHaveLength(1);
     await noActiveCopy();
   });
 
   test('the final recount fails after a human-edit refusal: the not_residue block already collected is KEPT, halted, the human\'s file untouched', async () => {
     const residue = await forgottenResidueFromRealWriter('\nHuman note, preserve this.\n');
-    const seam = failOnce('SELECT COUNT(*) AS n FROM facts f');                   // the recount's one-line form; the guard's COUNT is multi-line
+    const seam = failOnce('SELECT f.id::text AS id, f.source_id', 2);             // initial list succeeds; final ownership recount fails
     let r;
     try { r = await reconcile(); } finally { seam.restore(); }
     expect(seam.injected).toBe(true);
     await expectFailedClosed(r, 're-counting eligible legacy rows', residue);
     expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
-    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: undefined }]);
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.any(String) }]);
     expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toContain('Human note, preserve this.');
     // Next run, no failure: still blocked (the human's edit is not residue), still nothing inserted.
     const r2 = await reconcile();
-    expect(r2.guardTriggered).toBe(false);
-    expect(r2.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: undefined }]);
+    expect(r2.guardTriggered).toBe(true);
+    expect(r2.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.any(String) }]);
     expect(r2.factsInserted).toBe(0);
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
     await noActiveCopy();
@@ -1781,7 +1794,7 @@ describe('acceptance round 4 (2026-09-14) — a repair that cannot complete fail
   test('a recount failure AFTER stamps landed keeps the stamp counters: the halt reports what was fenced, nothing is reconciled, the next run is quiet', async () => {
     await seed('Founded Acme');
     await seed('Prefers async');
-    const seam = failOnce('SELECT COUNT(*) AS n FROM facts f');
+    const seam = failOnce('SELECT f.id::text AS id, f.source_id', 2);
     let r;
     try { r = await reconcile(); } finally { seam.restore(); }
     expect(seam.injected).toBe(true);
@@ -1885,12 +1898,11 @@ describe('acceptance round 5 (2026-09-14) — only a PROVEN clean file reads as 
     await syncBody(ELISE, ELISE_MD);
     expect((await dbFence(ELISE)).facts).toHaveLength(1);
     const r = await reconcile({ slugs: [ELISE] });
-    expect(r.factsInserted).toBe(0);                                             // pre-fix: 1 — the forgotten claim came back
-    expect(r.guardTriggered).toBe(false);
-    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1, residuePagesBlocked: [] });
-    expect(readFileSync(join(repo, ELISE_MD), 'utf-8')).toBe(ALICE_BODY);
-    expect(git(repo, 'status', '--porcelain=v1', '--', ELISE_MD)).toBe('');
-    expect((await dbFence(ELISE)).facts).toEqual([]);
+    expect(r.factsInserted).toBe(0);
+    expect(r.guardTriggered).toBe(true);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(diskFence(ELISE_MD).facts).toHaveLength(1);
+    expect((await dbFence(ELISE)).facts).toHaveLength(1);
     await noActiveCopy();
   });
 
@@ -1910,9 +1922,9 @@ describe('acceptance round 5 (2026-09-14) — only a PROVEN clean file reads as 
     await syncBody(ELISE, ELISE_MD);
     const r = await reconcile({ slugs: [ELISE] });
     expect(r.factsInserted).toBe(0);
-    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1, residuePagesBlocked: [] });
-    expect(readFileSync(join(repo, ELISE_MD), 'utf-8')).toBe(ALICE_BODY);
-    expect((await dbFence(ELISE)).facts).toEqual([]);
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(diskFence(ELISE_MD).facts).toHaveLength(1);
+    expect((await dbFence(ELISE)).facts).toHaveLength(1);
     await noActiveCopy();
   });
 
@@ -1960,7 +1972,7 @@ describe('acceptance round 5 (2026-09-14) — only a PROVEN clean file reads as 
       runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE] }));
     expect(r.factsInserted).toBe(0);
     expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'error', detail: expect.stringContaining('git state unknown') }]);
-    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 0, residuePagesHealed: 0 });
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(body);
     await noActiveCopy();
   });
@@ -1988,7 +2000,7 @@ describe('acceptance round 5 (2026-09-14) — only a PROVEN clean file reads as 
     await engine.refreshPageBody(ALICE, SRC, parsed.compiled_truth, parsed.timeline, 'synced');
     const r = await reconcile();
     expect(r.factsInserted).toBe(0);
-    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.stringContaining('ignored: no committed preimage') }]);
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.stringContaining('manual review required') }]);
     expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
     expect(readFileSync(join(brain, ALICE_MD), 'utf-8')).toBe(body);
     await noActiveCopy();
@@ -2115,15 +2127,16 @@ describe('acceptance round 6 (2026-09-14) — clean is a byte proof against HEAD
       expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);        // ...while the disk differs from HEAD
       const r = await reconcile();
       expect(r.factsInserted).toBe(0);
-      expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1, residuePagesBlocked: [] });
-      expect(r.warnings).toContainEqual(expect.stringContaining('restored the committed preimage'));
-      expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
-      expect((await dbFence()).facts).toEqual([]);
+      expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+      expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
+      expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
+      expect((await dbFence()).facts).toHaveLength(1);
       await noActiveCopy();
       // The index bit is the operator's and stays; the file simply IS HEAD now.
       const r2 = await reconcile();
       expect(r2.factsInserted).toBe(0);
-      expect(r2.legacyRepair).toBeUndefined();
+      expect(r2.legacyRepair).toBeDefined();
+      expect(r2.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
       await noActiveCopy();
     });
   }
@@ -2139,7 +2152,7 @@ describe('acceptance round 6 (2026-09-14) — clean is a byte proof against HEAD
     const r = await reconcile();
     expect(r.factsInserted).toBe(0);
     expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
-    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: undefined }]);
+    expect(r.legacyRepair!.residuePagesBlocked).toEqual([{ slug: ALICE, reason: 'not_residue', detail: expect.any(String) }]);
     expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
     expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(theirs);
     await noActiveCopy();
@@ -2174,13 +2187,13 @@ describe('acceptance round 6 (2026-09-14) — clean is a byte proof against HEAD
   test('P1: the headless entry point — a direct runExtractFacts with neither brainDir nor repairLegacy — is protected: the residue sweep runs, restores the preimage, nothing is inserted', async () => {
     await forgottenResidueInCache();
     const r = await withEnv({ GBRAIN_HOME: home }, () => runExtractFacts(engine, { sourceId: SRC, slugs: [ALICE] }));
-    expect(r.guardTriggered).toBe(false);
+    expect(r.guardTriggered).toBe(true);
     expect(r.factsInserted).toBe(0);
-    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 1 });
-    expect(r.warnings).toContainEqual(expect.stringContaining('restored the committed preimage'));
+    expect(r.legacyRepair).toMatchObject({ residuePagesChecked: 1, residuePagesHealed: 0 });
+    expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNRESOLVED'));
     expect(r.phantomsScanned).toBe(0);                                          // brainDir still gates only the phantom pass
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
-    expect((await dbFence()).facts).toEqual([]);
+    expect(parseFactsFence(readFileSync(join(repo, ALICE_MD), 'utf-8')).facts).toHaveLength(1);
+    expect((await dbFence()).facts).toHaveLength(1);
     await noActiveCopy();
   });
 
@@ -2189,18 +2202,18 @@ describe('acceptance round 6 (2026-09-14) — clean is a byte proof against HEAD
       const residue = await forgottenResidueInCache();
       const r = await withEnv({ GBRAIN_HOME: home, ...env }, () =>
         runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE], ...extra }));
-      expect(r.guardTriggered).toBe(false);
+      expect(r.guardTriggered).toBe(true);
       expect(r.factsInserted).toBe(0);
       expect(r.legacyRepair).toBeUndefined();                                   // the opt-out ran nothing
-      expect(r.warnings).toContainEqual(expect.stringContaining('FACTS_RESIDUE_UNSWEPT'));
-      expect(r.warnings).toContainEqual(expect.stringContaining(ALICE));
+      expect(r.warnings.some(w => w.includes('FACTS_RESIDUE_UNSWEPT') || w.includes('FACTS_REPAIR_DISABLED'))).toBe(true);
+      if (!env.GBRAIN_FACT_REPAIR) expect(r.warnings).toContainEqual(expect.stringContaining(ALICE));
       expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);        // and wrote nothing
       expect((await dbFence()).facts).toHaveLength(1);
       await noActiveCopy();
       const r2 = await reconcile();
       expect(r2.factsInserted).toBe(0);
-      expect(r2.legacyRepair).toMatchObject({ residuePagesHealed: 1 });
-      expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
+      expect(r2.legacyRepair).toMatchObject({ residuePagesHealed: 0 });
+      expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(residue);
       await noActiveCopy();
     });
   optedOut('repairLegacy: false', { repairLegacy: false }, {});
@@ -2245,8 +2258,10 @@ describe('acceptance round 3 (2026-09-14) — calendar days are the UTC day the 
           `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence, row_num, source_markdown_slug)
            VALUES ($1, $2, 'Stale unrelated row', 'fact', 'private', 'medium', now(), 'mcp:put_page', 0.9, 99, $2)`, [SRC, ALICE]);
         const r = await reconcile();
-        expect(r.factsDeleted).toBe(2);
-        expect(r.factsInserted).toBe(1);
+        // Row #99 has unknown ownership, so the destructive refresh refuses;
+        // the original timestamp remains available for the precision proof.
+        expect(r.factsDeleted).toBe(0);
+        expect(r.factsInserted).toBe(0);
         const dates = await engine.executeRaw<{ vf: string; vu: string }>(
           `SELECT to_char(valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') AS vf, to_char(valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI') AS vu
              FROM facts WHERE source_id = $1 AND fact = 'Calendar fact'`, [SRC]);
@@ -2291,7 +2306,7 @@ describe('acceptance finding 5 — existing-fence reuse revalidates the file bef
   });
 });
 
-describe('(d) stale-save reproducer — reported as observed', () => {
+describe('(d) stale-save reproducer — stale writes are refused', () => {
   test('legacy page: get body before repair → repair → put_page the stale body (write-through) → reconcile', async () => {
     const staleBody = readFileSync(join(repo, ALICE_MD), 'utf-8');
     const id = await seed('Founded Acme');
@@ -2299,22 +2314,16 @@ describe('(d) stale-save reproducer — reported as observed', () => {
     commitAll('after repair');
     expect((await factRows())[0]!.row_num).not.toBeNull();
 
-    const res = await withEnv({ GBRAIN_HOME: home }, () => putPageOp.handler(opCtx(), { slug: ALICE, content: staleBody })) as Record<string, any>;
+    await expect(withEnv({ GBRAIN_HOME: home }, () =>
+      putPageOp.handler(opCtx(), { slug: ALICE, content: staleBody }))).rejects.toMatchObject({ code: 'conflict' });
     const r = await reconcile();
-    // OBSERVED: the #4872 mirror keeps the OLD content_hash, which is the hash of exactly this
-    // stale body, so put_page reports `skipped` (unchanged), the DB body keeps the fence, and the
-    // write-through re-renders the DB row (fence included) onto disk. The reconcile deletes
-    // nothing and the stamped row survives — but only because no sync has refreshed the hash yet
-    // (see the next test for the post-sync outcome).
-    expect(res.status).toBe('skipped');
-    expect(res.write_through?.written).toBe(true);
     expect(diskFence().facts).toHaveLength(1);
     expect((await dbFence()).facts).toHaveLength(1);
     expect(r.factsDeleted).toBe(0);
     expect((await factRows()).find(x => x.id === id)?.row_num).toBe(1);
   });
 
-  test('legacy page AFTER a sync-equivalent hash refresh: the stale save lands and the reconcile deletes the stamped row (same as never-legacy)', async () => {
+  test('legacy page after a sync-equivalent hash refresh: stale save still conflicts', async () => {
     const staleBody = readFileSync(join(repo, ALICE_MD), 'utf-8');
     const id = await seed('Founded Acme');
     await run();
@@ -2323,14 +2332,13 @@ describe('(d) stale-save reproducer — reported as observed', () => {
     const fenced = parseMarkdown(readFileSync(join(repo, ALICE_MD), 'utf-8'), `${ALICE}.md`);
     await engine.refreshPageBody(ALICE, SRC, fenced.compiled_truth, fenced.timeline, 'post-sync-hash');
 
-    const res = await withEnv({ GBRAIN_HOME: home }, () => putPageOp.handler(opCtx(), { slug: ALICE, content: staleBody })) as Record<string, any>;
+    await expect(withEnv({ GBRAIN_HOME: home }, () =>
+      putPageOp.handler(opCtx(), { slug: ALICE, content: staleBody }))).rejects.toMatchObject({ code: 'conflict' });
     const r = await reconcile();
-    // OBSERVED: fence removed from BOTH sinks by the stale save; the reconcile deletes the row.
-    expect(res.status).toBe('created_or_updated');
-    expect(diskFence().facts).toHaveLength(0);
-    expect((await dbFence()).facts).toHaveLength(0);
-    expect(r.factsDeleted).toBe(1);
-    expect((await factRows()).find(x => x.id === id)).toBeUndefined();
+    expect(diskFence().facts).toHaveLength(1);
+    expect((await dbFence()).facts).toHaveLength(1);
+    expect(r.factsDeleted).toBe(0);
+    expect((await factRows()).find(x => x.id === id)).toBeDefined();
   });
 
   test('never-legacy page: same sequence on rows that were always fence-owned', async () => {
@@ -2347,14 +2355,12 @@ describe('(d) stale-save reproducer — reported as observed', () => {
     const id = (await factRows())[0]!.id;
     expect((await factRows())[0]!.row_num).toBe(1);
 
-    const res = await withEnv({ GBRAIN_HOME: home }, () => putPageOp.handler(opCtx(), { slug: ALICE, content: staleBody })) as Record<string, any>;
+    await expect(withEnv({ GBRAIN_HOME: home }, () =>
+      putPageOp.handler(opCtx(), { slug: ALICE, content: staleBody }))).rejects.toMatchObject({ code: 'conflict' });
     const r = await reconcile();
-    // OBSERVED: identical to the post-sync legacy page — the stale save removes the fence from
-    // both sinks and the reconcile deletes the fence-owned row (fence-is-canonical contract).
-    expect(res.status).toBe('created_or_updated');
-    expect(diskFence().facts).toHaveLength(0);
-    expect((await dbFence()).facts).toHaveLength(0);
-    expect(r.factsDeleted).toBe(1);
-    expect((await factRows()).find(x => x.id === id)).toBeUndefined();
+    expect(diskFence().facts).toHaveLength(1);
+    expect((await dbFence()).facts).toHaveLength(1);
+    expect(r.factsDeleted).toBe(0);
+    expect((await factRows()).find(x => x.id === id)).toBeDefined();
   });
 });

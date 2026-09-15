@@ -161,18 +161,18 @@ describe.skipIf(skip)('legacy-fact repair on Postgres', () => {
     expect(diskFence().facts).toHaveLength(1);
   });
 
-  test('crash after the rename, before COMMIT: DB rolled back and the committed preimage restored; the next run finishes', async () => {
+  test('crash after the rename preserves a complete suffix; the next run reuses it', async () => {
     await seed('Founded Acme');
     let seen = '';
     const s1 = await run({ hooks: { beforeCommit: () => { seen = readFileSync(join(repo, ALICE_MD), 'utf-8'); throw new Error('injected before COMMIT'); } } });
     expect(s1.skippedByReason.error).toBe(1);
     expect(parseFactsFence(seen).facts).toHaveLength(1);
-    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(ALICE_BODY);
-    expect(git('status', '--porcelain', '--', ALICE_MD)).toBe('');
+    expect(readFileSync(join(repo, ALICE_MD), 'utf-8')).toBe(seen);
+    expect(git('status', '--porcelain', '--', ALICE_MD)).toContain('M');
     expect((await rows())[0]!.row_num).toBeNull();
     expect(parseFactsFence((await engine.getPage(ALICE, { sourceId: SRC }))!.compiled_truth).facts).toEqual([]);
     const s3 = await run();
-    expect(s3).toMatchObject({ rowsAppended: 1, rowsStamped: 1, rowsRemaining: 0 });
+    expect(s3).toMatchObject({ rowsAppended: 0, rowsStamped: 1, rowsRemaining: 0 });
   });
 
   test('rollback, safe order: un-stamp first, then restore the file; facts retained, guard re-arms', async () => {
@@ -223,7 +223,7 @@ describe.skipIf(skip)('legacy-fact repair on Postgres', () => {
     expect(Number(after[0]!.n)).toBe(0);
   });
 
-  test('existing-fence reuse: a committed on-disk row without the typed columns is rewritten in place and the rebuilt row keeps them after a destructive reconcile', async () => {
+  test('existing-fence reuse refuses an automatic typed-column widening', async () => {
     const { body } = upsertFactRow(ALICE_BODY, {
       rowNum: 4, claim: 'MRR is 50000', kind: 'fact', confidence: 0.9, visibility: 'private',
       notability: 'medium', validFrom: '2026-01-02', source: 'mcp:put_page',
@@ -236,36 +236,31 @@ describe.skipIf(skip)('legacy-fact repair on Postgres', () => {
                           claim_metric, claim_value, claim_unit, claim_period)
        VALUES ($1, $2, 'MRR is 50000', 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', 'mcp:put_page', 0.9, 'mrr', 50000, 'USD', 'monthly')`, [SRC, ALICE]);
     const s = await run();
-    expect(s).toMatchObject({ rowsStamped: 1, rowsAppended: 0, rowsRewritten: 1, pagesSkipped: 0 });
-    expect(diskFence().facts[0]).toMatchObject({ rowNum: 4, claimMetric: 'mrr', claimValue: 50000, claimUnit: 'USD', claimPeriod: 'monthly' });
-    // Force the wipe + reinsert: a stale fence-owned row.
-    await engine.executeRaw(
-      `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence, row_num, source_markdown_slug)
-       VALUES ($1, $2, 'Stale', 'fact', 'private', 'medium', now(), 'mcp:put_page', 1.0, 99, $2)`, [SRC, ALICE]);
-    const r = await withEnv({ GBRAIN_HOME: home }, () => runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE] }));
-    expect(r.factsDeleted).toBe(2);
-    expect(r.factsInserted).toBe(1);
-    const db = await engine.executeRaw<{ claim_metric: string; claim_value: number; claim_unit: string; claim_period: string; row_num: number }>(
+    expect(s).toMatchObject({ rowsStamped: 0, rowsAppended: 0, rowsRewritten: 0, pagesSkipped: 1 });
+    expect(s.skippedByReason.file_rewrite_required).toBe(1);
+    expect(diskFence().facts[0]).toMatchObject({ rowNum: 4, claimMetric: undefined });
+    const db = await engine.executeRaw<{ claim_metric: string; claim_value: number; claim_unit: string; claim_period: string; row_num: number | null }>(
       `SELECT claim_metric, claim_value::float8 AS claim_value, claim_unit, claim_period, row_num FROM facts WHERE source_id = $1 AND fact = 'MRR is 50000'`, [SRC]);
     expect(db).toHaveLength(1);
-    expect(db[0]).toEqual({ claim_metric: 'mrr', claim_value: 50000, claim_unit: 'USD', claim_period: 'monthly', row_num: 4 });
+    expect(db[0]).toEqual({ claim_metric: 'mrr', claim_value: 50000, claim_unit: 'USD', claim_period: 'monthly', row_num: null });
   });
 
-  test('typed-claim columns ride into the fence and survive the reconcile; canonical fact/source are written on the stamp', async () => {
+  test('padded claim and blank source are refused without normalization', async () => {
     const r0 = await engine.executeRaw<{ id: string }>(
       `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability, valid_from, source, confidence,
                           claim_metric, claim_value, claim_unit, claim_period)
        VALUES ($1, $2, '  MRR is 50000 ', 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', '', 0.9, 'mrr', 50000, 'USD', 'monthly')
        RETURNING id::text AS id`, [SRC, ALICE]);
     const s = await run();
-    expect(s.rowsStamped).toBe(1);
-    expect(diskFence().facts[0]).toMatchObject({ claim: 'MRR is 50000', claimMetric: 'mrr', claimValue: 50000, claimUnit: 'USD', claimPeriod: 'monthly' });
+    expect(s.rowsStamped).toBe(0);
+    expect(s.skippedByReason.unexpressible_columns).toBe(1);
+    expect(diskFence().facts).toEqual([]);
     const r = await withEnv({ GBRAIN_HOME: home }, () => runExtractFacts(engine, { sourceId: SRC, brainDir: repo, slugs: [ALICE] }));
     expect(r.factsDeleted).toBe(0);
     expect(r.factsInserted).toBe(0);
     const db = await engine.executeRaw<{ fact: string; source: string; claim_metric: string; claim_value: number }>(
       `SELECT fact, source, claim_metric, claim_value::float8 AS claim_value FROM facts WHERE id = $1`, [Number(r0[0]!.id)]);
-    expect(db[0]).toEqual({ fact: 'MRR is 50000', source: 'fence:reconcile', claim_metric: 'mrr', claim_value: 50000 });
+    expect(db[0]).toEqual({ fact: '  MRR is 50000 ', source: '', claim_metric: 'mrr', claim_value: 50000 });
   });
 
   test('dry-run acquires no page lock and writes nothing', async () => {
@@ -379,10 +374,12 @@ describe.skipIf(skip)('legacy-fact repair on Postgres', () => {
       const r = await engine.executeRaw<{ row_num: number | null; valid_until: Date | string | null }>(`SELECT row_num, valid_until FROM facts WHERE id = $1`, [Number(a)]);
       expect(r[0]!.row_num).toBeNull();
       expect(r[0]!.valid_until).not.toBeNull();
-      // The competitor's change is preserved and carried on the next run.
+      // The competitor's sub-day value is preserved but cannot be represented
+      // losslessly as a fence date, so the next run refuses it.
       const s2 = await run();
-      expect(s2).toMatchObject({ rowsStamped: 1, rowsAppended: 1 });
-      expect(diskFence().facts[0]!.validUntil).toBe('2026-12-31');
+      expect(s2).toMatchObject({ rowsStamped: 0, rowsAppended: 0, pagesSkipped: 1 });
+      expect(s2.skippedByReason.unexpressible_columns).toBe(1);
+      expect(diskFence().facts).toEqual([]);
     }, 30_000);
 
     test('a second connection cannot see a stamped row before the file carries its fence: read from the rival inside the transaction, after the rename', async () => {

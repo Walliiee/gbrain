@@ -18,7 +18,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -27,6 +27,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { v0_32_2, __setTestEngineOverride, __testing } from '../src/commands/migrations/v0_32_2.ts';
 import { __testing as applyTesting } from '../src/commands/apply-migrations.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
+import { importFromContent } from '../src/core/import-file.ts';
 
 let engine: PGLiteEngine;
 let cleanDir: string;   // source 'default' — clean git repo
@@ -51,14 +52,15 @@ function gitInit(dir: string): void {
 }
 
 beforeEach(async () => {
+  await engine.executeRaw('DELETE FROM content_chunks');
+  await engine.executeRaw('DELETE FROM pages');
+  await engine.executeRaw('DELETE FROM facts');
   cleanDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-scope-clean-'));
   dirtyDir = mkdtempSync(join(tmpdir(), 'mig-v0_32_2-scope-dirty-'));
   gitInit(cleanDir);
   gitInit(dirtyDir);
   writeFileSync(join(dirtyDir, 'uncommitted.md'), 'dirty', 'utf-8');
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (engine as any).db.query('DELETE FROM facts');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await (engine as any).db.query(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [cleanDir]);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -80,11 +82,26 @@ const OPTS = { yes: true, dryRun: false, noAutopilotInstall: true };
 const scoped = (sourceId: string) => ({ ...OPTS, sourceId });
 
 async function seedLegacyFact(sourceId: string, entitySlug: string | null, fact: string): Promise<void> {
+  // Round8 compatibility rationale: safe backfill needs an existing committed
+  // page. Scope tests now model that instead of relying on removed stub writes.
+  if (entitySlug) {
+    const dir = sourceId === 'default' ? cleanDir : dirtyDir;
+    const file = join(dir, `${entitySlug}.md`);
+    if (!existsSync(file)) {
+      mkdirSync(join(dir, entitySlug.split('/').slice(0, -1).join('/')), { recursive: true });
+      writeFileSync(file, `---\ntype: person\ntitle: Fixture\n---\n\n# Fixture\n`, 'utf8');
+    }
+    if (execFileSync('git', ['-C', dir, 'status', '--porcelain', '--', `${entitySlug}.md`], { encoding: 'utf8' })) {
+      execFileSync('git', ['-C', dir, 'add', '--', `${entitySlug}.md`]);
+      execFileSync('git', ['-C', dir, 'commit', '-qm', `fixture ${entitySlug}`, '--', `${entitySlug}.md`]);
+    }
+    await importFromContent(engine, entitySlug, readFileSync(file, 'utf8'), { sourceId, noEmbed: true });
+  }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   await (engine as any).db.query(
     `INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, notability,
                         valid_from, source, confidence)
-     VALUES ($1, $2, $3, 'fact', 'private', 'medium', now(), 'mcp:put_page', 1.0)`,
+     VALUES ($1, $2, $3, 'fact', 'private', 'medium', '2026-01-02T00:00:00Z', 'mcp:put_page', 1.0)`,
     [sourceId, entitySlug, fact],
   );
 }
@@ -130,8 +147,8 @@ describe('phaseBFenceFacts — scoped to one source', () => {
     expect(parseFactsFence(body).facts.map(f => f.claim).sort()).toEqual(['Founded Acme', 'Prefers async']);
     expect(await rowNums('default')).toEqual([1, 2]);
 
-    // Unscoped source: no file, no DB change, its dirty tree never consulted.
-    expect(existsSync(join(dirtyDir, 'people/bob.md'))).toBe(false);
+    // Unscoped source: its pre-existing page stays unfenced and DB unchanged.
+    expect(parseFactsFence(readFileSync(join(dirtyDir, 'people/bob.md'), 'utf8')).facts).toEqual([]);
     expect(await rowNums('other')).toEqual([null]);
   });
 
@@ -146,7 +163,7 @@ describe('phaseBFenceFacts — scoped to one source', () => {
     // Nothing fenced anywhere: the clean source was out of scope.
     expect(await rowNums('default')).toEqual([null]);
     expect(await rowNums('other')).toEqual([null]);
-    expect(existsSync(join(cleanDir, 'people/alice.md'))).toBe(false);
+    expect(parseFactsFence(readFileSync(join(cleanDir, 'people/alice.md'), 'utf8')).facts).toEqual([]);
   });
 
   test('unknown --source fails loudly instead of reporting an empty backlog', async () => {

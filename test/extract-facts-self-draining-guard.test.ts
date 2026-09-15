@@ -134,7 +134,8 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
     expect(r.legacyRowsRepaired).toBe(0);
     expect(r.legacyRepair?.skippedByReason.symlink).toBe(1);
     expect(r.warnings.some(w => w.includes('symlink=1') && w.includes('people/alice'))).toBe(true);
-    expect(r.warnings.some(w => w.includes('pending fence backfill'))).toBe(true);
+    // Round8: a definite page-local refusal remains loud while healthy pages may continue.
+    expect(r.warnings.some(w => w.includes('known refused page'))).toBe(true);
     expect(readFileSync(real, 'utf-8')).toBe(ALICE_BODY);
     expect((await activeRows())[0]!.row_num).toBeNull();
   });
@@ -192,31 +193,29 @@ describe('runExtractFacts — the guard heals what it arms on', () => {
     expect(r.legacyRepair).toBeUndefined();
   });
 
-  test('a crash inside the repair leaves the guard armed and loud, never a fabricated success; nothing is written, so the next run simply finishes', async () => {
+  test('a complete append followed by a crash stays loud, then retries by exact reuse', async () => {
     await seed('Founded Acme');
-    for (const seam of ['beforeStamp', 'afterFirstStampUpdate', 'beforeCommit'] as const) {
-      const repairHooks: LegacyStampHooks = {};
-      repairHooks[seam] = () => { throw new Error(`injected at ${seam}`); };
-      const r = await withEnv({ GBRAIN_HOME: home }, () =>
-        runExtractFacts(engine, { sourceId: SRC, brainDir, repairHooks }));
-      expect(r.guardTriggered).toBe(true);
-      expect(r.legacyRowsPending).toBe(1);
-      expect(r.legacyRepair?.skippedByReason.error).toBe(1);
-      expect(r.legacyRepair?.skippedDetails[0]).toContain(`injected at ${seam}`);
-      // The row is NOT fence-owned, so the reconcile did not run and could not
-      // have deleted it — and neither sink carries a fence: the transaction
-      // rolled back and (after the rename) the committed preimage was restored.
-      expect((await activeRows())[0]!.row_num).toBeNull();
-      expect(r.factsDeleted).toBe(0);
-      expect(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8')).toBe(ALICE_BODY);
-      expect(git('status', '--porcelain').trimEnd()).toBe('');
-    }
+    const repairHooks: LegacyStampHooks = {
+      beforeCommit: () => { throw new Error('injected at beforeCommit'); },
+    };
+    const r = await withEnv({ GBRAIN_HOME: home }, () =>
+      runExtractFacts(engine, { sourceId: SRC, brainDir, repairHooks }));
+    expect(r.guardTriggered).toBe(true);
+    expect(r.legacyRowsPending).toBe(1);
+    expect(r.legacyRepair?.skippedByReason.error).toBe(1);
+    expect(r.legacyRepair?.skippedDetails[0]).toContain('injected at beforeCommit');
+    expect((await activeRows())[0]!.row_num).toBeNull();
+    expect(r.factsDeleted).toBe(0);
+    const completeAppend = readFileSync(join(brainDir, 'people/alice.md'), 'utf-8');
+    expect(parseFactsFence(completeAppend).facts.map(f => f.claim)).toEqual(['Founded Acme']);
 
-    // No operator step: the next run finishes.
+    // Round8 compatibility rationale: restoring the preimage would erase a
+    // potentially durable append. The retry proves and reuses the exact suffix.
     const r2 = await withEnv({ GBRAIN_HOME: home }, () =>
       runExtractFacts(engine, { sourceId: SRC, brainDir }));
     expect(r2.guardTriggered).toBe(false);
     expect(r2.legacyRowsRepaired).toBe(1);
+    expect(readFileSync(join(brainDir, 'people/alice.md'), 'utf-8')).toBe(completeAppend);
     expect((await activeRows()).map(x => x.fact)).toEqual(['Founded Acme']);
   });
 });

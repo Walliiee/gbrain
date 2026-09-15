@@ -139,6 +139,29 @@ function factsFenceSpans(body: string): Array<{ begin: number; end: number }> {
   return spans;
 }
 
+/**
+ * Replace every physical Facts fence with one canonical logical stream at
+ * the first fence position. Text between repeated fences is kept byte-for-
+ * byte; only the later fence blocks are removed. Passing null removes all
+ * fences. A non-null block is appended as a Facts section when none exists.
+ */
+export function replaceFactsFenceStream(body: string, fenceBlock: string | null): string {
+  const spans = factsFenceSpans(body);
+  if (spans.length === 0) {
+    if (fenceBlock === null) return body;
+    const sep = body.endsWith('\n') ? '\n' : '\n\n';
+    return `${body}${sep}## Facts\n\n${fenceBlock}\n`;
+  }
+
+  let out = body.slice(0, spans[0]!.begin) + (fenceBlock ?? '');
+  let cursor = spans[0]!.end;
+  for (const span of spans.slice(1)) {
+    out += body.slice(cursor, span.begin);
+    cursor = span.end;
+  }
+  return out + body.slice(cursor);
+}
+
 function parseConfidenceCell(raw: string): number | undefined {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
@@ -562,17 +585,9 @@ export function upsertFactRow(
   const newFence = renderFactsTable(allRows);
 
   const spans = factsFenceSpans(body);
-  const beginIdx = spans[0]?.begin ?? -1;
-  const endIdx = spans[0] ? spans[0].end - FACTS_FENCE_END.length : -1;
   let out: string;
-  if (beginIdx !== -1 && endIdx !== -1) {
-    let cursor = spans[0]!.end;
-    out = body.slice(0, beginIdx) + newFence;
-    for (const span of spans.slice(1)) {
-      out += body.slice(cursor, span.begin);
-      cursor = span.end;
-    }
-    out += body.slice(cursor);
+  if (spans.length > 0) {
+    out = replaceFactsFenceStream(body, newFence);
   } else {
     // #4756: the FIRST fence must land in compiled_truth — ABOVE the timeline
     // sentinel. splitBody() files everything below the sentinel into
