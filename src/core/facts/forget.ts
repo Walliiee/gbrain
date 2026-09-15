@@ -195,15 +195,21 @@ async function forgetFactOnce(
   const filePath = resolved.filePath;
   const tmpPath = `${filePath}.tmp`;
 
-  if (!existsSync(filePath)) {
-    // File deleted out from under us — only the DB has the row.
-    // Legacy path is the safe behavior; the operator can fix the
-    // tree mismatch separately.
-    const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-    return { ok, path: 'legacy_db', reason };
-  }
-
-  return withPageLock(slug, async () => {
+  const reroute = Symbol('reroute');
+  const outcome = await withPageLock<ForgetFactResult | typeof reroute>(slug, async () => {
+    // Routing may have changed while this call waited for a redirect's lock.
+    const current = await engine.executeRaw<FactDbRow>(
+      `SELECT id, source_id, entity_slug, row_num, source_markdown_slug, expired_at, visibility FROM facts WHERE id = $1`, [factId]);
+    const now = current[0];
+    if (!now || (opts.sourceId !== undefined && now.source_id !== opts.sourceId) || (opts.worldOnly && now.visibility !== 'world')) {
+      return { ok: false, path: 'not_found', reason };
+    }
+    if (now.expired_at !== null) return { ok: false, path: 'already_expired', reason };
+    if (now.source_id !== row.source_id || now.source_markdown_slug !== slug || now.row_num !== targetRowNum) return reroute;
+    if (!existsSync(filePath)) {
+      const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: missing canonical file, preserve explicit forget in DB
+      return { ok, path: 'legacy_db', reason };
+    }
     const body = readFileSync(filePath, 'utf-8');
     const parsed = parseFactsFence(body);
 
@@ -273,4 +279,11 @@ async function forgetFactOnce(
 
     return { ok: true, path: 'fence', reason };
   }, { timeoutMs: 5_000 });
+  // Release the old page lock BEFORE acquiring the new one (sorted redirect
+  // locks otherwise invert with this reroute).
+  if (outcome === reroute) {
+    if (rerouteOnce) return forgetFactOnce(engine, factId, opts, false);
+    throw new Error('forget routing changed twice; retry without losing the fact identity');
+  }
+  return outcome;
 }

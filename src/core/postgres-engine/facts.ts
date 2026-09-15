@@ -245,7 +245,12 @@ export async function insertFacts(
         `;
         if (ins[0]) {
           const created = creationTimes.get(JSON.stringify([input.fact, input.source]));
-          if (created !== undefined) await tx`UPDATE facts SET created_at = ${created}::timestamptz WHERE id = ${ins[0].id}`;
+          // Bind as TEXT and cast in SQL. With a bare `${created}::timestamptz`
+          // postgres.js infers a timestamp parameter from the cast and
+          // serialises the value at millisecond precision, so a database
+          // microsecond tail is silently truncated (`.123456` -> `.123000`).
+          // `::text::timestamptz` sends the exact captured string.
+          if (created !== undefined) await tx`UPDATE facts SET created_at = ${created}::text::timestamptz WHERE id = ${ins[0].id}`;
           out.push(Number(ins[0].id));
         }
         rowIds.push(ins[0] ? Number(ins[0].id) : null);

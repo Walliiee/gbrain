@@ -20,9 +20,9 @@
  *
  * Idempotency: phase B only touches rows with row_num IS NULL. Re-runs
  * after a partial completion pick up where the previous run stopped.
- * Per-page atomic (.tmp + parse + rename, same primitive as
- * fence-write.ts). Dirty-tree refusal mirrors src/core/dry-fix.ts so
- * the user can review the diff before committing.
+ * Per-page repair uses the same pinned append/reuse, full-snapshot validation,
+ * lossless metadata checks and disable boundary as automatic maintenance.
+ * Missing files, dirty bytes and lossy rows refuse; no separate fallback writer.
  *
  * Facts with NULL entity_slug are structurally unfenceable (no page to
  * fence onto). They're skipped with a warning; the operator decides
@@ -40,8 +40,8 @@
  * complete brain. No `--source` = brain-wide, unchanged.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import type {
@@ -50,7 +50,9 @@ import type {
 import type { BrainEngine } from '../../core/engine.ts';
 import { loadConfig, toEngineConfig } from '../../core/config.ts';
 import { createEngine } from '../../core/engine-factory.ts';
-import { upsertFactRow, parseFactsFence } from '../../core/facts-fence.ts';
+import { parseFactsFence } from '../../core/facts-fence.ts';
+import { fenceDateSql, stampLegacyFactsToFence, type LegacyStampRow } from '../../core/facts/fence-write.ts';
+import { isFactRepairDisabled } from '../../core/facts/repair-policy.ts';
 
 let testEngineOverride: BrainEngine | null = null;
 export function __setTestEngineOverride(engine: BrainEngine | null): void {
@@ -111,20 +113,7 @@ async function phaseASchema(
 
 // ── Phase B — Fence facts ──────────────────────────────────
 
-interface LegacyFactRow {
-  id: string;        // BIGSERIAL — string-typed on the wire for safety
-  source_id: string;
-  entity_slug: string | null;
-  fact: string;
-  kind: 'event' | 'preference' | 'commitment' | 'belief' | 'fact';
-  visibility: 'private' | 'world';
-  notability: 'high' | 'medium' | 'low';
-  context: string | null;
-  valid_from: Date;
-  valid_until: Date | null;
-  source: string;
-  confidence: number;
-}
+type LegacyFactRow = LegacyStampRow & { source_id: string; entity_slug: string | null };
 
 interface SourceLookup {
   id: string;
@@ -212,6 +201,9 @@ async function phaseBFenceFacts(
     return { name: 'fence_facts', status: 'skipped', detail: 'no_brain_configured' };
   }
 
+  if (isFactRepairDisabled()) return { name: 'fence_facts', status: 'failed',
+    detail: 'GBRAIN_FACT_REPAIR=off: fence backfill disabled; nothing written. Drain every writer before rollback.' };
+
   try {
     // Look up all sources + their local_paths.
     const sources = await engine.executeRaw<SourceLookup>(
@@ -232,10 +224,12 @@ async function phaseBFenceFacts(
     // Walk legacy rows in (source_id, entity_slug) groups for per-page
     // atomic writes.
     const legacy = await engine.executeRaw<LegacyFactRow>(
-      `SELECT id, source_id, entity_slug, fact, kind, visibility, notability,
-              context, valid_from, valid_until, source, confidence
+      `SELECT id::text AS id, source_id, entity_slug, fact, kind, visibility, notability,
+              context, ${fenceDateSql('valid_from')} AS valid_from, ${fenceDateSql('valid_until')} AS valid_until,
+              source, confidence, claim_metric, claim_value::text AS claim_value, claim_unit, claim_period,
+              superseded_by, to_jsonb(facts)::text AS snapshot
          FROM facts
-        WHERE row_num IS NULL${scopeSql}
+        WHERE row_num IS NULL AND expired_at IS NULL${scopeSql}
         ORDER BY source_id, entity_slug, id`,
       scopeParams,
     );
@@ -285,99 +279,16 @@ async function phaseBFenceFacts(
 
     for (const [key, group] of groups) {
       const [sourceId, entitySlug] = key.split('\0');
-      const localPath = localPathById.get(sourceId)!;
-      const filePath = join(localPath, `${entitySlug}.md`);
-      const tmpPath = `${filePath}.tmp`;
-
-      try {
-        // Read existing body or stub-create with minimum frontmatter.
-        let body: string;
-        if (existsSync(filePath)) {
-          body = readFileSync(filePath, 'utf-8');
-        } else {
-          mkdirSync(dirname(filePath), { recursive: true });
-          const prefix = entitySlug.split('/')[0];
-          const type =
-            prefix === 'people'    ? 'person' :
-            prefix === 'companies' ? 'company' :
-            prefix === 'deals'     ? 'deal' :
-            /* fallback */           'concept';
-          const tail = entitySlug.split('/').slice(1).join('/');
-          const title = tail.replace(/[-_/]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) || entitySlug;
-          body = `---\ntype: ${type}\ntitle: ${title}\nslug: ${entitySlug}\n---\n\n# ${title}\n`;
-        }
-
-        // Append each legacy row, collecting the assigned row_nums.
-        // Already-fenced rows (row_num already set) are skipped at the
-        // DB-row level by the WHERE clause, but if the SAME (entity,
-        // source, claim, source-text) tuple was previously appended in
-        // a partial-completion re-run, parseFactsFence will see the
-        // existing row and append a duplicate. We dedup on (claim,
-        // source) before append to handle this.
-        const existingFence = parseFactsFence(body);
-        const existingKeySet = new Set(existingFence.facts.map(f => `${f.claim}\0${f.source ?? ''}`));
-
-        const assignments: Array<{ id: string; row_num: number }> = [];
-        for (const row of group) {
-          const key = `${row.fact}\0${row.source ?? ''}`;
-          if (existingKeySet.has(key)) {
-            // Already fenced (idempotent re-run). Find the existing
-            // row_num and assign it to this DB row.
-            const existing = existingFence.facts.find(f =>
-              f.claim === row.fact && (f.source ?? '') === (row.source ?? ''),
-            );
-            if (existing) {
-              assignments.push({ id: row.id, row_num: existing.rowNum });
-              continue;
-            }
-          }
-          // Append a new row.
-          const validFromStr = (row.valid_from instanceof Date ? row.valid_from : new Date(row.valid_from))
-            .toISOString().slice(0, 10);
-          const validUntilStr = row.valid_until
-            ? (row.valid_until instanceof Date ? row.valid_until : new Date(row.valid_until))
-                .toISOString().slice(0, 10)
-            : undefined;
-          const { body: updated, rowNum } = upsertFactRow(body, {
-            claim:      row.fact,
-            kind:       row.kind,
-            confidence: row.confidence,
-            visibility: row.visibility,
-            notability: row.notability,
-            validFrom:  validFromStr,
-            validUntil: validUntilStr,
-            source:     row.source,
-            context:    row.context ?? undefined,
-          });
-          body = updated;
-          existingKeySet.add(key);
-          assignments.push({ id: row.id, row_num: rowNum });
-        }
-
-        // Atomic write: .tmp + parse + rename.
-        writeFileSync(tmpPath, body, 'utf-8');
-        const tmpBody = readFileSync(tmpPath, 'utf-8');
-        const parsed = parseFactsFence(tmpBody);
-        if (parsed.warnings.length > 0) {
-          outcome.failed_pages.push(`${entitySlug} (${parsed.warnings.join('; ')})`);
-          // .tmp stays for inspection; do NOT rename.
-          continue;
-        }
-        renameSync(tmpPath, filePath);
-
-        // UPDATE the DB rows with their new row_nums + source_markdown_slug.
-        for (const a of assignments) {
-          await engine.executeRaw(
-            `UPDATE facts SET row_num = $1, source_markdown_slug = $2 WHERE id = $3`,
-            [a.row_num, entitySlug, a.id],
-          );
-        }
-        outcome.fenced += assignments.length;
-        outcome.pages_touched += 1;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        outcome.failed_pages.push(`${entitySlug} (${msg})`);
+      // Use the actual repair boundary: no independent renderer, stub creation,
+      // pathname replacement or unconditional stamp. This carries the same full
+      // snapshots, native locks, disabled checks and lossless-value refusal.
+      const repaired = await stampLegacyFactsToFence(engine, { sourceId, slug: entitySlug }, group);
+      if (repaired.status !== 'stamped') {
+        outcome.failed_pages.push(`${entitySlug} (repair refused; preserve file and DB evidence: ${repaired.reason}: ${repaired.detail ?? ''})`);
+        continue;
       }
+      outcome.fenced += repaired.stamped;
+      outcome.pages_touched += repaired.stamped > 0 ? 1 : 0;
     }
 
     // Scoped run: name what a brain-wide run would still touch elsewhere

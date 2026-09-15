@@ -52,6 +52,8 @@ import { contentHash } from '../utils.ts';
 import { extractFactsFromFenceText, FENCE_SOURCE_DEFAULT } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
 import { openRepairFile, strictUtf8 } from './repair-file.ts';
+import { accountFenceDirt, type OwnedFenceRow } from './repair-account.ts';
+import { indexRepairedPage } from './repair-index.ts';
 import { isFactRepairDisabled, exactDecimal } from './repair-policy.ts';
 
 /** Resolved source binding for the entity page. */
@@ -710,9 +712,9 @@ export async function lookupSourceLocalPath(
 // ordinary writer: raw HEAD bytes + strict UTF-8, exact reuse or an append
 // through a pinned no-follow file descriptor. It never rewrites existing
 // bytes, stages, commits, heals residue, or restores a file after an error.
-// A crash can leave an append; active legacy rows retain the source guard,
-// and forgotten legacy rows retain the residue block. Manual review is
-// required. Full-row snapshots and original-vs-rendered comparisons refuse
+// A crash can leave an append; complete compatible bytes can be reused
+// unchanged while the rows remain eligible. Forgotten/ambiguous residue
+// retains the block and requires review. Full-row snapshots and original-vs-rendered comparisons refuse
 // lossy conversion; created_at survives later atomic reconciliation.
 // Offline rollback requires stopping and draining all producers first; see
 // docs/architecture/fact-repair.md. There is no online rollback operation.
@@ -965,11 +967,23 @@ function pageBodyIsFile(page: { compiled_truth: string | null; timeline: string 
     && sanitizeText(parsed.timeline).trim() === (page.timeline ?? '').trim();
 }
 
+/** A crash may leave one complete repair section beyond the DB mirror. */
+function pageBodyIsRepairPrefix(
+  page: { compiled_truth: string | null; timeline: string | null }, fileBody: string, slug: string,
+): boolean {
+  let at = fileBody.length;
+  while ((at = fileBody.lastIndexOf('\n## Facts\n\n', at - 1)) !== -1) {
+    if (pageBodyIsFile(page, fileBody.slice(0, at), slug)) return true;
+  }
+  return false;
+}
+
 function skip(slug: string, reason: LegacyStampSkipReason, detail?: string): LegacyStampResult {
   return { slug, status: 'skipped', reason, detail, stamped: 0, appended: 0, rewritten: 0, committed: false };
 }
 
 interface StampPlan {
+  headBody: string;
   preBody: string;
   body: string;
   assignments: Array<{ id: string; row_num: number }>;
@@ -1042,6 +1056,27 @@ export async function stampLegacyFactsToFence(
   }
 }
 
+/** Shared refusal policy; migration delegates to the same native writer. */
+export function legacyRowRefusal(r: LegacyStampRow): { reason: LegacyStampSkipReason; detail: string } | undefined {
+  if (r.superseded_by != null) return { reason: 'unexpressible_columns', detail: `id ${r.id}: superseded_by has no lossless fence form` };
+  if ((r.source ?? '').startsWith('cli:')) return { reason: 'unexpressible_columns', detail: `id ${r.id}: conversation provenance is not fence-owned` };
+  const view = fenceRoundTrip(r);
+  if (!view) return { reason: 'fence_parse_failed', detail: `id ${r.id}: fence round-trip failed` };
+  const loss = unrepresentable(r, view);
+  if (loss) return { reason: 'unexpressible_columns', detail: `id ${r.id}: ${loss}` };
+}
+
+async function ownedFenceRows(engine: BrainEngine, sourceId: string, slug: string): Promise<OwnedFenceRow[]> {
+  const rows = await engine.executeRaw<LegacyStampRow & { row_num: number; expired_at: unknown }>(
+    `SELECT id::text AS id, fact, kind, visibility, notability, context,
+            ${fenceDateSql('valid_from')} AS valid_from, ${fenceDateSql('valid_until')} AS valid_until,
+            source, confidence, claim_metric, claim_value::text AS claim_value, claim_unit, claim_period,
+            superseded_by, row_num, expired_at
+       FROM facts WHERE source_id = $1 AND source_markdown_slug = $2 AND row_num IS NOT NULL ORDER BY row_num`,
+    [sourceId, slug]);
+  return rows.map(r => ({ rowNum: Number(r.row_num), active: r.expired_at == null, view: legacyRowToFenceRow(r, Number(r.row_num)) }));
+}
+
 async function stampLegacyFactsToFenceUnguarded(
   engine: BrainEngine,
   target: { sourceId: string; slug: string },
@@ -1053,23 +1088,12 @@ async function stampLegacyFactsToFenceUnguarded(
   if (rows.length === 0) return { slug, status: 'stamped', stamped: 0, appended: 0, rewritten: 0, committed: false };
   if (await isWriteThroughDisabled(engine)) return skip(slug, 'write_through_disabled');
 
-  // Canonical view of every row, exactly as the fence will read it back.
+  // Validate the original values, not already-rounded renderings.
   const views = new Map<string, ParsedFact>();
   for (const r of rows) {
-    if (r.superseded_by != null) {
-      return skip(slug, 'unexpressible_columns', `id ${r.id}: superseded_by=${r.superseded_by} on an active row has no fence form`);
-    }
-    // #1928: `cli:`-origin conversation facts are never fence-owned — the
-    // reconcile's listExistingFactsForPage excludes them, so a stamped one
-    // would be re-inserted against its own row_num (idx_facts_fence_key).
-    if ((r.source ?? '').startsWith('cli:')) {
-      return skip(slug, 'unexpressible_columns', `id ${r.id}: source=${r.source} is conversation provenance, not fence-owned`);
-    }
-    const view = fenceRoundTrip(r);
-    if (!view) return skip(slug, 'fence_parse_failed', `id ${r.id}: row does not survive a fence round-trip: ${r.fact.slice(0, 60)}`);
-    const loss = unrepresentable(r, view);
-    if (loss) return skip(slug, 'unexpressible_columns', `id ${r.id}: ${loss}`);
-    views.set(r.id, view);
+    const refusal = legacyRowRefusal(r);
+    if (refusal) return skip(slug, refusal.reason, refusal.detail);
+    views.set(r.id, fenceRoundTrip(r)!);
   }
 
   // Codex #3: one row_num cannot own two ids. Refuse the page rather than
@@ -1104,12 +1128,16 @@ async function stampLegacyFactsToFenceUnguarded(
     // skip-worktree file whose bytes differ — the latter is the file's own
     // uncommitted change and is refused like any other, never stamped over.
     const gitState = provenFileState(writeRoot, filePath);
-    if (gitState === 'self_dirty') return skip(slug, 'file_uncommitted', filePath);
     if (gitState === 'untracked' || gitState === 'not_at_head') return skip(slug, 'file_uncommitted', `${gitState}: ${filePath}`);
-    if (gitState !== 'clean') return skip(slug, 'foreign_dirty', `${gitState}: ${filePath}`);
+    if (gitState !== 'clean' && gitState !== 'self_dirty') return skip(slug, 'foreign_dirty', `${gitState}: ${filePath}`);
 
     const preBody = strictUtf8(readFileSync(filePath));
-    if (gitHeadBlob(writeRoot, filePath) !== preBody) return skip(slug, 'file_uncommitted', 'raw bytes differ from raw HEAD blob');
+    const headBody = gitHeadBlob(writeRoot, filePath);
+    if (headBody === null) return skip(slug, 'file_uncommitted', 'no raw committed preimage');
+    if (headBody !== preBody) {
+      const account = accountFenceDirt(headBody, preBody, await ownedFenceRows(engine, sourceId, slug), [...views.values()]);
+      if (account.kind !== 'accounted') return skip(slug, 'file_uncommitted', account.kind === 'unaccounted' ? account.detail : filePath);
+    }
     const pre = parseFactsFence(preBody);
     if (pre.warnings.length > 0) return skip(slug, 'fence_parse_failed', pre.warnings.join('; '));
 
@@ -1138,6 +1166,7 @@ async function stampLegacyFactsToFenceUnguarded(
 
     let body = preBody;
     const assignments: Array<{ id: string; row_num: number }> = [];
+    const appendRows: ParsedFact[] = [];
     let appended = 0;
     let rewritten = 0;
     for (const row of rows) {
@@ -1156,13 +1185,23 @@ async function stampLegacyFactsToFenceUnguarded(
       if (struckKeys.has(k)) {
         return skip(slug, 'fence_row_mismatch', `id ${row.id}: the fence carries this claim struck through while the DB row is active`);
       }
-      const { body: updated, rowNum } = upsertFactRow(body, legacyRowToFenceRow(row, next++));
-      body = updated;
+      const rowNum = next++;
+      appendRows.push(legacyRowToFenceRow(row, rowNum));
       assignments.push({ id: row.id, row_num: rowNum });
       appended += 1;
     }
+    if (appendRows.length > 0) {
+      if (pre.facts.length === 0) {
+        for (const row of appendRows) body = upsertFactRow(body, row).body;
+      } else {
+        const sep = body.endsWith('\n') ? '\n' : '\n\n';
+        body += `${sep}## Facts\n\n${renderFactsTable(appendRows)}\n`;
+      }
+    }
     if (!body.startsWith(preBody)) return skip(slug, 'file_rewrite_required', 'repair only appends through a pinned file handle; review and commit a complete fence before retrying');
-    return { preBody, body, assignments, appended, rewritten };
+    // Only accountFenceDirt's exact append-chain proof permits extending
+    // uncommitted repair bytes; arbitrary human dirt still refuses above.
+    return { headBody, preBody, body, assignments, appended, rewritten };
   };
 
   if (opts.dryRun) {
@@ -1177,7 +1216,7 @@ async function stampLegacyFactsToFenceUnguarded(
       locked = true;
       const p = await plan();
       if ('status' in p) return p;
-      const { preBody, body, assignments, appended, rewritten } = p;
+      const { headBody, preBody, body, assignments, appended, rewritten } = p;
       const fileChanges = appended > 0 || rewritten > 0;
       const bound = openRepairFile(writeRoot, filePath, fileChanges);
       try {
@@ -1211,8 +1250,10 @@ async function stampLegacyFactsToFenceUnguarded(
           if (pageLock.length === 0) throw new StampRefusal('verify_failed', 'page row missing');
           const page = await tx.getPage(slug, { sourceId });
           if (!page) throw new StampRefusal('verify_failed', 'page row missing');
-          if (!pageBodyIsFile(page, preBody, slug)) {
-            throw new StampRefusal('verify_failed', 'DB body is not the committed file\'s body (stale page cache; run gbrain sync)');
+          if (!pageBodyIsFile(page, preBody, slug)
+            && !(preBody !== headBody && pageBodyIsFile(page, headBody, slug))
+            && !(preBody !== headBody && pageBodyIsRepairPrefix(page, preBody, slug))) {
+            throw new StampRefusal('verify_failed', 'DB body is not the committed file or a proven repair prefix (stale page cache; run gbrain sync)');
           }
 
           const current = await tx.executeRaw<LegacyStampRow & { expired_at: unknown; row_num: number | null; entity_slug: string | null }>(
@@ -1245,6 +1286,10 @@ async function stampLegacyFactsToFenceUnguarded(
           if (owned.length > 0) {
             throw new StampRefusal('fence_row_owned', owned.map(o => `#${o.row_num} is id ${o.id}`).join(' '));
           }
+          if (preBody !== headBody) {
+            const account = accountFenceDirt(headBody, preBody, await ownedFenceRows(tx, sourceId, slug), [...views.values()]);
+            if (account.kind !== 'accounted') throw new StampRefusal('row_changed', 'uncommitted fence no longer matches current facts');
+          }
           await opts.hooks?.afterRowLock?.(slug);
 
           // #4872 mirror, REQUIRED here: a row must not become fence-owned
@@ -1259,6 +1304,8 @@ async function stampLegacyFactsToFenceUnguarded(
           if (!mirrored || !fenceCarries(mirrored.compiled_truth ?? '', views, assignments)) {
             throw new StampRefusal('verify_failed', 'DB body does not carry every assigned row after the mirror');
           }
+
+          await indexRepairedPage(tx, slug, sourceId, sanitizeText(reparsed.compiled_truth), sanitizeText(reparsed.timeline));
 
           let stamped = 0;
           for (const a of assignments) {

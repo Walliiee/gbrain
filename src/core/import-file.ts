@@ -174,7 +174,7 @@ function mergeHiddenFactRowsIntoBody(
  * empty fences are skipped. Per-fence try/catch: one malformed fence doesn't
  * abort the page import.
  */
-async function extractFencedChunks(
+export async function extractFencedChunks(
   markdown: string,
   startChunkIndex: number,
 ): Promise<ChunkInput[]> {

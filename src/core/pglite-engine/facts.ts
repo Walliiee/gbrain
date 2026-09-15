@@ -259,7 +259,9 @@ export async function insertFacts(
         );
         if (ins.rows[0]) {
           const created = creationTimes.get(JSON.stringify([input.fact, input.source]));
-          if (created !== undefined) await tx.query('UPDATE facts SET created_at = $1::timestamptz WHERE id = $2', [created, ins.rows[0].id]);
+          // Parity with postgres-engine: bind as TEXT, cast in SQL, so no
+          // driver timestamp serialisation can truncate database microseconds.
+          if (created !== undefined) await tx.query('UPDATE facts SET created_at = $1::text::timestamptz WHERE id = $2', [created, ins.rows[0].id]);
           out.push(ins.rows[0].id);
         }
         rowIds.push(ins.rows[0] ? Number(ins.rows[0].id) : null);

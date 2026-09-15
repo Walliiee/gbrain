@@ -124,6 +124,21 @@ export interface FactsFenceParseResult {
   warnings: string[];
 }
 
+function factsFenceSpans(body: string): Array<{ begin: number; end: number }> {
+  const spans: Array<{ begin: number; end: number }> = [];
+  let cursor = 0;
+  while (true) {
+    const begin = body.indexOf(FACTS_FENCE_BEGIN, cursor);
+    if (begin === -1) break;
+    const endMarker = body.indexOf(FACTS_FENCE_END, begin + FACTS_FENCE_BEGIN.length);
+    if (endMarker === -1) break;
+    const end = endMarker + FACTS_FENCE_END.length;
+    spans.push({ begin, end });
+    cursor = end;
+  }
+  return spans;
+}
+
 function parseConfidenceCell(raw: string): number | undefined {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
@@ -167,7 +182,7 @@ function parseForgottenFromContext(context: string | undefined): boolean {
  * (extract-facts cycle phase, doctor) surface warnings as
  * `FACTS_TABLE_MALFORMED` sync-failures entries.
  */
-export function parseFactsFence(body: string): FactsFenceParseResult {
+function parseSingleFactsFence(body: string): FactsFenceParseResult {
   const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
   const endIdx   = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
   const warnings: string[] = [];
@@ -297,6 +312,45 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
     warnings.push('FACTS_TABLE_MALFORMED: pipe-rows present but no recognizable header');
   }
 
+  return { facts, warnings };
+}
+
+/** Parse repeated canonical facts fences as one append-only row stream. */
+export function parseFactsFence(body: string): FactsFenceParseResult {
+  const facts: ParsedFact[] = [];
+  const warnings: string[] = [];
+  const seenRowNums = new Set<number>();
+  let cursor = 0;
+  let found = false;
+  while (true) {
+    const begin = body.indexOf(FACTS_FENCE_BEGIN, cursor);
+    const strayEnd = body.indexOf(FACTS_FENCE_END, cursor);
+    if (begin === -1) {
+      if (!found && strayEnd !== -1) warnings.push('FACTS_FENCE_UNBALANCED: missing begin or end marker');
+      break;
+    }
+    if (strayEnd !== -1 && strayEnd < begin) {
+      warnings.push('FACTS_FENCE_UNBALANCED: end marker before begin');
+      break;
+    }
+    const end = body.indexOf(FACTS_FENCE_END, begin + FACTS_FENCE_BEGIN.length);
+    if (end === -1) {
+      warnings.push('FACTS_FENCE_UNBALANCED: missing begin or end marker');
+      break;
+    }
+    found = true;
+    const parsed = parseSingleFactsFence(body.slice(begin, end + FACTS_FENCE_END.length));
+    warnings.push(...parsed.warnings);
+    for (const fact of parsed.facts) {
+      if (seenRowNums.has(fact.rowNum)) {
+        warnings.push(`FACTS_ROW_NUM_COLLISION: duplicate row_num ${fact.rowNum}`);
+        continue;
+      }
+      seenRowNums.add(fact.rowNum);
+      facts.push(fact);
+    }
+    cursor = end + FACTS_FENCE_END.length;
+  }
   return { facts, warnings };
 }
 
@@ -507,11 +561,18 @@ export function upsertFactRow(
 
   const newFence = renderFactsTable(allRows);
 
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  const endIdx   = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
+  const spans = factsFenceSpans(body);
+  const beginIdx = spans[0]?.begin ?? -1;
+  const endIdx = spans[0] ? spans[0].end - FACTS_FENCE_END.length : -1;
   let out: string;
   if (beginIdx !== -1 && endIdx !== -1) {
-    out = body.slice(0, beginIdx) + newFence + body.slice(endIdx + FACTS_FENCE_END.length);
+    let cursor = spans[0]!.end;
+    out = body.slice(0, beginIdx) + newFence;
+    for (const span of spans.slice(1)) {
+      out += body.slice(cursor, span.begin);
+      cursor = span.end;
+    }
+    out += body.slice(cursor);
   } else {
     // #4756: the FIRST fence must land in compiled_truth — ABOVE the timeline
     // sentinel. splitBody() files everything below the sentinel into
@@ -606,23 +667,28 @@ export function stripFactsFence(body: string, opts: StripFactsFenceOpts = {}): s
   // Pages without a compiled body have nothing to strip. Guard so the privacy
   // strip is a safe no-op rather than crashing on `undefined.indexOf`.
   if (typeof body !== 'string') return body;
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  if (beginIdx === -1) return body;
-  const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-  if (endIdx === -1) return body;
+  const spans = factsFenceSpans(body);
+  if (spans.length === 0) return body;
 
   // Whole-fence strip mode (chunker case).
   if (!opts.keepVisibility || opts.keepVisibility.length === 0) {
-    return body.slice(0, beginIdx) + body.slice(endIdx + FACTS_FENCE_END.length);
+    let out = '';
+    let cursor = 0;
+    for (const span of spans) { out += body.slice(cursor, span.begin); cursor = span.end; }
+    return out + body.slice(cursor);
   }
 
   // Selective row-level strip mode (get_page case). Parse, filter, render.
   // The parser's lenient posture means malformed rows are silently dropped,
   // which is the safe direction at a privacy boundary — when in doubt,
   // strip rather than leak.
-  const { facts } = parseFactsFence(body);
   const keep = new Set(opts.keepVisibility);
-  const kept = facts.filter(f => keep.has(f.visibility));
-  const replacement = renderFactsTable(kept);
-  return body.slice(0, beginIdx) + replacement + body.slice(endIdx + FACTS_FENCE_END.length);
+  let out = '';
+  let cursor = 0;
+  for (const span of spans) {
+    const parsed = parseSingleFactsFence(body.slice(span.begin, span.end));
+    out += body.slice(cursor, span.begin) + renderFactsTable(parsed.facts.filter(f => keep.has(f.visibility)));
+    cursor = span.end;
+  }
+  return out + body.slice(cursor);
 }

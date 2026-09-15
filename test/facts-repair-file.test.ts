@@ -34,3 +34,20 @@ test('positive file boundary: a replacement human inode AFTER the last check is 
     expect(readFileSync(file + '.original', 'utf8')).toBe(ORIGINAL + '\nRepair append.\n');
   } finally { handle.close(); }
 });
+
+test('an insertion into existing bytes is refused before any write', () => {
+  const h = openRepairFile(repo, file, true);
+  try {
+    expect(() => h.append('Original NEW bytes.\n')).toThrow('repair would require a file rewrite');
+    expect(readFileSync(file, 'utf8')).toBe(ORIGINAL);
+  } finally { h.close(); }
+});
+
+test('O_APPEND preserves a human in-place edit after the final check and reports drift', () => {
+  const h = openRepairFile(repo, file, true);
+  const human = 'Human draft occupies the same inode.\n';
+  try {
+    expect(() => h.append(ORIGINAL + 'Repair suffix.\n', () => writeFileSync(file, human))).toThrow();
+    expect(readFileSync(file, 'utf8')).toBe(human + 'Repair suffix.\n');
+  } finally { h.close(); }
+});

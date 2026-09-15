@@ -728,3 +728,23 @@ describe('stripFactsFence', () => {
     expect(stripped).not.toContain(FACTS_FENCE_BEGIN);
   });
 });
+
+test('repeated canonical fences form one row stream and privacy stripping covers every block', () => {
+  const first = renderFactsTable([minimalFact(1)]);
+  const second = renderFactsTable([{ ...minimalFact(2), claim: 'Private second', visibility: 'private' }]);
+  const body = `Before\n${first}\nBetween\n${second}\nAfter`;
+  expect(parseFactsFence(body)).toMatchObject({ warnings: [], facts: [{ rowNum: 1 }, { rowNum: 2 }] });
+  const world = stripFactsFence(body, { keepVisibility: ['world'] });
+  expect(world).not.toContain('Private second');
+  expect(parseFactsFence(world).facts.map(f => f.rowNum)).toEqual([1]);
+  const none = stripFactsFence(body);
+  expect(none).not.toContain(FACTS_FENCE_BEGIN);
+  expect(none).not.toContain('Private second');
+  expect(none).toContain('Before');
+  expect(none).toContain('Between');
+  expect(none).toContain('After');
+  const canonical = upsertFactRow(body, { ...minimalFact(3), claim: 'Third fact' }).body;
+  expect(canonical.split(FACTS_FENCE_BEGIN)).toHaveLength(2);
+  expect(parseFactsFence(canonical).facts.map(f => f.rowNum)).toEqual([1, 2, 3]);
+  expect(canonical).toContain('Between');
+});

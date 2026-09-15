@@ -3,12 +3,22 @@
 Repair is a source-scoped, zero-provider pass inside `runExtractFacts`. It uses
 `resolvePageWriteTarget`, the native page lock and one engine transaction. A
 successful repair preserves fact IDs and mirrors the canonical fence into the
-page cache before stamping ownership. The source guard is re-counted afterward.
+page cache and native search chunks before stamping ownership. The source guard is re-counted afterward.
+
+Later eligible arrivals on already-fenced pages use repeated canonical facts
+fences as one logical row stream. The repair appends each new canonical section
+through the pinned `O_APPEND` handle; it never inserts into or rewrites prior
+bytes. The parser, native writers and privacy stripping aggregate every section
+and preserve stable row numbers.
 
 ## Supported safe path
 
 - A tracked file has raw working bytes equal to its raw committed blob, and
-  strict UTF-8 decoding preserves every byte, including a BOM.
+  strict UTF-8 decoding preserves every byte, including a BOM. An uncommitted
+  canonical append chain can also be reused or extended when every differing
+  byte is an exact machine-rendered section matching a currently owned or
+  still-eligible fact. This is a compatibility proof, never authorship or
+  permission to rewrite, delete or commit those bytes.
 - Every legacy row is exactly representable by the fence. Original confidence,
   typed numeric values and UTC timestamps are compared with the parsed output,
   not with another already-rounded rendering. Full-row JSON snapshots are read
@@ -22,8 +32,11 @@ page cache before stamping ownership. The source guard is re-counted afterward.
   target is replaced even after the last check, the replacement is untouched;
   the post-write identity check reports failure. File mode and inode survive.
 - The source binding is locked/revalidated with the page and fact rows. The
-  body mirror, fact ownership stamp and final file verification share the DB
-  transaction. `created_at` is preserved at full database precision through
+  body mirror, native chunk projection, fact ownership stamp and final file
+  verification share the DB transaction. World facts are keyword-searchable
+  after ordinary committed-only sync; private facts stay out of chunks. Chunk
+  embeddings use the existing stale-embedding backfill. Quarantine and embed-skip
+  markers retain their native no-chunk contract. `created_at` is preserved at full database precision through
   later atomic `DELETE RETURNING`/reinsertion of unchanged content in both
   engines. Non-null embedding/provenance/consolidation/event/dimension metadata
   without a fence representation refuses conversion.
@@ -34,21 +47,28 @@ queue, publisher, credential or source registration is involved.
 
 ## Explicit refusals and crash recovery
 
-The repair does **not** rewrite an existing fence to add/fill rows. It reports
-`file_rewrite_required`; a human can prepare and commit a complete reviewed
-fence, sync the page, then retry exact reuse. Dirty files, filters whose working
-bytes differ from the committed blob, unavailable files, hard links, symlinks,
-non-UTF8 content, unknown columns and unrepresentable values also refuse.
+The repair does **not** rewrite an existing fence to add/fill rows. A later
+eligible row is emitted in a new canonical fence section at EOF and all sections
+parse as one stream. Missing fields on an already-present row still report
+`file_rewrite_required`; that is an actual semantic rewrite and needs review.
+Unaccounted dirty files, filters whose working bytes differ from the committed
+blob, unavailable files, hard links, symlinks, non-UTF8 content, unknown columns
+and unrepresentable values also refuse.
 
 The repair never stages or commits. A successful append remains an uncommitted
-file change for the existing review/publication process. A later human save
+file change. Its search index is updated in the same transaction, without
+requiring a later automatic Git publisher. A later human save
 cannot be swept into a repair commit because no such commit occurs.
 
 A crash after the append may leave uncommitted fence content. It is **never**
 automatically deleted or restored, even when it can be reconstructed from DB
 rows. Resemblance does not prove authorship. The DB transaction rolls back or
 its outcome is verified; an unreadable outcome is reported as indeterminate.
-The file remains available for manual review, including later human edits.
+The file remains available for review, including later human edits. A retry can
+reuse a complete compatible fence without writing it; the full row snapshots
+are revalidated inside the transaction. This converges after a complete append
+whose rows remain eligible. Human prose, extra metadata and forgotten residue
+remain actionable refusals; no bytes are removed to manufacture convergence.
 
 Residue discovery does not require `sources.local_path`. It runs again after
 stamp attempts, even for a page in the earlier eligibility list. Unknown,
@@ -62,6 +82,38 @@ also examine freshly expired legacy rows against the actual cached input.
 Maintenance reports guard/degraded/residue-blocked counts and diagnostic
 messages; blocked work is not a quiet zero-success pass.
 
+## Concurrency and recovery contracts
+
+`get_page(include_content:true)` returns a content revision. `put_page` checks
+`base_revision` under the native page lock before changing either sink. An
+omission of active fence-owned rows needs a matching revision whose visible
+body actually carried those rows. Without that proof it reports `conflict`.
+Remote checks cover world-visible facts; the native hidden-row merge remains.
+A deliberate omission deletes only the identified active rows after a successful
+same-page import/write-through, while holding the lock. Tombstones are retained.
+
+Reconciliation re-reads owned rows under the page lock. Missing active row
+numbers report `FACTS_FENCE_UNPUBLISHED_CONFLICT`, preserving the page's facts.
+A HEAD commit or an unavailable file is not evidence of the editor's base.
+Restore the rows, explicitly forget their IDs, or use a revision-checked save.
+This conservative rule also preserves fabricated/stale orphan row numbers;
+reconciliation cannot infer that their deletion was intentional.
+
+Phantom redirection holds both endpoint page locks in sorted order through
+fresh reads, transfer and removal. Current fact rows are locked in one DB
+transaction and checked against actual fence state. Original identities,
+including expired rows, move with the destination row numbers. Conflicting
+deduplication, legacy history and page-local supersession references refuse.
+A queued forget rechecks routing after acquiring its lock, releases that lock
+before rerouting, and follows the original ID to the destination. The phantom
+writer retains its native file replacement policy; arbitrary noncooperating
+filesystem writers are outside that page-lock guarantee.
+
+The v0.32.2 migration uses `stampLegacyFactsToFence` itself. It cannot bypass
+lossless value checks, snapshots, native locks, missing-file refusal or
+`GBRAIN_FACT_REPAIR=off`. It no longer creates missing stubs or independently
+stamps lossy rows. It is not a recovery shortcut for a refused automatic repair.
+
 ## Offline rollback only
 
 There is no supported automatic or online rollback. The old procedure
@@ -73,7 +125,7 @@ An operator performing rollback must:
 
 1. Disable repair/reconciliation with `GBRAIN_FACT_REPAIR=off` in **every**
    relevant process and stop all producers touching the source (serve sweep,
-   cycle/job workers, sync, CLI/API writes). Drain their in-flight operations
+   cycle/job workers, sync, migration/backfill, CLI/API writes). Drain their in-flight operations
    and verify they have stopped before proceeding. The switch is checked by
    direct repair, reconciliation and phantom entry points and again before
    mutation; it does not itself stop or drain other processes.
@@ -93,6 +145,12 @@ Disabled attempts do no work; later human bytes and legacy rows survive. This
 is an isolated contract test, not evidence that production has been stopped.
 
 ## Verification and changed contracts
+
+`test/facts-repair-lifecycle.test.ts` pins the revision, queued forget, migration,
+search, crash reuse and full second/third/fourth-arrival contracts. The lifecycle
+passes in both required temporary roots without positional insertion or a repair
+commit. `test/facts-fence.test.ts` pins repeated-fence parsing, native
+canonicalization and all-block privacy stripping.
 
 `test/facts-repair-safety.test.ts` and `test/facts-repair-file.test.ts` cover the
 independent byte/filter, commit, symlink, ownership, unavailable-target,

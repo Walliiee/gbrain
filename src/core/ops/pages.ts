@@ -11,6 +11,7 @@ import type { BrainEngine } from '../engine.ts';
 import { clampSearchLimit } from '../engine.ts';
 import type { Page, PageType } from '../types.ts';
 import { importFromContent } from '../import-file.ts';
+import { checkFenceRowsOnPut, pageRevision } from '../facts/fence-drop-guard.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { writePageThrough, deletePageThrough, resolvePageWriteTarget, type WriteThroughResult } from '../write-through.ts';
 import { acquirePageLock, type PageLockHandle } from '../page-lock.ts';
@@ -133,7 +134,7 @@ const get_page: Operation = {
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     fuzzy: { type: 'boolean', description: 'Enable fuzzy slug resolution (default: false)' },
-    include_content: { type: 'boolean', description: '#2225: include the canonical serialized `content` field (frontmatter + body + timeline sentinel) for lossless get→edit→put_page round-trips. Default false — it roughly duplicates compiled_truth + timeline, so read-only callers should not pay for it.' },
+    include_content: { type: 'boolean', description: '#2225: include the canonical serialized `content` field (frontmatter + body + timeline sentinel) for lossless get→edit→put_page round-trips, plus revision to pass as put_page base_revision. Default false — it roughly duplicates compiled_truth + timeline, so read-only callers should not pay for it.' },
     include_deleted: { type: 'boolean', description: 'v0.26.5: surface soft-deleted pages with deleted_at populated (default: false). Used by restore workflows.' },
     source_id: { type: 'string', description: "#4329: scope the lookup to a single source (a multi-source brain can hold the same slug in several sources). Defaults to ctx.sourceId / the caller's grant. '__all__' spans every source for trusted local callers, your granted sources for remote callers." },
   },
@@ -283,7 +284,7 @@ const get_page: Operation = {
     return {
       ...visibleBody,
       tags,
-      ...(includeContent ? { content: serializePageToMarkdown(visibleBody as Page, tags) } : {}),
+      ...(includeContent ? (() => { const content = serializePageToMarkdown(visibleBody as Page, tags); return { content, revision: pageRevision(content) }; })() : {}),
       ...(resolved_slug ? { resolved_slug } : {}),
       ...(content_flag ? { content_flag } : {}),
     };
@@ -361,6 +362,7 @@ const put_page: Operation = {
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Complete markdown content with YAML frontmatter. REPLACES the entire page; this is not a partial edit. Read the canonical page first with `get_page include_content:true` before modifying it.' },
+    base_revision: { type: 'string', required: false, description: 'The revision returned by get_page include_content:true. A stale revision conflicts. Required when deliberately removing active Facts rows from the current page.' },
     allow_empty: { type: 'boolean', required: false, description: 'Allow overwriting an existing non-empty page with empty/whitespace-only content (default: false). Without it, put_page rejects the empty overwrite — the empty-stdin failure class.' },
     // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
     // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
@@ -480,6 +482,11 @@ const put_page: Operation = {
     let result!: Awaited<ReturnType<typeof importFromContent>>;
     let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'subagent_sandbox' | 'dry_run' }) | undefined;
     try {
+    const fenceVerdict = await checkFenceRowsOnPut(ctx.engine, {
+      slug: targetSlug, sourceId: ctx.sourceId ?? 'default', content: p.content as string,
+      remote: ctx.remote !== false, baseRevision: typeof p.base_revision === 'string' ? p.base_revision : undefined,
+    });
+    if (!fenceVerdict.ok) throw new OperationError('conflict', fenceVerdict.message, fenceVerdict.suggestion);
     result = await importFromContent(ctx.engine, slug, p.content as string, {
       noEmbed,
       // v0.42 (#1699): untrusted callers can't smuggle gate-owned frontmatter
@@ -647,6 +654,12 @@ const put_page: Operation = {
         `put_page: the page content could not be written to disk (${writeThrough.skipped ?? writeThrough.error}).`,
         'Check that the configured repo path exists and is writable, then retry.',
       );
+    }
+    // Explicit omission against a matching current revision. Never delete on
+    // dedup/skip/error or a write to a different slug. Tombstones are retained.
+    if (fenceVerdict.droppedIds.length && result.status === 'imported' && result.slug === targetSlug) {
+      await ctx.engine.executeRaw(`DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug = $2
+        AND id = ANY($3::bigint[]) AND expired_at IS NULL`, [ctx.sourceId ?? 'default', targetSlug, fenceVerdict.droppedIds]);
     }
     } finally {
       await pageLock.release();

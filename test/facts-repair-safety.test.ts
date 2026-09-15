@@ -99,16 +99,18 @@ test('useful safe path: append all legacy facts, preserve inode/mode/prose and I
   expect((await repair()).rowsStamped).toBe(0);
 });
 
-test('reuse a complete committed fence; refuse an in-place rewrite without losing either legacy row', async () => {
+test('reuse a complete committed fence; append a later row in a second canonical fence without rewriting prior bytes', async () => {
   const id = await seed();
   writeFileSync(file, fence()); git('add', '--', `${SLUG}.md`); git('commit', '-qm', 'reviewed fence'); await sync();
   expect(await repair()).toMatchObject({ rowsStamped: 1, rowsAppended: 0 });
-  await seed('New legacy fact');
-  const before = await rows(); const bytes = readFileSync(file);
-  expect(await repair()).toMatchObject({ rowsStamped: 0, skippedByReason: { file_rewrite_required: 1 } });
-  expect(await rows()).toEqual(before); expect(readFileSync(file)).toEqual(bytes);
-  expect((await extract()).guardTriggered).toBe(true);
-  expect((await rows()).some(r => JSON.parse(r.snapshot).id === Number(id))).toBe(true);
+  const later = await seed('New legacy fact');
+  const bytes = readFileSync(file);
+  expect(await repair()).toMatchObject({ rowsStamped: 1, rowsAppended: 1, skippedByReason: {} });
+  expect(readFileSync(file).subarray(0, bytes.length)).toEqual(bytes);
+  expect(parseFactsFence(readFileSync(file, 'utf8')).facts.map(f => f.claim)).toEqual(['Keep this fact', 'New legacy fact']);
+  expect((await extract()).guardTriggered).toBe(false);
+  const ids = (await rows()).map(r => JSON.parse(r.snapshot).id);
+  expect(ids).toEqual([Number(id), Number(later)]);
 });
 
 test('A/FILTER: raw committed blob comparison rejects a clean-filter/assume-unchanged disguise', async () => {

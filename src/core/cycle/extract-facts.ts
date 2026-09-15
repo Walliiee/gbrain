@@ -55,6 +55,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 
+import { missingOwnedFenceRows, unpublishedConflictWarning } from '../facts/fence-publication.ts';
 import type { BrainEngine } from '../engine.ts';
 import { resolveSupersededByRow, type SupersedeTarget } from '../facts/supersede-resolve.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
@@ -624,20 +625,11 @@ export async function runExtractFacts(
 
   if (legacyCount > 0) {
     result.guardTriggered = true;
-    // Drain advice must actually work: a bare `apply-migrations --yes`
-    // is a no-op once the v0.32.2 ledger entry says complete (the
-    // runner classifies it as already-applied), so the sanctioned
-    // re-run path is the explicit retry marker first. Phase B is
-    // idempotent — it only touches `row_num IS NULL` rows and de-dupes
-    // against the existing fence — so the re-run is safe. Individual
-    // rows can instead be drained through `forget_fact` (soft-expired
-    // rows stop counting).
     result.warnings.push(
-      `extract_facts: ${legacyCount} legacy v0.31 fact rows in source "${sourceId}" ` +
-      `(entity page present, not yet fenced) pending fence backfill. Re-run the v0.32.2 ` +
-      `fence backfill: \`gbrain apply-migrations --force-retry 0.32.2\` then ` +
-      `\`gbrain apply-migrations --yes --source ${sourceId}\` (only this source's tree ` +
-      `must be clean). Or drain individual rows via \`forget_fact\`.`,
+      `extract_facts: ${legacyCount} legacy fact rows in source "${sourceId}" remain after repair. ` +
+      `Resolve the named refusal and retry; preserve the file and fact evidence. ` +
+      `Use forget_fact only for facts you intend to forget. The v0.32.2 backfill uses the same safe writer ` +
+      `and cannot bypass a refusal or GBRAIN_FACT_REPAIR=off.`,
     );
     // #3683: book the halt BEFORE the early return. The end-of-run rollup
     // write below is unreachable from this path, so pre-fix a guard-triggered
@@ -816,6 +808,8 @@ export async function runExtractFacts(
           )) {
             return null;
           }
+          const missing = await missingOwnedFenceRows(engine, slug, sourceId, new Set());
+          if (missing.length) { result.warnings.push(unpublishedConflictWarning(slug, missing)); return null; }
           // The delete targets source_markdown_slug = slug only, so
           // NULL-source_markdown_slug legacy rows survive (the
           // partial-UNIQUE-index keyspace). #1928: `cli:`-origin facts
@@ -981,6 +975,8 @@ export async function runExtractFacts(
       )) {
         return null;
       }
+      const missing = await missingOwnedFenceRows(engine, slug, sourceId, new Set(parsed.facts.map(f => f.rowNum)));
+      if (missing.length) { result.warnings.push(unpublishedConflictWarning(slug, missing)); return null; }
       return engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
         toInsert,
         { source_id: sourceId },
