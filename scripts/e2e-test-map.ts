@@ -45,6 +45,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   // Source-aware ranking, hybrid search, intent classification.
   "src/core/search/**": [
     "test/e2e/native-lifecycle-postgres.test.ts",
+    "test/e2e/native-lifecycle-transport.test.ts",
     "test/e2e/chunk-canonical-text-privacy.test.ts",
     "test/e2e/engine-content-privacy.test.ts", "test/e2e/remote-privacy-journeys.test.ts",
     "test/e2e/read-enrichment-privacy.test.ts", "test/e2e/legacy-chunk-privacy.test.ts",
@@ -52,7 +53,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
     "test/e2e/search-exclude.test.ts",
     "test/e2e/search-swamp.test.ts",
   ],
-  "src/commands/config.ts": ["test/e2e/native-lifecycle-postgres.test.ts"],
+  "src/commands/config.ts": ["test/e2e/native-lifecycle-postgres.test.ts", "test/e2e/native-lifecycle-transport.test.ts"],
   // Shared lifecycle contracts run on both engines, including real ANN plans.
   "test/helpers/lifecycle-search-contract.ts": ["test/e2e/native-lifecycle-postgres.test.ts"],
   "test/helpers/lifecycle-vector-contract.ts": ["test/e2e/native-lifecycle-postgres.test.ts"],
@@ -146,6 +147,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   // postgres.js bind paths + JSONB shapes + parity vs PGLite.
   "src/core/postgres-engine.ts": [
     "test/e2e/native-lifecycle-postgres.test.ts",
+    "test/e2e/native-lifecycle-transport.test.ts",
     "test/e2e/chunk-canonical-text-privacy.test.ts",
     "test/e2e/engine-content-privacy.test.ts", "test/e2e/remote-privacy-journeys.test.ts",
     "test/e2e/read-enrichment-privacy.test.ts", "test/e2e/legacy-chunk-privacy.test.ts",
@@ -164,6 +166,7 @@ export const E2E_TEST_MAP: Record<string, string[]> = {
   // PGLite bootstrap path + parity guard.
   "src/core/pglite-engine.ts": [
     "test/e2e/native-lifecycle-postgres.test.ts",
+    "test/e2e/native-lifecycle-transport.test.ts",
     "test/e2e/chunk-canonical-text-privacy.test.ts",
     "test/e2e/engine-content-privacy.test.ts", "test/e2e/remote-privacy-journeys.test.ts",
     "test/e2e/read-enrichment-privacy.test.ts", "test/e2e/legacy-chunk-privacy.test.ts",

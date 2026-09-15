@@ -72,6 +72,8 @@ configured exclusions match no pages. Empty or absent configuration preserves
 the previous vector behavior. Fallback latency on large brains is unmeasured;
 existing query timeouts still apply.
 
+`test/e2e/native-lifecycle-transport.test.ts` exercises real CLI processes and stdio MCP against a fresh, keyless PGLite brain: an unconfigured historical control, DB/file readback disagreement, filtered top-k, private/source scope, ignored caller overrides, explicit historical get, invalid configuration, and rollback. It removes its temporary home and inherits no operator database URL or provider credentials. This transport test is lexical; the shared native-engine contracts separately exercise real vectors and PostgreSQL.
+
 This setting does not implement conditional `expires_at` rules, canonical or
 generated-record exceptions, status weights, source weights, or other ranking
 policies used by an external wrapper. It does not infer lifecycle from titles,
