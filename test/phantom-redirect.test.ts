@@ -606,7 +606,12 @@ describe('runExtractFacts — phantom-redirect integration', () => {
         await putPage('alice', STUB_BODY);
         writeMd(brainDir, 'alice', STUB_BODY);
 
-        const result = await runExtractFacts(engine, { sourceId: 'default', brainDir });
+        // 2026-09-13: the guard now heals repairable rows in place before
+        // deciding to halt (fence-legacy.ts). This test pins the ORDERING
+        // contract — guard before phantom pass — so opt out of the repair
+        // and keep the row un-healable; the self-draining path has its own
+        // suite (extract-facts-self-draining-guard.test.ts).
+        const result = await runExtractFacts(engine, { sourceId: 'default', brainDir, repairLegacy: false });
         expect(result.guardTriggered).toBe(true);
         expect(result.phantomsRedirected).toBe(0);
         // Phantom .md still on disk (pass skipped)

@@ -53,6 +53,9 @@
  * backlog through the sanctioned removal path instead of raw SQL.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
+
+import { missingOwnedFenceRows, unpublishedConflictWarning } from '../facts/fence-publication.ts';
 import type { BrainEngine } from '../engine.ts';
 import { resolveSupersededByRow, type SupersedeTarget } from '../facts/supersede-resolve.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
@@ -70,6 +73,16 @@ import {
 } from './phantom-redirect.ts';
 import { embed, isAvailable } from '../ai/gateway.ts';
 import { isAborted } from '../abort-check.ts';
+import {
+  repairLegacyRowsForSource,
+  listResidueOnlyPagesForSource,
+  isFactRepairDisabled,
+  type RepairLegacyRowsSummary,
+  type LegacyStampHooks,
+} from '../facts/fence-legacy.ts';
+import { parseMarkdown } from '../markdown.ts';
+import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
+import { acquirePageLock } from '../page-lock.ts';
 
 interface ExistingPageFact {
   // v0.46 (#3014) — the row's own fact id. Read so the supersession-drift
@@ -103,6 +116,109 @@ function dedupeFactsByContentKey(facts: FenceExtractedFact[]): FenceExtractedFac
 }
 
 /**
+ * Reconciliation may only trust the pages-table body when it still matches
+ * the canonical Markdown file — on the insert-only branch as much as the
+ * destructive ones. The fact writer deliberately commits Markdown first and
+ * then stamps the facts index, while page sync is asynchronous. In that gap a
+ * sweep can observe the old pages.compiled_truth plus the new fact row and
+ * otherwise delete the new row as "stale"; in the mirror-image gap (a file
+ * restored to its committed preimage while the cache still carries a crashed
+ * repair's appends) an unchecked insert resurrects a row the file no longer
+ * has — the forgotten-fact resurrection of the 2026-09-14 acceptance review.
+ *
+ * `unavailable` preserves the existing DB-only/thin-client behaviour. A local
+ * canonical file that exists but cannot be read is fail-closed: the write
+ * waits for a healthy sync/read instead of guessing that the cache is
+ * authoritative.
+ */
+async function canonicalCacheState(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+  cachedCompiledTruth: string,
+  cachedTimeline: string,
+): Promise<'fresh' | 'stale' | 'unavailable'> {
+  // sync.write_through=off: the fence writers already treat the file as
+  // non-canonical (fence-write.ts legacy fallback), so a stale mirror file must
+  // not block reconcile here either.
+  if (await isWriteThroughDisabled(engine)) return 'unavailable';
+  const target = await resolvePageWriteTarget(engine, slug, sourceId);
+  if (!target.ok || !existsSync(target.filePath)) return 'unavailable';
+  try {
+    const canonical = parseMarkdown(readFileSync(target.filePath, 'utf-8'), target.filePath);
+    return canonical.compiled_truth === cachedCompiledTruth.trim()
+      && canonical.timeline === cachedTimeline.trim()
+      ? 'fresh'
+      : 'stale';
+  } catch {
+    return 'stale';
+  }
+}
+
+async function refuseReconcileOnStaleCache(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+  cachedCompiledTruth: string,
+  cachedTimeline: string,
+  warnings: string[],
+): Promise<boolean> {
+  const tombstones = await engine.executeRaw<{ fact: string }>(
+    `SELECT fact FROM facts WHERE source_id = $1 AND entity_slug = $2 AND row_num IS NULL AND expired_at IS NOT NULL`,
+    [sourceId, slug]);
+  const parsed = parseFactsFence(cachedCompiledTruth);
+  if (tombstones.length && (parsed.warnings.length || parsed.facts.some(f => f.active && tombstones.some(t => t.fact.trim() === f.claim.trim())))) {
+    warnings.push(`${slug}: FACTS_RESIDUE_UNRESOLVED: freshly checked tombstones forbid resurrection`);
+    return true;
+  }
+  const state = await canonicalCacheState(
+    engine,
+    slug,
+    sourceId,
+    cachedCompiledTruth,
+    cachedTimeline,
+  );
+  if (state !== 'stale') return false;
+  warnings.push(
+    `${slug}: FACTS_PAGE_CACHE_STALE: canonical Markdown differs from the pages cache; ` +
+    'refusing fact reconciliation until gbrain sync refreshes the page index.',
+  );
+  return true;
+}
+
+/**
+ * Run one page's DB write under its page lock (5s, matching the fence writers
+ * in fence-write.ts / forget.ts). A lock still held past the deadline
+ * degrades to a FACTS_PAGE_LOCK_TIMEOUT warning for THAT page and a null
+ * result, so one wedged page cannot abort the remaining slugs of the phase
+ * run. Errors thrown by `fn` itself still propagate.
+ */
+async function underPageLock<T>(
+  slug: string,
+  fn: () => Promise<T>,
+  opts: ExtractFactsOpts,
+  warnings: string[],
+): Promise<T | null> {
+  const handle = await acquirePageLock(slug, { timeoutMs: 5_000, lockRoot: opts.pageLockRoot });
+  if (!handle) {
+    warnings.push(
+      `${slug}: FACTS_PAGE_LOCK_TIMEOUT: page lock held by another writer; ` +
+      'skipping fact reconciliation for this page until the next run.',
+    );
+    return null;
+  }
+  try {
+    if (isFactRepairDisabled()) {
+      warnings.push(`${slug}: FACTS_REPAIR_DISABLED: reconciliation refused during repair shutdown`);
+      return null;
+    }
+    return await fn();
+  } finally {
+    await handle.release();
+  }
+}
+
+/**
  * Fence-owned DB rows for one page coordinate. Excludes `cli:`-origin
  * conversation facts (#1928) — they are not fence-owned, so they must
  * neither count as "stale" (which would force a wipe every cycle) nor
@@ -116,16 +232,9 @@ function dedupeFactsByContentKey(facts: FenceExtractedFact[]): FenceExtractedFac
  * wipe every cycle) nor mask a fence row from insertion. Mirrors the
  * preserveExpiredLegacy filter deleteFactsForPage applies on the wipe.
  *
- * Deliberate consequence: if the fence still carries the same
- * (claim, source) as an expired legacy row, the reconcile inserts it
- * as a fresh ACTIVE fence-owned row. That is the fence-is-canonical
- * contract working as documented — legacy DB-only forgets "DO NOT
- * survive rebuild" (see forget.ts header); suppressing the insert
- * would instead create silent fence↔DB divergence, the exact failure
- * mode the empty-fence guard exists to prevent. To durably forget
- * such a claim, forget the fence-owned row (forget_fact now takes the
- * fence path, which strikes the row through in markdown). The expired
- * legacy row survives alongside as the record of the earlier forget.
+ * A matching expired legacy claim is now a block, not permission to
+ * resurrect. Residue discovery and a fresh per-write tombstone check enforce
+ * that stronger contract even when file access or repair is disabled.
  */
 async function listExistingFactsForPage(
   engine: BrainEngine,
@@ -157,7 +266,8 @@ export interface ExtractFactsOpts {
    * to canonical pages and to unlink phantom `.md` files. When omitted,
    * the phantom-redirect pass is skipped (callers like `gbrain dream`
    * that don't have a brainDir, e.g. headless eval runs, still get the
-   * standard fence-reconcile loop).
+   * standard fence-reconcile loop — with the legacy repair and its residue
+   * protection, which never depended on brainDir; see `repairLegacy`).
    */
   brainDir?: string;
   /**
@@ -167,6 +277,29 @@ export interface ExtractFactsOpts {
    * under the worker's 30s force-evict instead of running to completion.
    */
   signal?: AbortSignal;
+  /**
+   * 2026-09-13: self-draining guard. When the guard counts legacy rows and
+   * this run is not a dry-run, stamp them onto their pages through the
+   * native fence writer (fence-write.ts `stampLegacyFactsToFence`) and
+   * re-count before deciding to halt; with the guard unarmed, sweep the
+   * pages whose never-fenced rows have all been forgotten for a crashed
+   * run's residue before reconciling them. Defaults to `true` for EVERY
+   * caller: the repair and its residue protection resolve files from
+   * `sources.local_path`, never from `brainDir` (which gates only the
+   * phantom pass), so a headless call is protected exactly like the cycle
+   * and the maintenance sweep (2026-09-14 acceptance round 6 — the old
+   * `brainDir !== undefined` default left a direct call reconciling
+   * unprotected, and a forgotten claim came back through it). Pass `false`
+   * (or set `GBRAIN_FACT_REPAIR=off`) to keep the pure halt: legacy rows
+   * still halt the phase, and a page carrying forgotten never-fenced rows is
+   * then BLOCKED from the reconcile (`FACTS_RESIDUE_UNSWEPT`) instead of
+   * swept — never reconciled unprotected.
+   */
+  repairLegacy?: boolean;
+  /** Test-only crash seams for the repair. */
+  repairHooks?: LegacyStampHooks;
+  /** Override the shared page-lock directory for deterministic tests. */
+  pageLockRoot?: string;
 }
 
 export interface ExtractFactsResult {
@@ -176,6 +309,19 @@ export interface ExtractFactsResult {
   factsDeleted: number;
   legacyRowsPending: number;
   guardTriggered: boolean;
+  /** Legacy rows the in-cycle repair fenced + stamped before the reconcile ran. */
+  legacyRowsRepaired: number;
+  /** Full repair summary when the repair pass ran (guard armed, disk access, not dry-run). */
+  legacyRepair?: RepairLegacyRowsSummary;
+  /**
+   * Set with `guardTriggered` when the repair could not complete (a
+   * repair-wide query threw or the repair itself threw): the phase halted
+   * BEFORE the reconcile, because a page the repair did not reach cannot be
+   * proven free of a crashed repair's fence rows. Distinct from the legacy-
+   * rows-pending halt: the drain advice there does not apply, the next run
+   * simply retries.
+   */
+  repairFailed?: string;
   warnings: string[];
   /** v0.35.5: phantom-redirect pre-pass counts. */
   phantomsScanned: number;
@@ -272,6 +418,7 @@ export async function runExtractFacts(
     factsDeleted: 0,
     legacyRowsPending: 0,
     guardTriggered: false,
+    legacyRowsRepaired: 0,
     warnings: [],
     phantomsScanned: 0,
     phantomsRedirected: 0,
@@ -343,24 +490,154 @@ export async function runExtractFacts(
         )`,
     [sourceId],
   );
-  const legacyCount = parseInt(legacy[0]?.n ?? '0', 10);
+  let legacyCount = parseInt(legacy[0]?.n ?? '0', 10);
   result.legacyRowsPending = legacyCount;
-  if (legacyCount > 0) {
+  if (isFactRepairDisabled()) {
     result.guardTriggered = true;
-    // Drain advice must actually work: a bare `apply-migrations --yes`
-    // is a no-op once the v0.32.2 ledger entry says complete (the
-    // runner classifies it as already-applied), so the sanctioned
-    // re-run path is the explicit retry marker first. Phase B is
-    // idempotent — it only touches `row_num IS NULL` rows and de-dupes
-    // against the existing fence — so the re-run is safe. Individual
-    // rows can instead be drained through `forget_fact` (soft-expired
-    // rows stop counting).
+    result.warnings.push('FACTS_REPAIR_DISABLED: repair, phantom redirect and reconciliation are disabled; drain all in-flight writers before rollback.');
+    return result;
+  }
+
+  // ── Self-draining guard (2026-09-13) ─────────────────────────────
+  // The guard has armed. Before halting, fence the rows it armed on — in
+  // THIS source, page by page, under the page lock, refusing per file —
+  // and re-count. Zero afterwards means the reconcile below runs in the
+  // same phase; anything left halts exactly as before, with the refusals
+  // named. Never runs on a dry-run; the `GBRAIN_FACT_REPAIR=off` kill
+  // switch restores the pure halt without a deploy. The repair resolves its
+  // files from `sources.local_path`, so it needs no brainDir — every entry
+  // point (cycle, maintenance sweep, a direct call) gets it by default.
+  // Safety properties live in the writer's stamp mode (fence-write.ts); the
+  // caller is src/core/facts/fence-legacy.ts.
+  const repairEnabled = (opts.repairLegacy ?? true) && !isFactRepairDisabled();
+  // The repair also runs when the guard is NOT armed but a page still carries
+  // forgotten never-fenced rows (review finding 3): a crashed run's residue on
+  // such a page would otherwise be imported by the next sync and re-inserted
+  // by the reconcile below, with no eligible row left to bring the repair back.
+  // Listed whether or not the repair is enabled: with it off, those pages are
+  // blocked from the reconcile below instead of swept.
+  const residuePages = !opts.dryRun && legacyCount === 0
+    ? await listResidueOnlyPagesForSource(engine, sourceId)
+    : [];
+  const residuePagesPending = residuePages.length > 0;
+  // Residue-only pages the sweep could not prove safe (file still carrying
+  // uncommitted fence rows that are not exactly a crashed repair's, or a cache
+  // not yet back to the file's body): the reconcile below leaves them alone,
+  // otherwise it would insert the forgotten rows from that file or cache.
+  const blockedResidueSlugs = new Set<string>();
+  // Pages whose legacy writer returned a definite page-local refusal. They
+  // remain degraded and are skipped, but do not starve unrelated pages.
+  const blockedRepairSlugs = new Set<string>();
+  // A repair that could not complete proves nothing about the pages it did
+  // not reach. Codex acceptance round 3, P1: the catch below used to read a
+  // repair-wide throw as "nothing to block" — with the source's only legacy
+  // row already forgotten, legacyCount stayed 0, blockedResidueSlugs stayed
+  // empty, the reconcile ran, and the forgotten claim was re-inserted from
+  // the crashed repair's residue on disk and in the cache. Now any failure
+  // (reported on the summary, or thrown) halts BEFORE the reconcile, exactly
+  // as an armed guard does, naming the failure and keeping every block the
+  // pass did collect.
+  let repairFailure: string | undefined;
+  if ((legacyCount > 0 || residuePagesPending) && repairEnabled && !opts.dryRun) {
+    try {
+      const repair = await repairLegacyRowsForSource(engine, {
+        sourceId,
+        signal: opts.signal,
+        hooks: opts.repairHooks,
+      });
+      repairFailure = repair.failure;
+      // A sweep that found every candidate page clean is not a repair worth
+      // reporting; the summary stays as quiet as a run with nothing to do.
+      // A failed one is always reported, partial counters and all.
+      if (repair.rowsEligible > 0 || repair.residuePagesChecked > 0 || repair.residuePagesBlocked.length > 0 || repairFailure !== undefined) result.legacyRepair = repair;
+      result.legacyRowsRepaired = repair.rowsStamped;
+      for (const page of repair.skippedPages) blockedRepairSlugs.add(page.slug);
+      // `rowsRemaining` is a fresh count only when the pass completed; after a
+      // failure the guard's own pre-repair count stays the last authoritative one.
+      if (repairFailure === undefined) {
+        legacyCount = repair.rowsRemaining;
+        result.legacyRowsPending = legacyCount;
+      }
+      if (repair.residuePagesBlocked.length > 0) {
+        for (const b of repair.residuePagesBlocked) blockedResidueSlugs.add(b.slug);
+        const named = repair.residuePagesBlocked.slice(0, 10)
+          .map(b => `${b.slug} (${b.reason}${b.detail ? `: ${b.detail.slice(0, 120)}` : ''})`).join(' | ');
+        result.warnings.push(
+          `extract_facts: FACTS_RESIDUE_UNRESOLVED: ${repair.residuePagesBlocked.length} page(s) in source "${sourceId}" ` +
+          `have unverified file/cache content; their fact reconciliation and the source phantom pass are skipped ` +
+          `until manual review resolves forgotten claims and gbrain sync refreshes the page: ${named}`,
+        );
+      }
+      if (repair.pagesSkipped > 0) {
+        const reasons = Object.entries(repair.skippedByReason).map(([k, v]) => `${k}=${v}`).join(' ');
+        result.warnings.push(
+          `extract_facts: legacy repair left ${repair.pagesSkipped} page(s) unfenced in source "${sourceId}" ` +
+          `(${reasons}): ${repair.skippedDetails.join(' | ')}`,
+        );
+      }
+      if (repair.aborted) {
+        repairFailure = 'repair aborted before all candidates were checked';
+        result.warnings.push(`extract_facts: legacy repair aborted before finishing source "${sourceId}"`);
+      }
+    } catch (e) {
+      // The repair never throws by contract; if it does anyway, it is the
+      // same fail-closed halt as a reported failure — never a quiet "nothing
+      // to block".
+      repairFailure = e instanceof Error ? e.message : String(e);
+    }
+  } else if (residuePagesPending && !opts.dryRun) {
+    // The repair is off (`repairLegacy: false` or GBRAIN_FACT_REPAIR=off)
+    // and pages carry forgotten never-fenced rows. Nothing has proven their
+    // files or cache free of a crashed repair's fence rows, so the reconcile
+    // leaves every one of them alone — fail closed, named, never reconciled
+    // unprotected (2026-09-14 acceptance round 6). With the guard armed the
+    // phase halts below before any reconcile, as it always did.
+    for (const slug of residuePages) blockedResidueSlugs.add(slug);
     result.warnings.push(
-      `extract_facts: ${legacyCount} legacy v0.31 fact rows in source "${sourceId}" ` +
-      `(entity page present, not yet fenced) pending fence backfill. Re-run the v0.32.2 ` +
-      `fence backfill: \`gbrain apply-migrations --force-retry 0.32.2\` then ` +
-      `\`gbrain apply-migrations --yes --source ${sourceId}\` (only this source's tree ` +
-      `must be clean). Or drain individual rows via \`forget_fact\`.`,
+      `extract_facts: FACTS_RESIDUE_UNSWEPT: ${residuePages.length} page(s) in source "${sourceId}" carry forgotten ` +
+      `never-fenced rows and the legacy repair is disabled (repairLegacy: false or GBRAIN_FACT_REPAIR=off), so their ` +
+      `files cannot be proven free of a crashed repair's fence rows; their fact reconciliation is skipped until the ` +
+      `repair is enabled: ${residuePages.slice(0, 10).join(' | ')}`,
+    );
+  }
+
+  // Forgotten residue remains source-indeterminate: unlike a writer's
+  // definite page-local refusal, it can represent a crashed publication
+  // whose ownership/cache state is not known. Preserve the source-wide halt.
+  if (blockedResidueSlugs.size > 0) {
+    const residueFailure = `unresolved residue on ${blockedResidueSlugs.size} page(s); manual review required before this source can reconcile or redirect`;
+    repairFailure = repairFailure ? `${repairFailure}; ${residueFailure}` : residueFailure;
+  }
+
+  if (repairFailure !== undefined) {
+    result.guardTriggered = true;
+    result.repairFailed = repairFailure;
+    result.warnings.push(
+      `extract_facts: FACTS_REPAIR_INCOMPLETE: the legacy repair in source "${sourceId}" did not complete ` +
+      `(${repairFailure.slice(0, 200)}); fact reconciliation for this source is skipped this run because a page ` +
+      `the repair did not reach cannot be proven free of a crashed repair's fence rows. The next run retries.`,
+    );
+    // Booked as a halt, like the guard's own: the phase did not run.
+    if (!opts.dryRun) {
+      await upsertExtractRollup(engine, {
+        kind: 'facts.fence',
+        source_id: sourceId,
+        cost_delta: 0,
+        round_completed_delta: 0,
+        halt_delta: 1,
+      });
+    }
+    return result;
+  }
+
+  if (legacyCount > 0) {
+    const unknownRemaining = result.legacyRepair?.remainingPageSlugs
+      .filter(slug => !blockedRepairSlugs.has(slug)) ?? [];
+    result.guardTriggered = true;
+    result.warnings.push(
+      `extract_facts: ${legacyCount} legacy fact rows in source "${sourceId}" remain after repair; ` +
+      `${blockedRepairSlugs.size} known refused page(s) are skipped while independently healthy pages reconcile. ` +
+      `Resolve the named refusal and retry; preserve the file and fact evidence.`,
     );
     // #3683: book the halt BEFORE the early return. The end-of-run rollup
     // write below is unreachable from this path, so pre-fix a guard-triggered
@@ -377,7 +654,10 @@ export async function runExtractFacts(
         halt_delta: 1,
       });
     }
-    return result;
+    // A fresh recount with every remaining row owned by a known refused page
+    // is determinate. Unknown ownership, a disabled repair, or an incomplete
+    // summary remains source-wide fail-closed.
+    if (unknownRemaining.length > 0 || !result.legacyRepair) return result;
   }
 
   // ── v0.35.5: phantom-redirect pre-pass ──────────────────────────
@@ -390,7 +670,7 @@ export async function runExtractFacts(
   // IS NOT NULL` so a half-redirected page (soft-deleted, .md still on
   // disk) won't be re-redirected.
   let phantomResult: PhantomPassResult = emptyPhantomPassResult();
-  if (opts.brainDir) {
+  if (opts.brainDir && blockedResidueSlugs.size === 0 && blockedRepairSlugs.size === 0 && !isFactRepairDisabled()) {
     try {
       phantomResult = await runPhantomRedirectPass(
         engine,
@@ -450,6 +730,9 @@ export async function runExtractFacts(
     // partial state; the receipt/rollup below still runs with partial counts.
     if (isAborted(opts.signal)) break;
     result.pagesScanned += 1;
+    // Named in the FACTS_RESIDUE_UNRESOLVED warning above; neither its file
+    // nor its cache is proven free of a crashed repair's rows.
+    if (blockedResidueSlugs.has(slug) || blockedRepairSlugs.has(slug)) continue;
 
     const page = await engine.getPage(slug, { sourceId });
     if (!page) {
@@ -525,19 +808,36 @@ export async function runExtractFacts(
 
     if (extracted.length === 0) {
       if (existing.length > 0) {
-        // The delete targets source_markdown_slug = slug only, so
-        // NULL-source_markdown_slug legacy rows survive (the
-        // partial-UNIQUE-index keyspace). #1928: `cli:`-origin facts
-        // (conversation facts from extract-conversation-facts) are NOT
-        // fence-owned — the page carries no `## Facts` fence to recreate
-        // them — so they MUST survive this reconcile. #2646: soft-expired
-        // legacy rows (forget_fact's record of the forget) likewise
-        // survive via preserveExpiredLegacy.
-        const deleted = await engine.deleteFactsForPage(slug, sourceId, {
-          excludeSourcePrefixes: ['cli:'],
-          preserveExpiredLegacy: true,
-        });
-        result.factsDeleted += deleted.deleted;
+        const deletion = await underPageLock(slug, async () => {
+          if (await refuseReconcileOnStaleCache(
+            engine,
+            slug,
+            sourceId,
+            page.compiled_truth ?? '',
+            page.timeline ?? '',
+            result.warnings,
+          )) {
+            return null;
+          }
+          const missing = await missingOwnedFenceRows(engine, slug, sourceId, new Set());
+          if (missing.length) { result.warnings.push(unpublishedConflictWarning(slug, missing)); return null; }
+          // The delete targets source_markdown_slug = slug only, so
+          // NULL-source_markdown_slug legacy rows survive (the
+          // partial-UNIQUE-index keyspace). #1928: `cli:`-origin facts
+          // (conversation facts from extract-conversation-facts) are NOT
+          // fence-owned — the page carries no `## Facts` fence to recreate
+          // them — so they MUST survive this reconcile. #2646: soft-expired
+          // legacy rows (forget_fact's record of the forget) likewise
+          // survive via preserveExpiredLegacy.
+          return engine.deleteFactsForPage(slug, sourceId, {
+            excludeSourcePrefixes: ['cli:'],
+            preserveExpiredLegacy: true,
+          });
+        }, opts, result.warnings);
+        if (!deletion) {
+          continue;
+        }
+        result.factsDeleted += deletion.deleted;
       }
       continue;
     }
@@ -671,11 +971,30 @@ export async function runExtractFacts(
 
     if (toInsert.length === 0) continue;
 
-    const inserted = await engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
-      toInsert,
-      { source_id: sourceId },
-      deleteForPageFirst ? { deleteForPageFirst } : undefined,
-    );
+    // Insert-only or wipe + reinsert alike: under the page lock, and only
+    // from a cache that still IS the canonical file. An insert from a cache
+    // the file no longer matches is how a restored preimage's forgotten rows
+    // came back (2026-09-14 acceptance review, finding 2).
+    const inserted = await underPageLock(slug, async () => {
+      if (await refuseReconcileOnStaleCache(
+        engine,
+        slug,
+        sourceId,
+        page.compiled_truth ?? '',
+        page.timeline ?? '',
+        result.warnings,
+      )) {
+        return null;
+      }
+      const missing = await missingOwnedFenceRows(engine, slug, sourceId, new Set(parsed.facts.map(f => f.rowNum)));
+      if (missing.length) { result.warnings.push(unpublishedConflictWarning(slug, missing)); return null; }
+      return engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
+        toInsert,
+        { source_id: sourceId },
+        deleteForPageFirst ? { deleteForPageFirst } : undefined,
+      );
+    }, opts, result.warnings);
+    if (!inserted) continue;
     result.factsInserted += inserted.inserted;
     // v0.46 (#3014) — the wipe (when needed) ran inside insertFacts' txn;
     // count it here from the atomic result rather than a separate delete.

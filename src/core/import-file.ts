@@ -51,7 +51,7 @@ import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { computeCorpusGeneration, loadSourceRow } from './contextual-retrieval-service.ts';
 import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
-import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning } from './facts-fence.ts';
+import { parseFactsFence, renderFactsTable, replaceOrInsertFactsFence, restoreHiddenFactRows, factsGapWarning } from './facts-fence.ts';
 import { scanFencedBlocks, MAX_FENCES_PER_PAGE } from './fence-scan.ts';
 
 /**
@@ -113,19 +113,6 @@ function fenceTagToPseudoPath(lang: string | undefined): string | null {
 // MAX_FENCES_PER_PAGE (fence-bomb DOS cap, GBRAIN_MAX_FENCES_PER_PAGE env
 // override) moved to fence-scan.ts with the #2862 linear scanner.
 
-function replaceOrAppendFactsFence(body: string, fenceBlock: string): string {
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  if (beginIdx !== -1) {
-    const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-    if (endIdx !== -1) {
-      return body.slice(0, beginIdx) + fenceBlock + body.slice(endIdx + FACTS_FENCE_END.length);
-    }
-  }
-
-  const sep = body.endsWith('\n') ? '\n' : '\n\n';
-  return `${body}${sep}## Facts\n\n${fenceBlock}\n`;
-}
-
 /**
  * #2044 / #4548: row-level, visibility-aware fence merge for one page
  * column on the remote write-back boundary. Restores non-'world' fence
@@ -159,7 +146,12 @@ function mergeHiddenFactRowsIntoBody(
         `the hidden row(s) keep their original numbers.`,
       );
     }
-    return replaceOrAppendFactsFence(incomingBody, renderFactsTable(merge.merged));
+    const mergedBody = replaceOrInsertFactsFence(incomingBody, renderFactsTable(merge.merged));
+    const finalParse = parseFactsFence(mergedBody);
+    if (finalParse.warnings.length > 0) {
+      throw new Error(`FACTS_FINAL_MERGE_INVALID on ${slug}: ${finalParse.warnings.join('; ')}`);
+    }
+    return mergedBody;
   }
   const gapWarning = factsGapWarning(slug, incomingFacts, existingFacts, false);
   if (gapWarning) console.warn(gapWarning);
@@ -174,7 +166,7 @@ function mergeHiddenFactRowsIntoBody(
  * empty fences are skipped. Per-fence try/catch: one malformed fence doesn't
  * abort the page import.
  */
-async function extractFencedChunks(
+export async function extractFencedChunks(
   markdown: string,
   startChunkIndex: number,
 ): Promise<ChunkInput[]> {

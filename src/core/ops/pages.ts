@@ -11,8 +11,11 @@ import type { BrainEngine } from '../engine.ts';
 import { clampSearchLimit } from '../engine.ts';
 import type { Page, PageType } from '../types.ts';
 import { importFromContent } from '../import-file.ts';
+import { checkFenceRowsOnPut, pageRevision } from '../facts/fence-drop-guard.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { writePageThrough, deletePageThrough, resolvePageWriteTarget, type WriteThroughResult } from '../write-through.ts';
+import { acquirePageLock, type PageLockHandle } from '../page-lock.ts';
+import { validateSlug } from '../utils.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
 // #3190: pack-aware link typing on the put_page auto-link path.
 import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
@@ -65,6 +68,33 @@ function assertSourceInWriteGrant(ctx: OperationContext, sourceId: string): void
 }
 
 /**
+ * put_page / restore_page hold the page lock across the DB write AND the
+ * disk write-through (2026-09-14 review finding 4). Pre-fix the lock was
+ * taken inside writePageThrough only, AFTER importFromContent had committed:
+ * a lock still held past the wait came back as `page_lock_timeout`, the op
+ * reported success, and the file kept its OLD content with no retry queued —
+ * so the next `gbrain sync` re-imported the old file over the acknowledged
+ * save. Taking the lock FIRST means a busy page refuses before anything is
+ * written (the caller retries; nothing is lost), and every acknowledged save
+ * has both sinks written under one holder. Lock order matches every other
+ * writer (page lock outermost, then the DB); no lock holder calls back into
+ * these ops, and importFromContent takes no page lock, so there is no
+ * re-entrancy. The fence writers, forget, the legacy-fact stamp mode and the
+ * destructive reconcile wait 5 s for the same lock and degrade per page.
+ */
+async function lockPageForWrite(slug: string, op: string): Promise<PageLockHandle> {
+  const handle = await acquirePageLock(slug, { timeoutMs: 5_000 });
+  if (!handle) {
+    throw new OperationError(
+      'storage_error',
+      `${op}: '${slug}' is being written by another process (the page lock was held for the whole 5 s wait); nothing was written.`,
+      'Retry in a few seconds — a facts-fence write, forget, legacy-fact repair or reconcile on this page is in progress.',
+    );
+  }
+  return handle;
+}
+
+/**
  * #4352 remediation — filter fuzzy-resolution candidates so get_page's
  * ambiguous_slug candidate list can't enumerate private slugs to an
  * untrusted caller. Probe SQL lives ONCE in findPrivateOnlySlugs (a slug
@@ -104,7 +134,7 @@ const get_page: Operation = {
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     fuzzy: { type: 'boolean', description: 'Enable fuzzy slug resolution (default: false)' },
-    include_content: { type: 'boolean', description: '#2225: include the canonical serialized `content` field (frontmatter + body + timeline sentinel) for lossless get→edit→put_page round-trips. Default false — it roughly duplicates compiled_truth + timeline, so read-only callers should not pay for it.' },
+    include_content: { type: 'boolean', description: '#2225: include the canonical serialized `content` field (frontmatter + body + timeline sentinel) for lossless get→edit→put_page round-trips, plus revision to pass as put_page base_revision. Default false — it roughly duplicates compiled_truth + timeline, so read-only callers should not pay for it.' },
     include_deleted: { type: 'boolean', description: 'v0.26.5: surface soft-deleted pages with deleted_at populated (default: false). Used by restore workflows.' },
     source_id: { type: 'string', description: "#4329: scope the lookup to a single source (a multi-source brain can hold the same slug in several sources). Defaults to ctx.sourceId / the caller's grant. '__all__' spans every source for trusted local callers, your granted sources for remote callers." },
   },
@@ -254,7 +284,7 @@ const get_page: Operation = {
     return {
       ...visibleBody,
       tags,
-      ...(includeContent ? { content: serializePageToMarkdown(visibleBody as Page, tags) } : {}),
+      ...(includeContent ? (() => { const content = serializePageToMarkdown(visibleBody as Page, tags); return { content, revision: pageRevision(content) }; })() : {}),
       ...(resolved_slug ? { resolved_slug } : {}),
       ...(content_flag ? { content_flag } : {}),
     };
@@ -332,6 +362,7 @@ const put_page: Operation = {
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Complete markdown content with YAML frontmatter. REPLACES the entire page; this is not a partial edit. Read the canonical page first with `get_page include_content:true` before modifying it.' },
+    base_revision: { type: 'string', required: false, description: 'The revision returned by get_page include_content:true. A stale revision conflicts. Required when deliberately removing active Facts rows from the current page.' },
     allow_empty: { type: 'boolean', required: false, description: 'Allow overwriting an existing non-empty page with empty/whitespace-only content (default: false). Without it, put_page rejects the empty overwrite — the empty-stdin failure class.' },
     // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
     // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
@@ -439,7 +470,24 @@ const put_page: Operation = {
       // Pack load failed; fall through to legacy inferType behavior.
       activePack = undefined;
     }
-    const result = await importFromContent(ctx.engine, slug, p.content as string, {
+    // Page lock FIRST, then the DB write, then the disk write-through, all
+    // under one holder (see lockPageForWrite). A busy page refuses here,
+    // before anything is written. Lock the slug the row will actually be
+    // stored under: importFromContent normalizes through validateSlug (the
+    // engines' shared chokepoint — lowercasing, including Unicode case
+    // folds), so locking the raw input would let `people/Ⅰ` slip past a
+    // holder of `people/ⅰ` (review finding 4).
+    const targetSlug = validateSlug(slug);
+    const pageLock = await lockPageForWrite(targetSlug, 'put_page');
+    let result!: Awaited<ReturnType<typeof importFromContent>>;
+    let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'subagent_sandbox' | 'dry_run' }) | undefined;
+    try {
+    const fenceVerdict = await checkFenceRowsOnPut(ctx.engine, {
+      slug: targetSlug, sourceId: ctx.sourceId ?? 'default', content: p.content as string,
+      remote: ctx.remote !== false, baseRevision: typeof p.base_revision === 'string' ? p.base_revision : undefined,
+    });
+    if (!fenceVerdict.ok) throw new OperationError('conflict', fenceVerdict.message, fenceVerdict.suggestion);
+    result = await importFromContent(ctx.engine, slug, p.content as string, {
       noEmbed,
       // v0.42 (#1699): untrusted callers can't smuggle gate-owned frontmatter
       // markers (quarantine/content_flag/embed_skip). Fail-closed — anything
@@ -472,7 +520,7 @@ const put_page: Operation = {
     // put_page, and otherwise have write-through rewrite the victim's file
     // with falsified provenance. Dedup returns status 'skipped' without
     // touching the DB, so throwing here leaves nothing to roll back.
-    if (result.slug && result.slug !== slug) {
+    if (result.slug && result.slug !== targetSlug) {
       // Deliberately does NOT name the resolved slug: it belongs to a page
       // outside the fence, and echoing it would turn frontmatter-id guessing
       // into a slug-enumeration oracle.
@@ -533,8 +581,8 @@ const put_page: Operation = {
     //   - All other writes → write-through.
     // put_page's own trust-gating produces two skip reasons ('subagent_sandbox',
     // 'dry_run') that never come out of writePageThrough itself — widen the
-    // field rather than losing the commit/pushed/lastPushStatus typing.
-    let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'subagent_sandbox' | 'dry_run' }) | undefined;
+    // field (declared above the locked block) rather than losing the
+    // commit/pushed/lastPushStatus typing.
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
     if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
@@ -542,7 +590,10 @@ const put_page: Operation = {
       const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
       // Shared canonical write-through (also used by `gbrain brainstorm/lsd
       // --save`). Renders the file from the saved DB row and writes it
-      // atomically; never throws (failures land in skipped/error).
+      // atomically; never throws (failures land in skipped/error). The lock
+      // taken above covers the normalized target slug; a dedup hit that
+      // resolved to ANOTHER in-fence slug (status 'skipped', nothing written
+      // to the DB) lets the helper take that slug's own lock.
       writeThrough = await writePageThrough(ctx.engine, result.slug, {
         sourceId,
         frontmatterOverrides: {
@@ -551,6 +602,7 @@ const put_page: Operation = {
           source_kind: provenanceVia,
         },
         logger: ctx.logger,
+        holdsPageLock: result.slug === targetSlug,
       });
     } else if (isSandboxSubagent) {
       writeThrough = { written: false, skipped: 'subagent_sandbox' };
@@ -567,12 +619,22 @@ const put_page: Operation = {
     // thrown write error, or a guard that REFUSED to write into an existing
     // repo (missing dir, sibling-source collision, escaped path, case-fold
     // clash, unreadable row) — means a file was supposed to exist and
-    // doesn't, so put_page must not report success.
+    // doesn't, so put_page must not report success. `page_lock_timeout` can
+    // no longer reach here for the target slug: the lock is held from before
+    // the DB write (lockPageForWrite), so a busy page refuses before anything
+    // is committed instead of acknowledging an undurable save. It can still
+    // come back for a GENUINE dedup hit on ANOTHER slug — status 'skipped',
+    // i.e. importFromContent wrote nothing — where the other page's file
+    // already matches its row: reported, not fatal. Any other changed-slug
+    // outcome is a real write on a page this call does not hold, and fails.
+    const dedupOtherSlugBusy = writeThrough?.skipped === 'page_lock_timeout'
+      && result.status === 'skipped' && result.slug !== targetSlug;
     if (writeThrough && !writeThrough.written
       && writeThrough.skipped !== 'no_repo_configured'
       && writeThrough.skipped !== 'disabled_by_config'
       && writeThrough.skipped !== 'subagent_sandbox'
-      && writeThrough.skipped !== 'dry_run') {
+      && writeThrough.skipped !== 'dry_run'
+      && !dedupOtherSlugBusy) {
       // Roll back rather than leave an index-only orphan, but only when this
       // call is what created the row: created_at === updated_at is set by
       // the SAME insert statement (the ON CONFLICT UPDATE branch never
@@ -592,6 +654,15 @@ const put_page: Operation = {
         `put_page: the page content could not be written to disk (${writeThrough.skipped ?? writeThrough.error}).`,
         'Check that the configured repo path exists and is writable, then retry.',
       );
+    }
+    // Explicit omission against a matching current revision. Never delete on
+    // dedup/skip/error or a write to a different slug. Tombstones are retained.
+    if (fenceVerdict.droppedIds.length && result.status === 'imported' && result.slug === targetSlug) {
+      await ctx.engine.executeRaw(`DELETE FROM facts WHERE source_id = $1 AND source_markdown_slug = $2
+        AND id = ANY($3::bigint[]) AND expired_at IS NULL`, [ctx.sourceId ?? 'default', targetSlug, fenceVerdict.droppedIds]);
+    }
+    } finally {
+      await pageLock.release();
     }
 
     // Auto-link post-hook: runs AFTER importFromContent (which is its own
@@ -1179,27 +1250,35 @@ const restore_page: Operation = {
     const sourceOpts = requestedSource
       ? { sourceId: requestedSource }
       : ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    const ok = await ctx.engine.restorePage(slug, sourceOpts);
-    if (!ok) {
-      // Distinguish "not found" from "already active" (idempotent-as-false).
-      const existing = await ctx.engine.getPage(slug, { includeDeleted: true, ...sourceOpts });
-      if (!existing) {
-        throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug (and source_id on a multi-source brain).');
+    // Same boundary as put_page: the lock is held from before the DB write
+    // through the file write-through, so a busy page refuses before the row
+    // is restored instead of restoring it with no file behind it.
+    const pageLock = await lockPageForWrite(slug, 'restore_page');
+    try {
+      const ok = await ctx.engine.restorePage(slug, sourceOpts);
+      if (!ok) {
+        // Distinguish "not found" from "already active" (idempotent-as-false).
+        const existing = await ctx.engine.getPage(slug, { includeDeleted: true, ...sourceOpts });
+        if (!existing) {
+          throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug (and source_id on a multi-source brain).');
+        }
+        return { status: 'already_active', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}) };
       }
-      return { status: 'already_active', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}) };
+      // #4022: re-render the artifact — delete_page now removes it, so without
+      // this a restored page has a DB row and no file, and `sync --full`'s
+      // delete-reconcile treats the missing artifact as a user deletion,
+      // silently re-deleting the page that was just restored. Keeps the two
+      // sinks symmetric across the delete/restore pair; sandbox subagents stay
+      // DB-only, matching put_page's trust gate.
+      const isSandboxSubagent = ctx.viaSubagent === true
+        && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
+      const writeThrough = isSandboxSubagent
+        ? { written: false, skipped: 'subagent_sandbox' as const }
+        : await writePageThrough(ctx.engine, slug, { sourceId: sourceOpts.sourceId, logger: ctx.logger, holdsPageLock: true });
+      return { status: 'restored', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: writeThrough };
+    } finally {
+      await pageLock.release();
     }
-    // #4022: re-render the artifact — delete_page now removes it, so without
-    // this a restored page has a DB row and no file, and `sync --full`'s
-    // delete-reconcile treats the missing artifact as a user deletion,
-    // silently re-deleting the page that was just restored. Keeps the two
-    // sinks symmetric across the delete/restore pair; sandbox subagents stay
-    // DB-only, matching put_page's trust gate.
-    const isSandboxSubagent = ctx.viaSubagent === true
-      && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
-    const writeThrough = isSandboxSubagent
-      ? { written: false, skipped: 'subagent_sandbox' as const }
-      : await writePageThrough(ctx.engine, slug, { sourceId: sourceOpts.sourceId, logger: ctx.logger });
-    return { status: 'restored', slug, ...(sourceOpts.sourceId ? { source_id: sourceOpts.sourceId } : {}), write_through: writeThrough };
   },
   cliHints: { name: 'restore', positional: ['slug'] },
 };

@@ -124,6 +124,51 @@ export interface FactsFenceParseResult {
   warnings: string[];
 }
 
+function factsFenceSpans(body: string): Array<{ begin: number; end: number }> {
+  const spans: Array<{ begin: number; end: number }> = [];
+  let cursor = 0;
+  while (true) {
+    const begin = body.indexOf(FACTS_FENCE_BEGIN, cursor);
+    if (begin === -1) break;
+    const endMarker = body.indexOf(FACTS_FENCE_END, begin + FACTS_FENCE_BEGIN.length);
+    if (endMarker === -1) break;
+    const end = endMarker + FACTS_FENCE_END.length;
+    spans.push({ begin, end });
+    cursor = end;
+  }
+  return spans;
+}
+
+/**
+ * The ONE fence-placement rule, adapted from upstream #4756 and shared by
+ * every writer that materializes a Facts fence. Replaces the complete parsed
+ * logical stream at its first physical fence while preserving intervening
+ * prose byte-for-byte. With no fence, inserts above the timeline sentinel so
+ * extract_facts can see it; no sentinel means append at EOF.
+ */
+export function replaceOrInsertFactsFence(body: string, fenceBlock: string): string {
+  const spans = factsFenceSpans(body);
+  if (spans.length === 0) {
+    const section = `## Facts\n\n${fenceBlock}\n`;
+    const sentinelAt = timelineSentinelOffset(body);
+    if (sentinelAt !== -1) {
+      const head = body.slice(0, sentinelAt);
+      const sep = head === '' ? '' : head.endsWith('\n\n') ? '' : head.endsWith('\n') ? '\n' : '\n\n';
+      return `${head}${sep}${section}\n${body.slice(sentinelAt)}`;
+    }
+    const sep = body.endsWith('\n') ? '\n' : '\n\n';
+    return `${body}${sep}${section}`;
+  }
+
+  let out = body.slice(0, spans[0]!.begin) + fenceBlock;
+  let cursor = spans[0]!.end;
+  for (const span of spans.slice(1)) {
+    out += body.slice(cursor, span.begin);
+    cursor = span.end;
+  }
+  return out + body.slice(cursor);
+}
+
 function parseConfidenceCell(raw: string): number | undefined {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
@@ -167,7 +212,7 @@ function parseForgottenFromContext(context: string | undefined): boolean {
  * (extract-facts cycle phase, doctor) surface warnings as
  * `FACTS_TABLE_MALFORMED` sync-failures entries.
  */
-export function parseFactsFence(body: string): FactsFenceParseResult {
+function parseSingleFactsFence(body: string): FactsFenceParseResult {
   const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
   const endIdx   = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
   const warnings: string[] = [];
@@ -297,6 +342,45 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
     warnings.push('FACTS_TABLE_MALFORMED: pipe-rows present but no recognizable header');
   }
 
+  return { facts, warnings };
+}
+
+/** Parse repeated canonical facts fences as one append-only row stream. */
+export function parseFactsFence(body: string): FactsFenceParseResult {
+  const facts: ParsedFact[] = [];
+  const warnings: string[] = [];
+  const seenRowNums = new Set<number>();
+  let cursor = 0;
+  let found = false;
+  while (true) {
+    const begin = body.indexOf(FACTS_FENCE_BEGIN, cursor);
+    const strayEnd = body.indexOf(FACTS_FENCE_END, cursor);
+    if (begin === -1) {
+      if (!found && strayEnd !== -1) warnings.push('FACTS_FENCE_UNBALANCED: missing begin or end marker');
+      break;
+    }
+    if (strayEnd !== -1 && strayEnd < begin) {
+      warnings.push('FACTS_FENCE_UNBALANCED: end marker before begin');
+      break;
+    }
+    const end = body.indexOf(FACTS_FENCE_END, begin + FACTS_FENCE_BEGIN.length);
+    if (end === -1) {
+      warnings.push('FACTS_FENCE_UNBALANCED: missing begin or end marker');
+      break;
+    }
+    found = true;
+    const parsed = parseSingleFactsFence(body.slice(begin, end + FACTS_FENCE_END.length));
+    warnings.push(...parsed.warnings);
+    for (const fact of parsed.facts) {
+      if (seenRowNums.has(fact.rowNum)) {
+        warnings.push(`FACTS_ROW_NUM_COLLISION: duplicate row_num ${fact.rowNum}`);
+        continue;
+      }
+      seenRowNums.add(fact.rowNum);
+      facts.push(fact);
+    }
+    cursor = end + FACTS_FENCE_END.length;
+  }
   return { facts, warnings };
 }
 
@@ -507,52 +591,44 @@ export function upsertFactRow(
 
   const newFence = renderFactsTable(allRows);
 
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  const endIdx   = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-  let out: string;
-  if (beginIdx !== -1 && endIdx !== -1) {
-    out = body.slice(0, beginIdx) + newFence + body.slice(endIdx + FACTS_FENCE_END.length);
-  } else {
-    // #4756: the FIRST fence must land in compiled_truth — ABOVE the timeline
-    // sentinel. splitBody() files everything below the sentinel into
-    // page.timeline, where extract_facts refuses to reconcile it
-    // (FACTS_FENCE_BELOW_SENTINEL) — a blind EOF append on any page that
-    // already had a timeline froze the fence permanently.
-    const section = `## Facts\n\n${newFence}\n`;
-    const sentinelAt = timelineSentinelOffset(body);
-    if (sentinelAt !== -1) {
-      const head = body.slice(0, sentinelAt);
-      const sep = head === '' ? '' : head.endsWith('\n\n') ? '' : head.endsWith('\n') ? '\n' : '\n\n';
-      out = `${head}${sep}${section}\n${body.slice(sentinelAt)}`;
-    } else {
-      const sep = body.endsWith('\n') ? '\n' : '\n\n';
-      out = `${body}${sep}${section}`;
-    }
-  }
-  return { body: out, rowNum: nextRowNum };
+  return { body: replaceOrInsertFactsFence(body, newFence), rowNum: nextRowNum };
 }
 
 /**
  * Char offset of the line start of the first timeline sentinel in `body`,
- * or -1 when none is present. Mirrors the UNAMBIGUOUS sentinel forms of
- * `markdown.ts:findTimelineSplitIndex` (`<!-- timeline -->` /
- * `<!--timeline-->` — what serializeMarkdown emits — plus the decorated
- * `--- timeline ---`). The legacy bare `---` + `## Timeline` fallback is
- * deliberately NOT matched: upsertFactRow receives raw on-disk text that may
- * still carry YAML frontmatter, whose `---` delimiters would false-positive
- * that rule (findTimelineSplitIndex documents the same caveat — it expects
- * body lines). Local rather than imported because this module must stay free
+ * or -1 when none is present. Mirrors every sentinel form honored by
+ * `markdown.ts:findTimelineSplitIndex`, including legacy bare `---` followed
+ * by `## Timeline` / `## History`. Leading YAML frontmatter is skipped before
+ * scanning, so its delimiters cannot false-positive. Local rather than imported
+ * because this module must stay free
  * of markdown.ts's transitive dependency graph (see the FactKind comment at
  * the top of the file).
  */
 function timelineSentinelOffset(body: string): number {
+  const lines = body.split('\n');
+  let start = 0;
+  if (lines[0]?.trim() === '---') {
+    for (let i = 1; i < lines.length; i++) {
+      if (lines[i]!.trim() === '---') { start = i + 1; break; }
+    }
+  }
   let offset = 0;
-  for (const line of body.split('\n')) {
+  for (let i = 0; i < start; i++) offset += lines[i]!.length + 1;
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i]!;
     const trimmed = line.trim();
     if (
       trimmed === '<!-- timeline -->' ||
       trimmed === '<!--timeline-->' ||
-      /^---\s+timeline\s+---$/i.test(trimmed)
+      /^---\s+timeline\s+---$/i.test(trimmed) ||
+      (trimmed === '---' && (() => {
+        for (let j = i + 1; j < lines.length; j++) {
+          const next = lines[j]!.trim();
+          if (next === '') continue;
+          return /^##\s+(timeline|history)\b/i.test(next);
+        }
+        return false;
+      })())
     ) {
       return offset;
     }
@@ -606,23 +682,28 @@ export function stripFactsFence(body: string, opts: StripFactsFenceOpts = {}): s
   // Pages without a compiled body have nothing to strip. Guard so the privacy
   // strip is a safe no-op rather than crashing on `undefined.indexOf`.
   if (typeof body !== 'string') return body;
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  if (beginIdx === -1) return body;
-  const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-  if (endIdx === -1) return body;
+  const spans = factsFenceSpans(body);
+  if (spans.length === 0) return body;
 
   // Whole-fence strip mode (chunker case).
   if (!opts.keepVisibility || opts.keepVisibility.length === 0) {
-    return body.slice(0, beginIdx) + body.slice(endIdx + FACTS_FENCE_END.length);
+    let out = '';
+    let cursor = 0;
+    for (const span of spans) { out += body.slice(cursor, span.begin); cursor = span.end; }
+    return out + body.slice(cursor);
   }
 
   // Selective row-level strip mode (get_page case). Parse, filter, render.
   // The parser's lenient posture means malformed rows are silently dropped,
   // which is the safe direction at a privacy boundary — when in doubt,
   // strip rather than leak.
-  const { facts } = parseFactsFence(body);
   const keep = new Set(opts.keepVisibility);
-  const kept = facts.filter(f => keep.has(f.visibility));
-  const replacement = renderFactsTable(kept);
-  return body.slice(0, beginIdx) + replacement + body.slice(endIdx + FACTS_FENCE_END.length);
+  let out = '';
+  let cursor = 0;
+  for (const span of spans) {
+    const parsed = parseSingleFactsFence(body.slice(span.begin, span.end));
+    out += body.slice(cursor, span.begin) + renderFactsTable(parsed.facts.filter(f => keep.has(f.visibility)));
+    cursor = span.end;
+  }
+  return out + body.slice(cursor);
 }

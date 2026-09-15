@@ -21,6 +21,9 @@ import {
 import { importFromContent } from '../src/core/import-file.ts';
 import { serializePageToMarkdown, resolvePageFilePath } from '../src/core/markdown.ts';
 import { operations, type OperationContext } from '../src/core/operations.ts';
+import { acquirePageLock } from '../src/core/page-lock.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { createHash } from 'node:crypto';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -722,4 +725,257 @@ describe('delete_page / restore_page write-through symmetry (#4022)', () => {
     expect(rest.status).toBe('restored');
     expect(rest.write_through?.skipped).toBe('subagent_sandbox');
   });
+});
+
+describe('writePageThrough — page lock (2026-09-14 review finding 1)', () => {
+  const lockHome = () => path.join(tmpRoot, 'home');
+  const lockFileFor = (slug: string) =>
+    path.join(lockHome(), '.gbrain', 'page-locks', `${createHash('sha256').update(slug).digest('hex')}.lock`);
+
+  test('a held page lock degrades to skipped: page_lock_timeout — no throw, file untouched, DB row intact', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'people/locked';
+    await seedPage(slug);
+    const first = await withEnv({ GBRAIN_HOME: lockHome() }, () => writePageThrough(engine, slug, { sourceId: 'default' }));
+    expect(first.written).toBe(true);
+    const before = fs.readFileSync(first.path!, 'utf8');
+    await engine.putPage(slug, { type: 'note', title: 'T', compiled_truth: '# changed', timeline: '' } as any, { sourceId: 'default' });
+
+    const holder = await withEnv({ GBRAIN_HOME: lockHome() }, () => acquirePageLock(slug));
+    expect(holder).not.toBeNull();
+    try {
+      const t0 = Date.now();
+      const res = await withEnv({ GBRAIN_HOME: lockHome() }, () => writePageThrough(engine, slug, { sourceId: 'default' }));
+      expect(res).toEqual({ written: false, skipped: 'page_lock_timeout' });
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(4_500);
+      expect(fs.readFileSync(first.path!, 'utf8')).toBe(before);
+      expect((await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth).toBe('# changed');
+    } finally {
+      await holder!.release();
+    }
+    // Once released, the same write lands and the lock is released again after it.
+    const after = await withEnv({ GBRAIN_HOME: lockHome() }, () => writePageThrough(engine, slug, { sourceId: 'default' }));
+    expect(after.written).toBe(true);
+    expect(fs.readFileSync(after.path!, 'utf8')).toContain('# changed');
+    expect(fs.existsSync(lockFileFor(slug))).toBe(false);
+  }, 20_000);
+
+  test('holdsPageLock: true skips acquisition (re-entrant callers do not deadlock against themselves)', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'people/reentrant';
+    await seedPage(slug);
+    const holder = await withEnv({ GBRAIN_HOME: lockHome() }, () => acquirePageLock(slug));
+    try {
+      const res = await withEnv({ GBRAIN_HOME: lockHome() }, () =>
+        writePageThrough(engine, slug, { sourceId: 'default', holdsPageLock: true }));
+      expect(res.written).toBe(true);
+      // The caller's lock is still theirs: not released by the write.
+      expect(fs.existsSync(lockFileFor(slug))).toBe(true);
+    } finally {
+      await holder!.release();
+    }
+  });
+});
+
+describe('put_page / restore_page hold the page lock across the DB write AND the write-through (2026-09-14 review 2, finding 4)', () => {
+  const lockHome = () => path.join(tmpRoot, 'home');
+  const lockFileFor = (slug: string) =>
+    path.join(lockHome(), '.gbrain', 'page-locks', `${createHash('sha256').update(slug).digest('hex')}.lock`);
+  const put_page = operations.find((o) => o.name === 'put_page')!;
+  const delete_page = operations.find((o) => o.name === 'delete_page')!;
+  const restore_page = operations.find((o) => o.name === 'restore_page')!;
+  const ctx = () => ({
+    engine: engine as any,
+    config: { engine: 'pglite' } as any,
+    logger: { info() {}, warn() {}, error() {} },
+    dryRun: false, remote: false, sourceId: 'default',
+  }) as OperationContext;
+  const inHome = <T>(fn: () => Promise<T>) => withEnv({ GBRAIN_HOME: lockHome() }, fn);
+  const OLD = '---\ntitle: T\ntype: note\n---\n\n# Old content\n';
+  const NEW = '---\ntitle: T\ntype: note\n---\n\n# New content, acknowledged\n';
+
+  test('a page lock held for the whole wait: put_page refuses BEFORE the DB write (storage_error) — nothing created, no file', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'people/locked-put';
+    const holder = await inHome(() => acquirePageLock(slug));
+    expect(holder).not.toBeNull();
+    try {
+      const t0 = Date.now();
+      await expect(inHome(() => put_page.handler(ctx(), { slug, content: NEW }))).rejects.toMatchObject({ code: 'storage_error' });
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(4_500);
+      expect(await engine.getPage(slug, { sourceId: 'default' })).toBeNull();
+      expect(fs.existsSync(path.join(brainDir, `${slug}.md`))).toBe(false);
+    } finally {
+      await holder!.release();
+    }
+    // The caller's retry lands in both sinks.
+    const res = await inHome(() => put_page.handler(ctx(), { slug, content: NEW })) as Record<string, any>;
+    expect(res.status).toBe('created_or_updated');
+    expect(res.write_through.written).toBe(true);
+    expect(fs.readFileSync(path.join(brainDir, `${slug}.md`), 'utf8')).toContain('# New content, acknowledged');
+    expect(fs.existsSync(lockFileFor(slug))).toBe(false);
+  }, 20_000);
+
+  test('no lost save: an existing page stays OLD in both sinks while refused, so a sync in between changes nothing; the retry lands NEW in both, and a later sync keeps NEW', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'people/durable';
+    const filePath = path.join(brainDir, `${slug}.md`);
+    const first = await inHome(() => put_page.handler(ctx(), { slug, content: OLD })) as Record<string, any>;
+    expect(first.write_through.written).toBe(true);
+    const oldFile = fs.readFileSync(filePath, 'utf8');
+    const oldRow = (await engine.getPage(slug, { sourceId: 'default' }))!;
+
+    const holder = await inHome(() => acquirePageLock(slug));
+    try {
+      await expect(inHome(() => put_page.handler(ctx(), { slug, content: NEW }))).rejects.toMatchObject({ code: 'storage_error' });
+      // Refused before the DB write: row and file are still the OLD save.
+      const row = (await engine.getPage(slug, { sourceId: 'default' }))!;
+      expect(row.compiled_truth).toBe(oldRow.compiled_truth);
+      expect(row.content_hash).toBe(oldRow.content_hash);
+      expect(fs.readFileSync(filePath, 'utf8')).toBe(oldFile);
+      // What `gbrain sync` would do next with the file: re-import it — and the
+      // file IS the old save, so the row is unchanged (pre-fix, the row held the
+      // acknowledged NEW content and this step reverted it to OLD).
+      await importFromContent(engine, slug, fs.readFileSync(filePath, 'utf8'), { noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md` });
+      expect((await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth).toBe(oldRow.compiled_truth);
+    } finally {
+      await holder!.release();
+    }
+
+    const retry = await inHome(() => put_page.handler(ctx(), { slug, content: NEW })) as Record<string, any>;
+    expect(retry.status).toBe('created_or_updated');
+    expect(retry.write_through.written).toBe(true);
+    expect((await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth).toContain('New content, acknowledged');
+    expect(fs.readFileSync(filePath, 'utf8')).toContain('# New content, acknowledged');
+    // A sync after the acknowledged save keeps it: the file carries the same content.
+    await importFromContent(engine, slug, fs.readFileSync(filePath, 'utf8'), { noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md` });
+    expect((await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth).toContain('New content, acknowledged');
+  }, 20_000);
+
+  test('a REAL blocked writer: put_page waits while another holder has the page, then lands both sinks once the holder releases; the lock is released after', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'people/blocked-then-landed';
+    const filePath = path.join(brainDir, `${slug}.md`);
+    // Scanner-recorded source_path (a synced page), so the file of record is
+    // deterministic: a put-born page under a sync.repo_path that itself sits
+    // inside a git repo (the operator's TMPDIR here) binds a git-root-relative
+    // source_path that the repo_path branch then joins under the page root — a
+    // twin, and the shape the `[REGRESSION twin]` cases above already pin.
+    await seedPage(slug);
+    const first = await inHome(() => put_page.handler(ctx(), { slug, content: OLD })) as Record<string, any>;
+    expect(first.write_through.path).toBe(filePath);
+    const holder = (await inHome(() => acquirePageLock(slug)))!;
+    let releasedAt = 0;
+    let fileWhileHeld = '';
+    let bodyWhileHeld = '';
+    // The holder releases from a timer callback: put_page is genuinely
+    // blocked on the lockfile until then (its poll is 200 ms, its wait 5 s).
+    // Observations are captured here and asserted below.
+    const release = new Promise<void>((resolve) => setTimeout(async () => {
+      fileWhileHeld = fs.readFileSync(filePath, 'utf8');
+      bodyWhileHeld = (await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth;
+      releasedAt = Date.now();
+      await holder.release();
+      resolve();
+    }, 1_000));
+    const t0 = Date.now();
+    const res = await inHome(() => put_page.handler(ctx(), { slug, content: NEW })) as Record<string, any>;
+    await release;
+    expect(fileWhileHeld).toContain('# Old content');                 // while held: nothing written…
+    expect(bodyWhileHeld).toContain('Old content');                   // …in either sink
+    expect(res.status).toBe('created_or_updated');
+    expect(res.write_through.written).toBe(true);
+    expect(res.write_through.path).toBe(filePath);                    // the same file of record, not a twin
+    expect(Date.now()).toBeGreaterThanOrEqual(releasedAt);           // landed after the release, not before
+    expect(releasedAt - t0).toBeGreaterThanOrEqual(900);
+    expect((await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth).toContain('New content, acknowledged');
+    expect(fs.readFileSync(filePath, 'utf8')).toContain('# New content, acknowledged');
+    expect(fs.existsSync(lockFileFor(slug))).toBe(false);
+  }, 20_000);
+
+  test('the lock is released on every exit: after a successful save, and after a refused one (empty overwrite)', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'people/lock-released';
+    await inHome(() => put_page.handler(ctx(), { slug, content: OLD }));
+    expect(fs.existsSync(lockFileFor(slug))).toBe(false);
+    await expect(inHome(() => put_page.handler(ctx(), { slug, content: '   ' }))).rejects.toMatchObject({ code: 'invalid_params' });
+    expect(fs.existsSync(lockFileFor(slug))).toBe(false);
+    // A fence writer can take it right away.
+    const h = await inHome(() => acquirePageLock(slug));
+    expect(h).not.toBeNull();
+    await h!.release();
+  });
+
+  test('acceptance finding 4: the lock is taken on the NORMALIZED target slug — holding people/ⅰ refuses a save through people/Ⅰ; once free, the save lands under people/ⅰ', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const stored = 'people/ⅰ';   // U+2170 — what importFromContent stores
+    const input = 'people/Ⅰ';    // U+2160 — a valid input that case-folds onto it
+    expect(input).not.toBe(stored);
+    expect(input.toLowerCase()).toBe(stored);
+    const holder = (await inHome(() => acquirePageLock(stored)))!;
+    try {
+      await expect(inHome(() => put_page.handler(ctx(), { slug: input, content: NEW }))).rejects.toMatchObject({ code: 'storage_error' });
+      expect(await engine.getPage(stored, { sourceId: 'default' })).toBeNull();
+      expect(await engine.getPage(input, { sourceId: 'default' })).toBeNull();
+      expect(fs.existsSync(path.join(brainDir, `${stored}.md`))).toBe(false);
+    } finally {
+      await holder.release();
+    }
+    const res = await inHome(() => put_page.handler(ctx(), { slug: input, content: NEW })) as Record<string, any>;
+    expect(res.status).toBe('created_or_updated');
+    expect(res.slug).toBe(stored);
+    expect(res.write_through.written).toBe(true);
+    expect(res.write_through.path).toBe(path.join(brainDir, `${stored}.md`));
+    expect(fs.readFileSync(res.write_through.path, 'utf8')).toContain('# New content, acknowledged');
+    expect(fs.existsSync(lockFileFor(stored))).toBe(false);
+  }, 20_000);
+
+  test('acceptance finding 4: only a GENUINE unchanged dedup (status skipped, nothing written) tolerates a busy other page; the requested slug is never created', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const original = 'people/dedup-original';
+    const requested = 'people/dedup-request';
+    const content = '---\ntitle: T\ntype: note\nid: ext-dup-1\n---\n\n# Same external record\n';
+    const first = await inHome(() => put_page.handler(ctx(), { slug: original, content })) as Record<string, any>;
+    expect(first.status).toBe('created_or_updated');
+    // Someone holds the ORIGINAL page while the same external record is saved under another slug.
+    const holder = (await inHome(() => acquirePageLock(original)))!;
+    try {
+      const res = await inHome(() => put_page.handler(ctx(), { slug: requested, content })) as Record<string, any>;
+      expect(res.status).toBe('skipped');                                  // importFromContent wrote nothing
+      expect(res.slug).toBe(original);
+      expect(res.write_through).toEqual({ written: false, skipped: 'page_lock_timeout' });
+      expect(await engine.getPage(requested, { sourceId: 'default' })).toBeNull();
+      expect(fs.existsSync(path.join(brainDir, `${requested}.md`))).toBe(false);
+      expect(fs.readFileSync(path.join(brainDir, `${original}.md`), 'utf8')).toContain('# Same external record');
+    } finally {
+      await holder.release();
+    }
+  }, 20_000);
+
+  test('restore_page: a held lock refuses BEFORE the row is restored; once free, the row is restored AND the file re-rendered', async () => {
+    await engine.setConfig('sync.repo_path', brainDir);
+    const slug = 'people/restore-locked';
+    const filePath = path.join(brainDir, `${slug}.md`);
+    await seedPage(slug);   // scanner-recorded source_path: see the blocked-writer case above
+    const first = await inHome(() => put_page.handler(ctx(), { slug, content: OLD })) as Record<string, any>;
+    expect(first.write_through.path).toBe(filePath);
+    const del = await inHome(() => delete_page.handler(ctx(), { slug })) as Record<string, any>;
+    expect(del.write_through).toMatchObject({ removed: true, path: filePath });
+    expect(fs.existsSync(filePath)).toBe(false);
+    const holder = (await inHome(() => acquirePageLock(slug)))!;
+    try {
+      await expect(inHome(() => restore_page.handler(ctx(), { slug }))).rejects.toMatchObject({ code: 'storage_error' });
+      expect(await engine.getPage(slug, { sourceId: 'default' })).toBeNull();            // still soft-deleted
+      expect(fs.existsSync(filePath)).toBe(false);
+    } finally {
+      await holder.release();
+    }
+    const res = await inHome(() => restore_page.handler(ctx(), { slug })) as Record<string, any>;
+    expect(res.status).toBe('restored');
+    expect(res.write_through.written).toBe(true);
+    expect(res.write_through.path).toBe(filePath);
+    expect(fs.existsSync(filePath)).toBe(true);
+    expect(fs.readFileSync(filePath, 'utf8')).toContain('# Old content');
+    expect(fs.existsSync(lockFileFor(slug))).toBe(false);
+  }, 20_000);
 });
