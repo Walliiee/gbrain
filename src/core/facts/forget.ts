@@ -37,7 +37,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import type { BrainEngine } from '../engine.ts';
 import { withPageLock } from '../page-lock.ts';
 import { resolvePageWriteTarget } from '../write-through.ts';
-import { parseFactsFence, renderFactsTable, type ParsedFact } from '../facts-fence.ts';
+import { parseFactsFence, renderFactsTable, replaceOrInsertFactsFence, type ParsedFact } from '../facts-fence.ts';
 
 export interface ForgetFactResult {
   /** True iff the row was found AND a forget was applied (fence or DB). */
@@ -102,6 +102,15 @@ export async function forgetFactInFence(
     worldOnly?: boolean;
   } = {},
 ): Promise<ForgetFactResult> {
+  return forgetFactOnce(engine, factId, opts, true);
+}
+
+async function forgetFactOnce(
+  engine: BrainEngine,
+  factId: number,
+  opts: NonNullable<Parameters<typeof forgetFactInFence>[2]>,
+  rerouteOnce: boolean,
+): Promise<ForgetFactResult> {
   const reason = opts.reason ?? 'forgotten';
 
   const rows = await engine.executeRaw<FactDbRow>(
@@ -138,6 +147,24 @@ export async function forgetFactInFence(
 
   if (!canFence) {
     // Legacy path — DB-only forget. Doesn't survive `gbrain rebuild`.
+    //
+    // Conditional on the row STILL being legacy: the routing above came from
+    // a pre-read, and the legacy-fact repair (fence-write.ts stamp mode) can
+    // stamp this row in between. An unconditional expire would then expire a
+    // fence-owned row without striking its fence, and the reconcile's
+    // expiry-drift path would re-insert it active. Zero rows → the row moved
+    // (stamped, or expired by someone else): re-run the routing once so it
+    // takes the fence path (or reports already_expired).
+    const expired = await engine.executeRaw<{ id: string }>(
+      `UPDATE facts SET expired_at = now()
+        WHERE id = $1 AND expired_at IS NULL AND row_num IS NULL
+        RETURNING id::text AS id`,
+      [factId],
+    );
+    if (expired.length === 1) return { ok: true, path: 'legacy_db', reason };
+    if (rerouteOnce) return forgetFactOnce(engine, factId, opts, false);
+    // Second pass and still not a clean legacy row (row_num set but the
+    // fence columns are incomplete): the pre-fix DB-only expire.
     const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
     return { ok, path: 'legacy_db', reason };
   }
@@ -168,15 +195,21 @@ export async function forgetFactInFence(
   const filePath = resolved.filePath;
   const tmpPath = `${filePath}.tmp`;
 
-  if (!existsSync(filePath)) {
-    // File deleted out from under us — only the DB has the row.
-    // Legacy path is the safe behavior; the operator can fix the
-    // tree mismatch separately.
-    const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-    return { ok, path: 'legacy_db', reason };
-  }
-
-  return withPageLock(slug, async () => {
+  const reroute = Symbol('reroute');
+  const outcome = await withPageLock<ForgetFactResult | typeof reroute>(slug, async () => {
+    // Routing may have changed while this call waited for a redirect's lock.
+    const current = await engine.executeRaw<FactDbRow>(
+      `SELECT id, source_id, entity_slug, row_num, source_markdown_slug, expired_at, visibility FROM facts WHERE id = $1`, [factId]);
+    const now = current[0];
+    if (!now || (opts.sourceId !== undefined && now.source_id !== opts.sourceId) || (opts.worldOnly && now.visibility !== 'world')) {
+      return { ok: false, path: 'not_found', reason };
+    }
+    if (now.expired_at !== null) return { ok: false, path: 'already_expired', reason };
+    if (now.source_id !== row.source_id || now.source_markdown_slug !== slug || now.row_num !== targetRowNum) return reroute;
+    if (!existsSync(filePath)) {
+      const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: missing canonical file, preserve explicit forget in DB
+      return { ok, path: 'legacy_db', reason };
+    }
     const body = readFileSync(filePath, 'utf-8');
     const parsed = parseFactsFence(body);
 
@@ -213,15 +246,13 @@ export async function forgetFactInFence(
 
     // Render + atomic .tmp + parse-validate + rename.
     const newFence = renderFactsTable(updated);
-    const begin = body.indexOf('<!--- gbrain:facts:begin -->');
-    const end   = body.indexOf('<!--- gbrain:facts:end -->', begin + 1);
-    if (begin === -1 || end === -1) {
+    if (!body.includes('<!--- gbrain:facts:begin -->') || !body.includes('<!--- gbrain:facts:end -->')) {
       // Race / corruption: fence disappeared between parse and render.
       // Legacy fallback.
       const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
       return { ok, path: 'legacy_db', reason };
     }
-    const newBody = body.slice(0, begin) + newFence + body.slice(end + '<!--- gbrain:facts:end -->'.length);
+    const newBody = replaceOrInsertFactsFence(body, newFence);
 
     writeFileSync(tmpPath, newBody, 'utf-8');
     const tmpBody = readFileSync(tmpPath, 'utf-8');
@@ -246,4 +277,11 @@ export async function forgetFactInFence(
 
     return { ok: true, path: 'fence', reason };
   }, { timeoutMs: 5_000 });
+  // Release the old page lock BEFORE acquiring the new one (sorted redirect
+  // locks otherwise invert with this reroute).
+  if (outcome === reroute) {
+    if (rerouteOnce) return forgetFactOnce(engine, factId, opts, false);
+    throw new Error('forget routing changed twice; retry without losing the fact identity');
+  }
+  return outcome;
 }

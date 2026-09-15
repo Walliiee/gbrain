@@ -184,6 +184,16 @@ export async function runMaintenanceSweep(
         );
         if (rows.length > 0) {
           const { runExtractFacts } = await import('./cycle/extract-facts.ts');
+          // The extractor's residue protection — the in-cycle legacy repair
+          // plus the residue-only sweep, which hold the reconcile off a page
+          // still carrying a crashed repair's uncommitted fence rows — is on
+          // by default for every caller and resolves its files from
+          // `sources.local_path` (never from brainDir), so this pass gets
+          // exactly the cycle's protection without opting in (it used to be
+          // gated on brainDir, which the sweep does not have, and a page the
+          // cycle had just halted on was reconciled here on the next idle
+          // tick with the forgotten claim re-inserted). brainDir itself stays
+          // unset so the phantom-redirect pre-pass stays a cycle-only step.
           const r = await runExtractFacts(engine, {
             slugs: rows.map(row => row.slug),
             sourceId,
@@ -191,6 +201,11 @@ export async function runMaintenanceSweep(
           });
           report.factsReconciled = r.factsInserted;
           if (r.guardTriggered) skip('facts_fence_guard');
+          if (r.warnings.length) {
+            skip('facts_fence_degraded');
+            for (const warning of r.warnings) log(`[sweep] ${warning}`);
+          }
+          for (const _block of r.legacyRepair?.residuePagesBlocked ?? []) skip('facts_fence_residue_blocked');
           if (budgetController.signal.aborted) skip('budget_exhausted:facts_fence');
         }
       }

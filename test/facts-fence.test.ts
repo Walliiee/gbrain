@@ -635,12 +635,12 @@ Prose here.
       expect(fenceAt).toBeLessThan(out.indexOf('<!-- timeline -->'));
     });
 
-    test('the legacy bare --- + ## Timeline form is deliberately NOT a sentinel (it would false-positive on frontmatter)', () => {
+    test('the legacy bare --- + ## Timeline form is a sentinel below body prose, never a frontmatter false-positive', () => {
       const body = `# Entity\n\nProse.\n\n---\n\n## Timeline\n- 2020: Founded\n`;
       const { body: out } = upsertFactRow(body, newRow);
-      // Not recognized → EOF append (after the timeline text), same as "no sentinel".
-      expect(out.indexOf(FACTS_FENCE_BEGIN)).toBeGreaterThan(out.indexOf('## Timeline'));
-      expect(out.indexOf(FACTS_FENCE_BEGIN)).toBeGreaterThan(out.indexOf('- 2020: Founded'));
+      expect(out.indexOf(FACTS_FENCE_BEGIN)).toBeGreaterThan(out.indexOf('Prose.'));
+      expect(out.indexOf(FACTS_FENCE_BEGIN)).toBeLessThan(out.indexOf('---\n\n## Timeline'));
+      expect(out.endsWith('---\n\n## Timeline\n- 2020: Founded\n')).toBe(true);
     });
 
     test('CRLF body: the sentinel line is recognized and the fence lands above it, tail preserved', () => {
@@ -727,4 +727,24 @@ describe('stripFactsFence', () => {
     expect(stripped).not.toContain('something');
     expect(stripped).not.toContain(FACTS_FENCE_BEGIN);
   });
+});
+
+test('repeated canonical fences form one row stream and privacy stripping covers every block', () => {
+  const first = renderFactsTable([minimalFact(1)]);
+  const second = renderFactsTable([{ ...minimalFact(2), claim: 'Private second', visibility: 'private' }]);
+  const body = `Before\n${first}\nBetween\n${second}\nAfter`;
+  expect(parseFactsFence(body)).toMatchObject({ warnings: [], facts: [{ rowNum: 1 }, { rowNum: 2 }] });
+  const world = stripFactsFence(body, { keepVisibility: ['world'] });
+  expect(world).not.toContain('Private second');
+  expect(parseFactsFence(world).facts.map(f => f.rowNum)).toEqual([1]);
+  const none = stripFactsFence(body);
+  expect(none).not.toContain(FACTS_FENCE_BEGIN);
+  expect(none).not.toContain('Private second');
+  expect(none).toContain('Before');
+  expect(none).toContain('Between');
+  expect(none).toContain('After');
+  const canonical = upsertFactRow(body, { ...minimalFact(3), claim: 'Third fact' }).body;
+  expect(canonical.split(FACTS_FENCE_BEGIN)).toHaveLength(2);
+  expect(parseFactsFence(canonical).facts.map(f => f.rowNum)).toEqual([1, 2, 3]);
+  expect(canonical).toContain('Between');
 });

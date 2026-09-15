@@ -27,6 +27,7 @@ import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import { serializePageToMarkdown, resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
 import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
+import { acquirePageLock } from './page-lock.ts';
 import {
   isDurabilityHardened, commitWriteThroughFile, currentBranch, getLastPushOutcome,
   type PushLogOutcome,
@@ -85,8 +86,13 @@ export interface WriteThroughResult {
    *     (macOS/Windows default), the target directory already holds a
    *     differently-cased entry that the FS folds onto this page's file, so
    *     writing would silently clobber the OTHER slug's file (#2831) — refused.
+   *   - page_lock_timeout: another writer (facts fence, forget, timeline
+   *     splice, legacy-fact stamp, destructive reconcile) held the page lock
+   *     for the whole 5 s wait. Only reachable for callers that do NOT hold
+   *     the lock themselves (`holdsPageLock`); `put_page`/`restore_page` take
+   *     it before their DB write, so for them a busy page refuses up front.
    */
-  skipped?: 'disabled_by_config' | 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | 'case_insensitive_collision';
+  skipped?: 'disabled_by_config' | 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | 'case_insensitive_collision' | 'page_lock_timeout';
   /** Set when the render/write/rename itself threw (EACCES, ENOTDIR, disk full). */
   error?: string;
 }
@@ -96,6 +102,17 @@ export interface WritePageThroughOpts {
   /** Merged over the page's own frontmatter at render time (e.g. provenance). */
   frontmatterOverrides?: Record<string, unknown>;
   logger?: WriteThroughLogger;
+  /**
+   * The caller ALREADY holds the page lock for `slug` (page-lock.ts). The
+   * lock is a non-re-entrant lockfile, so a nested acquire would wait out the
+   * timeout against itself; pass true to skip acquisition. `put_page` and
+   * `restore_page` (ops/pages.ts) hold it across their DB write AND this
+   * write-through, so an acknowledged save is durable in both sinks; the
+   * best-effort callers (commands/brainstorm.ts `--save`, commands/sync.ts
+   * re-export of never-committed pages) do not and accept
+   * `page_lock_timeout` as a reported skip.
+   */
+  holdsPageLock?: boolean;
 }
 
 /**
@@ -375,111 +392,138 @@ export async function writePageThrough(
     }
     const { filePath, writeRoot, sourcePathToBind } = target;
 
-    const writtenPage = await engine.getPage(slug, { sourceId });
-    if (!writtenPage) {
-      return { written: false, skipped: 'page_not_found_after_write' };
-    }
-
-    const tags = await engine.getTags(slug, { sourceId });
-    const md = serializePageToMarkdown(writtenPage, tags, {
-      frontmatterOverrides: opts.frontmatterOverrides,
-    });
-
-    // #2831: two distinct DB slugs differing only by case (FOO vs foo) resolve
-    // to the SAME file on a case-insensitive filesystem — the second write
-    // would silently clobber the first slug's artifact. Refuse when the target
-    // dir holds a differently-cased entry that the FS folds onto our path:
-    // exact-case entry present → normal update, falls through; on a
-    // case-sensitive FS the variant path doesn't exist, so the guard is a
-    // no-op there.
-    const dir = dirname(filePath);
-    if (existsSync(dir)) {
-      const base = basename(filePath);
-      const entries = readdirSync(dir);
-      if (!entries.includes(base) && existsSync(filePath)) {
-        // The path exists on disk but no exactly-named entry does → the FS
-        // folded the name (case, or unicode normalization on APFS) onto a
-        // different slug's file.
-        const clash =
-          entries.find((e) => e.toLowerCase() === base.toLowerCase()) ?? '(normalization variant)';
-        opts.logger?.warn(
-          `[write-through] case-insensitive collision for ${slug}: '${clash}' already occupies ${filePath} — file not written (DB row is intact)`,
-        );
-        return { written: false, skipped: 'case_insensitive_collision' };
+    // Serialize with every other writer of this page's file: the facts fence
+    // writer, forget, the timeline splice, the legacy-fact stamp mode and the
+    // destructive reconcile all take `withPageLock(slug)`. Unlocked, a
+    // write-through rendered from a stale row could land between a fence
+    // writer's verify and its stamp and flatten the fence off disk. A lock
+    // held past the wait is a `skipped` reason, never a thrown put_page.
+    const writeLocked = async (): Promise<WriteThroughResult> => {
+      const writtenPage = await engine.getPage(slug, { sourceId });
+      if (!writtenPage) {
+        return { written: false, skipped: 'page_not_found_after_write' };
       }
-    }
 
-    // On Bun + Windows, mkdirSync(dir, { recursive: true }) can still throw
-    // EEXIST when the directory already exists (POSIX no-ops it). That aborts
-    // the put_page / enrich / capture write-through whenever the prefix dir
-    // already exists, silently leaving the DB and the .md file plane out of sync.
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const tags = await engine.getTags(slug, { sourceId });
+      const md = serializePageToMarkdown(writtenPage, tags, {
+        frontmatterOverrides: opts.frontmatterOverrides,
+      });
 
-    // Atomic write: unique temp sibling + rename. Unique name (pid + random)
-    // so two concurrent saves to the same target can't clobber each other's
-    // temp file. Clean up the temp on any failure so we never leak a stray
-    // `.tmp` next to the real file.
-    const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
-    try {
-      writeFileSync(tmpPath, md, 'utf8');
-      renameSync(tmpPath, filePath);
-    } catch (writeErr) {
-      try {
-        if (existsSync(tmpPath)) unlinkSync(tmpPath);
-      } catch {
-        // best-effort cleanup; surface the original write error below
-      }
-      throw writeErr;
-    }
-
-    // #4247: a page born via put/capture/reverse-write keeps source_path=NULL
-    // forever — mtime-watermark incremental sync never rescans an untouched
-    // file — so bind the just-materialized file of record now. NULL-guarded so
-    // a scanner-recorded path is never rewritten; best-effort because row and
-    // file are already durable and a full sync can still heal the bookkeeping.
-    try {
-      await engine.executeRaw(
-        `UPDATE pages
-            SET source_path = $1
-          WHERE source_id = $2
-            AND slug = $3
-            AND deleted_at IS NULL
-            AND source_path IS NULL`,
-        [sourcePathToBind, sourceId, slug],
-      );
-    } catch (bindErr) {
-      const msg = bindErr instanceof Error ? bindErr.message : String(bindErr);
-      opts.logger?.warn(`[write-through] wrote ${slug} but could not bind source_path: ${msg}`);
-    }
-
-    // #2426: on a durability-hardened repo (user ran `gbrain sources harden`),
-    // commit the artifact so it reaches git — pre-fix, write-through content
-    // stayed uncommitted forever: never pushed, `last_sync_at` frozen, and
-    // silently deleted by a later `sync --full` delete-reconcile. The local
-    // post-commit hook background-pushes the commit. Best-effort: a commit
-    // failure never fails the write (the DB row + file are the durable sinks).
-    let committed = false;
-    let pushed: 'pending' | undefined;
-    let lastPushStatus: PushLogOutcome | undefined;
-    try {
-      if (isDurabilityHardened(writeRoot)) {
-        committed = commitWriteThroughFile(writeRoot, filePath, slug);
-        if (committed) {
-          pushed = 'pending';
-          lastPushStatus = getLastPushOutcome(currentBranch(writeRoot));
+      // #2831: two distinct DB slugs differing only by case (FOO vs foo) resolve
+      // to the SAME file on a case-insensitive filesystem — the second write
+      // would silently clobber the first slug's artifact. Refuse when the target
+      // dir holds a differently-cased entry that the FS folds onto our path:
+      // exact-case entry present → normal update, falls through; on a
+      // case-sensitive FS the variant path doesn't exist, so the guard is a
+      // no-op there.
+      const dir = dirname(filePath);
+      if (existsSync(dir)) {
+        const base = basename(filePath);
+        const entries = readdirSync(dir);
+        if (!entries.includes(base) && existsSync(filePath)) {
+          // The path exists on disk but no exactly-named entry does → the FS
+          // folded the name (case, or unicode normalization on APFS) onto a
+          // different slug's file.
+          const clash =
+            entries.find((e) => e.toLowerCase() === base.toLowerCase()) ?? '(normalization variant)';
+          opts.logger?.warn(
+            `[write-through] case-insensitive collision for ${slug}: '${clash}' already occupies ${filePath} — file not written (DB row is intact)`,
+          );
+          return { written: false, skipped: 'case_insensitive_collision' };
         }
       }
-    } catch { /* best-effort */ }
 
-    return {
-      written: true,
-      path: filePath,
-      ...(committed ? { committed, pushed, lastPushStatus } : {}),
+      // On Bun + Windows, mkdirSync(dir, { recursive: true }) can still throw
+      // EEXIST when the directory already exists (POSIX no-ops it). That aborts
+      // the put_page / enrich / capture write-through whenever the prefix dir
+      // already exists, silently leaving the DB and the .md file plane out of sync.
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+      // Atomic write: unique temp sibling + rename. Unique name (pid + random)
+      // so two concurrent saves to the same target can't clobber each other's
+      // temp file. Clean up the temp on any failure so we never leak a stray
+      // `.tmp` next to the real file.
+      const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
+      try {
+        writeFileSync(tmpPath, md, 'utf8');
+        renameSync(tmpPath, filePath);
+      } catch (writeErr) {
+        try {
+          if (existsSync(tmpPath)) unlinkSync(tmpPath);
+        } catch {
+          // best-effort cleanup; surface the original write error below
+        }
+        throw writeErr;
+      }
+
+      // #4247: a page born via put/capture/reverse-write keeps source_path=NULL
+      // forever — mtime-watermark incremental sync never rescans an untouched
+      // file — so bind the just-materialized file of record now. NULL-guarded so
+      // a scanner-recorded path is never rewritten; best-effort because row and
+      // file are already durable and a full sync can still heal the bookkeeping.
+      try {
+        await engine.executeRaw(
+          `UPDATE pages
+              SET source_path = $1
+            WHERE source_id = $2
+              AND slug = $3
+              AND deleted_at IS NULL
+              AND source_path IS NULL`,
+          [sourcePathToBind, sourceId, slug],
+        );
+      } catch (bindErr) {
+        const msg = bindErr instanceof Error ? bindErr.message : String(bindErr);
+        opts.logger?.warn(`[write-through] wrote ${slug} but could not bind source_path: ${msg}`);
+      }
+
+      // #2426: on a durability-hardened repo (user ran `gbrain sources harden`),
+      // commit the artifact so it reaches git — pre-fix, write-through content
+      // stayed uncommitted forever: never pushed, `last_sync_at` frozen, and
+      // silently deleted by a later `sync --full` delete-reconcile. The local
+      // post-commit hook background-pushes the commit. Best-effort: a commit
+      // failure never fails the write (the DB row + file are the durable sinks).
+      let committed = false;
+      let pushed: 'pending' | undefined;
+      let lastPushStatus: PushLogOutcome | undefined;
+      try {
+        if (isDurabilityHardened(writeRoot)) {
+          committed = commitWriteThroughFile(writeRoot, filePath, slug);
+          if (committed) {
+            pushed = 'pending';
+            lastPushStatus = getLastPushOutcome(currentBranch(writeRoot));
+          }
+        }
+      } catch { /* best-effort */ }
+
+      return {
+        written: true,
+        path: filePath,
+        ...(committed ? { committed, pushed, lastPushStatus } : {}),
+      };
     };
+
+    const locked = opts.holdsPageLock
+      ? await writeLocked()
+      : await withPageLockOrTimeout(slug, writeLocked);
+    return locked ?? { written: false, skipped: 'page_lock_timeout' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     opts.logger?.warn(`[write-through] failed for ${slug}: ${msg}`);
     return { written: false, error: msg };
+  }
+}
+
+/**
+ * `withPageLock` with the fence writers' 5 s wait, degrading a timeout to
+ * null instead of a throw. Errors thrown by `fn` itself still propagate.
+ */
+async function withPageLockOrTimeout<T>(slug: string, fn: () => Promise<T>): Promise<T | null> {
+  const handle = await acquirePageLock(slug, { timeoutMs: 5_000 });
+  if (!handle) return null;
+  try {
+    return await fn();
+  } finally {
+    await handle.release();
   }
 }
 
